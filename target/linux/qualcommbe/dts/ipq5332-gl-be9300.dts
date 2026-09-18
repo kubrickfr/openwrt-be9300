@@ -8,6 +8,7 @@
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/leds/common.h>
 #include <dt-bindings/clock/qcom,ipq5332-nsscc.h>
+#include <dt-bindings/thermal/thermal.h>
 
 / {
 	#address-cells = <0x2>;
@@ -118,7 +119,16 @@
 			interrupt-parent = <&tlmm>;
 			interrupts = <36 IRQ_TYPE_EDGE_RISING>;
 			pulses-per-revolution = <2>;
-			cooling-levels = <36 128 192 255>;
+			/*
+			 * Level 0 stops the fan; level 1 is the lowest duty
+			 * cycle it reliably spins at (~1150 rpm).  The rest is
+			 * a fine ramp so step_wise moves in inaudible
+			 * increments, finer at the bottom where the pwm->rpm
+			 * slope is steepest.
+			 */
+			cooling-levels = <0 36 42 48 55 62 70 78 87 96
+					  106 117 128 140 153 167 182 198 215 234
+					  255>;
 			#cooling-cells = <2>;
 		};
 	};
@@ -129,37 +139,32 @@
 
 			trips {
 				fan_trip_high: active-high {
-					temperature = <100000>;
-					hysteresis = <2000>;
-					type = "active";
-				};
-
-				fan_trip_med: active-med {
-					temperature = <75000>;
-					hysteresis = <2000>;
+					temperature = <95000>;
+					hysteresis = <5000>;
 					type = "active";
 				};
 
 				fan_trip_low: active-low {
-					temperature = <50000>;
-					hysteresis = <2000>;
+					temperature = <75000>;
+					hysteresis = <10000>;
 					type = "active";
 				};
 			};
 
 			cooling-maps {
+				/* Hold a high floor if we ever get this hot. */
 				fan-active-high {
-					cooling-device = <&fan0 3 3>;
+					cooling-device = <&fan0 12 THERMAL_NO_LIMIT>;
 					trip = <&fan_trip_high>;
 				};
 
-				fan-active-med {
-					cooling-device = <&fan0 2 2>;
-					trip = <&fan_trip_med>;
-				};
-
+				/*
+				 * Give step_wise the whole range so it ramps a
+				 * level at a time instead of slamming between
+				 * fixed duty cycles.
+				 */
 				fan-active-low {
-					cooling-device = <&fan0 1 1>;
+					cooling-device = <&fan0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 					trip = <&fan_trip_low>;
 				};
 			};
