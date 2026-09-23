@@ -1,8 +1,9 @@
 #!/bin/sh
-# ath12k takes its MAC from firmware board data and has no DT/nvmem support,
-# so without this every boot invents a new base address and all BSSIDs move.
-# Pin each BSS to an address derived from the factory ART value (offset 0x04,
-# what stock uses for wlan0). Sections that already set macaddr are left alone.
+# The DT hands ath12k the factory ART Wi-Fi address (offset 0x04, what stock
+# uses for wlan0) as the phy address. Pin each AP BSS to an address derived
+# from the same value, so BSSIDs keep the layout of earlier images and do not
+# depend on the order in which wifi-scripts brings up interfaces. Sections
+# that already set macaddr are left alone.
 . /lib/functions.sh
 . /lib/functions/system.sh
 
