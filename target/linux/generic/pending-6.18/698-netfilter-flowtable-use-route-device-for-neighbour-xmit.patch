@@ -1,0 +1,49 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] netfilter: flowtable: use route device for neighbour xmit
+
+The transmit-path consolidation backported to 6.18.45 uses the discovered
+output interface for FLOW_OFFLOAD_XMIT_NEIGH. Path discovery can select a
+bridge port even when the flow retains neighbour-based transmission, whose
+neighbour lookup and cached route still refer to the bridge itself.
+
+On the GL-BE9300 with PPPoE WAN and bridged LAN, the reply route uses
+br-lan but the stored output index points to lan1. Software-offloaded
+HTTPS stalls with this combination. Selecting the cached route device
+restores traffic without reverting the common transmit helper or
+disabling software offload.
+
+Use the route device for IPv4 and IPv6 neighbour transmission, matching
+the device used by the neighbour lookup and the pre-consolidation path.
+Leave direct transmission unchanged.
+
+Validated with an ARM64 module build, controlled live IPv4 HTTPS
+comparisons, 10 MiB downloads with software offload enabled, and a
+user-run speed test. IPv6 runtime validation remains pending; the router
+has no IPv6 default route.
+
+Fixes: b5964aac51e0 ("netfilter: flowtable: consolidate xmit path")
+Signed-off-by: François Guerraz <kubrick@fgv6.net>
+---
+ net/netfilter/nf_flow_table_ip.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -463,7 +463,7 @@ nf_flow_offload_ip_hook(void *priv, stru
+ 	switch (tuplehash->tuple.xmit_type) {
+ 	case FLOW_OFFLOAD_XMIT_NEIGH:
+ 		rt = dst_rtable(tuplehash->tuple.dst_cache);
+-		xmit.outdev = dev_get_by_index_rcu(state->net, tuplehash->tuple.ifidx);
++		xmit.outdev = rt->dst.dev;
+ 		if (!xmit.outdev) {
+ 			flow_offload_teardown(flow);
+ 			return NF_DROP;
+@@ -768,7 +768,7 @@ nf_flow_offload_ipv6_hook(void *priv, st
+ 	switch (tuplehash->tuple.xmit_type) {
+ 	case FLOW_OFFLOAD_XMIT_NEIGH:
+ 		rt = dst_rt6_info(tuplehash->tuple.dst_cache);
+-		xmit.outdev = dev_get_by_index_rcu(state->net, tuplehash->tuple.ifidx);
++		xmit.outdev = rt->dst.dev;
+ 		if (!xmit.outdev) {
+ 			flow_offload_teardown(flow);
+ 			return NF_DROP;
