@@ -1,0 +1,39 @@
+#!/bin/sh
+#
+# GL.iNet boards store the factory regulatory country as two ASCII letters
+# at offset 0x88 of the ART partition. Hand it to wifi config as the default
+# country, which it writes into every radio section it creates, including
+# radios that probe late. Without it the 6 GHz radio gets country '00', and
+# hostapd then refuses to start any interface on the phy.
+
+. /lib/functions/uci-defaults.sh
+. /lib/functions/system.sh
+
+gl_art_country()
+{
+	local art country
+
+	art=$(find_mmc_part "0:ART")
+	[ -n "$art" ] || return
+
+	country=$(dd if="$art" bs=1 skip=136 count=2 2>/dev/null |
+		tr 'a-z' 'A-Z')
+	case "$country" in
+	[A-Z][A-Z])
+		echo "$country"
+		;;
+	esac
+}
+
+board_config_update
+
+case "$(board_name)" in
+gl.inet,gl-be9300)
+	country=$(gl_art_country)
+	[ -n "$country" ] && ucidef_set_country "$country"
+	;;
+esac
+
+board_config_flush
+
+exit 0
