@@ -44,13 +44,17 @@ static void rtl837x_gpio_set(struct gpio_chip *gc, unsigned offset, int value)
 
 static int rtl837x_gpio_get(struct gpio_chip *gc, unsigned offset)
 {
-    struct rtl837x_gpio *gpio = gpiochip_get_data(gc);
-    rtk_gpio_level_t pval;
-    uint32_t ret = gpio->gsw->pMapper->gpio_pinVal_read(offset, &pval);
-    if (ret)
-        dev_err(gpio->gsw->dev, "gpio %d: failed to read gpio val %x", offset, ret);
+	struct rtl837x_gpio *gpio = gpiochip_get_data(gc);
+	rtk_gpio_level_t pval;
+	uint32_t ret = gpio->gsw->pMapper->gpio_pinVal_read(offset, &pval);
 
-    return pval == GPIO_LEVEL_HIGH ? 1 : 0;
+	if (ret) {
+		dev_err(gpio->gsw->dev,
+			"gpio %d: failed to read gpio val %x", offset, ret);
+		return -EIO;
+	}
+
+	return pval == GPIO_LEVEL_HIGH ? 1 : 0;
 }
 
 static int rtl837x_gpio_direction_input(struct gpio_chip *gc, unsigned offset)

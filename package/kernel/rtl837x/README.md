@@ -26,11 +26,17 @@ It builds the switch driver module:
 rtl837x_dsa.ko
 ```
 
-The driver also depends on the RTL 8-byte DSA tagger:
+The driver also builds and loads the standard 802.1Q DSA tagger:
 
 ```text
-tag_rtl8_4.ko
+tag_vsc73xx_8021q.ko
 ```
+
+The module name comes from the upstream DSA implementation used for the
+`VSC73XX_8021Q` tag protocol; the RTL837x driver reuses it as its
+`tag_8021q` transport. The proprietary RTL8_4/0x8899 CPU tag is intentionally
+not used because the IPQ5332 EDMA checksum parser must be able to parse past
+the CPU tag. Do not replace this dependency with `tag_rtl8_4.ko`.
 
 ## Device Tree
 
