@@ -4,13 +4,59 @@
 # from the same value, so BSSIDs keep the layout of earlier images and do not
 # depend on the order in which wifi-scripts brings up interfaces. Sections
 # that already set macaddr are left alone.
+#
+# The secondary links of an MLD have no wifi-iface of their own, so they
+# cannot be pinned. wifi-scripts derives them from the radio's macaddr_base,
+# or else from the phy address plus 32, which is another unit's global
+# address. Give each radio a locally administered macaddr_base: the ART
+# address with the first octet's high nibble replaced, (0x9 ^ (radio + 1)) for
+# GL's 94 OUI. Other units differ in the low five octets. The BSS pins keep
+# high nibble 0x9, and wifi-scripts only flips bits 2-3 of the first octet
+# for the first four addresses it derives from a base.
+#
+# This is a uci-defaults script: OpenWrt keeps it for the next boot unless it
+# exits 0. Wait until wifi config has created all three radios, so that no
+# radio misses its macaddr_base.
 . /lib/functions.sh
 . /lib/functions/system.sh
+
+EXPECTED_RADIOS=3
 
 [ "$(board_name)" = "gl.inet,gl-be9300" ] || exit 0
 
 base=$(mmc_get_mac_binary 0:ART 0x4)
 [ -n "$base" ] || exit 0
+
+count_radios() {
+	uci -q show wireless | grep -c "^wireless\.[^.]*=wifi-device$"
+}
+
+[ -f /etc/config/wireless ] || /sbin/wifi config
+[ "$(count_radios)" -ge "$EXPECTED_RADIOS" ] || /sbin/wifi config
+if [ "$(count_radios)" -lt "$EXPECTED_RADIOS" ]; then
+	logger -t gl-be9300-wifi-macs -p daemon.warn \
+		"found $(count_radios) of $EXPECTED_RADIOS radios; retrying next boot"
+	exit 1
+fi
+
+radio_macaddr_base() {
+	local radio="$1"
+	local first=$(( (0x${base%%:*} | 2) ^ ((radio + 1) << 4) ))
+
+	printf '%02x:%s\n' "$first" "${base#*:}"
+}
+
+set_radio_base() {
+	local section="$1"
+	local radio mb
+
+	config_get mb "$section" macaddr_base
+	[ -n "$mb" ] && return 0		# explicitly set already
+	config_get radio "$section" radio
+	[ -n "$radio" ] || return 0
+
+	uci set "wireless.$section.macaddr_base=$(radio_macaddr_base "$radio")"
+}
 
 n=0
 set_wifi_mac() {
@@ -31,6 +77,7 @@ set_wifi_mac() {
 }
 
 config_load wireless
+config_foreach set_radio_base wifi-device
 config_foreach set_wifi_mac wifi-iface
 uci commit wireless
 
