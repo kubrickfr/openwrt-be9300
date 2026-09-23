@@ -1,0 +1,50 @@
+IPQ5332 ath12k firmware
+=======================
+
+Version:  WLAN.WBE.1.6-01270-QCAHKSWPL_SILICONZ-1
+Variant:  5332.wlanfw.evalQ (Qualcomm evaluation build)
+Built:    2026-01-16 13:11 (Q_SENTINEL build stamp)
+iu_fw:    WLAN_UCODE_MIAMI_3.1.7-00000
+Format:   split PIL images (.mdt + .bNN), from build/ms/bin/5332.wlanfw.eval/PIL_IMAGES
+
+Origin:   imported by JiaY-shi into the GL-BE6500 tree (4be26be3f3,
+          "firmware: add GL-BE6500 ath12k firmware and board data");
+          byte-identical to jiay/flint3e-support ddf329e7c9. The original
+          source of the images was not recorded.
+
+No WLAN.WBE.1.6 IPQ5332 build is published (as of 2026-09-23):
+linux-firmware carries no IPQ5332 firmware,
+git.codelinaro.org/clo/ath-firmware/ath12k-firmware only has
+IPQ5322/hw1.0/board-2.bin, and github.com/quic/upstream-wifi-fw only has
+IPQ5332 (5332.wlanfw) split images up to WLAN.WBE.1.3.1-00130, under
+ath12k-firmware/IPQ5322/hw1.0. The ath12k legacy firmware support in this
+tree targets WLAN.WBE.1.6-01270, so these images are kept in the tree.
+The redistribution licence of this particular build has not been
+established.
+
+The QSDK debug files shipped with the original import (Data.msc,
+qdss_trace_config.bin, *.flist) are not loaded by ath12k and are left
+out, as is the standalone regdb.bin: the GL-BE9300 board-2.bin files
+carry their own regdb.
+
+sha256:
+  a5f566f1cc8c8f74d469920ee6effd8bb4043bf3afa4a2eaf9dc151750941aaa  iu_fw.b00
+  52fedfa9790d9bea101273ef3a3e30f92ba0e68cd22c32fceed81e872de9ae47  iu_fw.b01
+  c065323f83731f95a7d91d96a75af1dabeb53baabdb6a66a7935cb3473221a17  iu_fw.b02
+  e79f9f6d35994ab640c4df20bc83e2b0ef840267b4c72cd81c8da36786d98ed5  iu_fw.mdt
+  c41ca01aa96cf3a9d8c31b3c60665c4d099d8a2cad0f78414cd7c17c66178004  q6_fw0.b00
+  3b0fd38c1194f332ac277c403f20fb5a1e33b94e6756c608ad3d89642b67cd0f  q6_fw0.b01
+  8219ce5d5a96b4d42d14a08a649906ffff97c5bc2bf3304d6e9f963792b9ff7b  q6_fw0.b02
+  beafb89e3dddf95192fef6eb66fab6bfcc2db0bc3725ec105faaf7d6831bb37c  q6_fw0.b03
+  676575325faf779196d920d604a1fdf6123bd2756e3c4e2d167a9c276cb44726  q6_fw0.b04
+  903937b50466f2d347c0143b81f5cf79ee772fafafba53909da52ad1fd06a258  q6_fw0.b05
+  1f19630862afe809e6752b6d63942e1e0af78c85c3119be6677fea13b47d296f  q6_fw0.b06
+  11905ff9e681ca2ac6c98a3063ef7a9976c0eff8a55c85f5973bb3187c02897e  q6_fw0.b07
+  1f7ec901a12f070108b83cc3a39ab2e731ca7134206187331240b7af6171ea6b  q6_fw0.b08
+  71b3a022568901910165708cd292ff16cce2f61086e7ef88eff34ee9056dc97a  q6_fw0.b09
+  258279aae51a6951179fa61221127f6c9bded6e95b933db4bd2f4ad9ab486b58  q6_fw0.b11
+  cbeaccd7f7dae3a751594c9640e47f9b2a892c7e92b40398ed38c297fbbed79e  q6_fw0.mdt
+  bebbbe9278936c03d0af8e7a1309483140b62a0f1b660485dbb05e2baf0c937d  q6_fw1.b00
+  7de8d730c76b289279137f2128d5561d4056135111261afa69d5a32f87b0c192  q6_fw1.b01
+  6ddf4edd77987a3265539fe5018e0e3a025e08d3a39ee535930ed6eead495bc0  q6_fw1.b02
+  eb5395b538e9d4950b86f59b0d66db0f30378498d8a47daa058594451b761eb2  q6_fw1.mdt
