@@ -1,0 +1,138 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: scale mitigation timers by the EDMA clock
+
+EDMA_MICROSEC_TO_TIMER_UNIT() turns the Rx and Tx interrupt mitigation
+timers from microseconds into timer units of 128 EDMA clock cycles, but
+it is given ppe_dev->clk_rate, the constant 353 MHz that qcom_ppe_probe()
+sets for every SoC.  The EDMA clock runs at whatever rate the clock
+controller rounds that request to: 353 MHz on IPQ9574, but 300 MHz on
+IPQ5332, whose PPE clock source tops out there.  On IPQ5332 every timer
+is therefore programmed about 1.18 times longer than the value it was
+given: the 25 us Rx default is about 29 us, the 250 us Tx default about
+294 us.
+
+Read the rate the EDMA clock actually runs at once it has been set, and
+convert with that, as the vendor nss-dp driver does with clk_get_rate()
+on its EDMA clock.  The module parameters now mean what their
+descriptions say, and the timers no longer change with the PPE clock
+rate.  IPQ9574 is unaffected: its EDMA clock runs at exactly the 353 MHz
+that was assumed.
+
+On IPQ5332 this shortens the default moderation from about 29/294 us to
+25/250 us, the defaults the vendor nss-dp driver also uses.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: François Guerraz <kubrick@fgv6.net>
+---
+Not measured on hardware yet.
+
+In OpenWrt the previous timing is approximated by adding the parameters
+to the qcom-ppe line in /etc/modules.d:
+
+  qcom-ppe edma_rx_mitigation_timer=29 edma_tx_mitigation_timer=294
+
+which programs 28.6/294.0 us at 300 MHz.  Once the next patch clocks the
+IPQ5332 PPE at 200 MHz, edma_rx_mitigation_timer=44 and
+edma_tx_mitigation_timer=441 program exactly the 68/689 timer units
+(43.5/441.0 us) of earlier builds whose PPE clock was capped at 200 MHz.
+--- a/drivers/net/ethernet/qualcomm/ppe/edma.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma.c
+@@ -167,7 +167,8 @@ static struct edma_hw_info ipq9574_hw_in
+ };
+ 
+ static int edma_clock_set_and_enable(struct device *dev,
+-				     const char *id, unsigned long rate)
++				     const char *id, unsigned long rate,
++				     unsigned long *actual_rate)
+ {
+ 	struct device_node *edma_np;
+ 	struct clk *clk = NULL;
+@@ -197,6 +198,8 @@ static int edma_clock_set_and_enable(str
+ 	}
+ 
+ 	of_node_put(edma_np);
++	if (actual_rate)
++		*actual_rate = clk_get_rate(clk);
+ 	dev_dbg(dev, "set %lu rate for %s\n", rate, id);
+ 
+ 	return 0;
+@@ -206,22 +209,34 @@ static int edma_clock_configure(void)
+ {
+ 	struct ppe_device *ppe_dev = edma_ctx->ppe_dev;
+ 	struct device *dev = ppe_dev->dev;
+-	unsigned long ppe_rate;
++	unsigned long ppe_rate, sys_rate;
+ 	int ret;
+ 
+ 	ppe_rate = ppe_dev->clk_rate;
+ 
+ 	ret = edma_clock_set_and_enable(dev, clock_name[EDMA_SYS_CLK],
+-					ppe_rate);
++					ppe_rate, &sys_rate);
+ 	if (ret)
+ 		return ret;
+ 
+ 	ret = edma_clock_set_and_enable(dev, clock_name[EDMA_APB_CLK],
+-					ppe_rate);
++					ppe_rate, NULL);
+ 	if (ret)
+ 		return ret;
+ 
+-	dev_dbg(dev, "EDMA clocks are configured\n");
++	/* The interrupt mitigation timers count cycles of the EDMA clock,
++	 * which runs at the rate the clock controller can provide rather
++	 * than at the requested PPE rate.
++	 */
++	if (!sys_rate) {
++		dev_warn(dev, "EDMA clock rate unknown, assuming %lu Hz\n",
++			 ppe_rate);
++		sys_rate = ppe_rate;
++	}
++	edma_ctx->timer_clk_mhz = sys_rate / MHZ;
++
++	dev_dbg(dev, "EDMA clocks are configured, timer clock %lu MHz\n",
++		edma_ctx->timer_clk_mhz);
+ 
+ 	return 0;
+ }
+--- a/drivers/net/ethernet/qualcomm/ppe/edma.h
++++ b/drivers/net/ethernet/qualcomm/ppe/edma.h
+@@ -126,6 +126,8 @@ struct edma_intr_info {
+  * @rx_page_mode: Page mode enabled or disabled
+  * @rx_buf_size: Rx buffer size for Jumbo MRU
+  * @tx_requeue_stop: Tx requeue stop enabled or disabled
++ * @timer_clk_mhz: EDMA clock rate in MHz, used to convert the mitigation
++ *                 timers into units of 128 clock cycles
+  */
+ struct edma_context {
+ 	struct net_device **netdev_arr;
+@@ -142,6 +144,7 @@ struct edma_context {
+ 	u32 rx_page_mode;
+ 	u32 rx_buf_size;
+ 	bool tx_requeue_stop;
++	unsigned long timer_clk_mhz;
+ };
+ 
+ /* Global EDMA context. */
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_cfg_rx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_cfg_rx.c
+@@ -196,7 +196,7 @@ static void edma_cfg_rx_desc_ring_config
+ 
+ 	/* Configure the Mitigation timer */
+ 	data = EDMA_MICROSEC_TO_TIMER_UNIT(edma_rx_mitigation_timer,
+-					   ppe_dev->clk_rate / MHZ);
++					   edma_ctx->timer_clk_mhz);
+ 	data = ((data & EDMA_RX_MOD_TIMER_INIT_MASK)
+ 			<< EDMA_RX_MOD_TIMER_INIT_SHIFT);
+ 	pr_debug("EDMA Rx mitigation timer value: %d\n", data);
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_cfg_tx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_cfg_tx.c
+@@ -189,7 +189,7 @@ static void edma_cfg_txcmpl_ring_configu
+ 
+ 	/* Configure the Mitigation timer. */
+ 	data = EDMA_MICROSEC_TO_TIMER_UNIT(edma_tx_mitigation_timer,
+-					   ppe_dev->clk_rate / MHZ);
++					   edma_ctx->timer_clk_mhz);
+ 	data = ((data & EDMA_TX_MOD_TIMER_INIT_MASK)
+ 		<< EDMA_TX_MOD_TIMER_INIT_SHIFT);
+ 	pr_debug("EDMA Tx mitigation timer value: %d\n", data);
