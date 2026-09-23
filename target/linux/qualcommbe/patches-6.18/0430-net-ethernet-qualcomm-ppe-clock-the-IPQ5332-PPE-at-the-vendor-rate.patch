@@ -1,0 +1,56 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: clock the IPQ5332 PPE at the vendor rate
+
+qcom_ppe_probe() sets a PPE clock rate of 353 MHz, the IPQ9574 rate, for
+every SoC.  ppe_clock_init_and_reset() requests it for the PPE clocks and
+derives the NSSNOC PPE interconnect votes from it, and
+edma_clock_configure() requests it for the EDMA clocks.  On IPQ5332 the
+PPE clock source offers 200 MHz and 300 MHz, so the PPE, EDMA and port
+MAC clocks, which all derive from nss_cc_ppe_clk_src, run at 300 MHz.
+
+The IPQ5332 CMN PLL has a dedicated 200 MHz PPE output
+(IPQ5332_PPE_200MHZ_CLK), and the vendor SSDK clocks the IPQ5332 PPE
+(MPPE, revision 1 of the IPQ9574 APPE) at MPPE_CLK_RATE, 200 MHz,
+against APPE_CLK_RATE, 353 MHz, for the IPQ9574 (include/init/ssdk_clk.h
+and ssdk_appe_fixed_clock_init() in qca-ssdk), and sets the NSSNOC PPE
+clocks to the same rate.  The same driver programs the MPPE scheduler
+tables and buffer budgets that this driver uses for IPQ5332.
+
+Request 200 MHz on IPQ5332 so that the PPE runs at the vendor rate and
+the interconnect votes follow it.  With the previous patch the
+mitigation timers keep their programmed durations across the change.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: François Guerraz <kubrick@fgv6.net>
+---
+Not measured on hardware yet.  The stock firmware rate is taken from the
+public qca-ssdk source (win_qsdk.common.1.10.r2), not read back from a
+running stock unit.
+
+In OpenWrt this overrides the 300 MHz entry that the IPQ53xx subtarget
+series adds to the IPQ5332 NSSCC PPE frequency table.  Dropping this
+patch restores 300 MHz for comparison.
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c
+@@ -23,6 +23,11 @@
+ #define PPE_PORT_MAX		8
+ #define PPE_CLK_RATE		353000000
+ 
++/* The IPQ5332 CMN PLL has a dedicated 200 MHz PPE output, and the vendor
++ * SSDK clocks the IPQ5332 (MPPE) PPE, EDMA and port MACs at that rate.
++ */
++#define PPE_CLK_RATE_IPQ5332	200000000
++
+ /* ICC clocks for enabling PPE device. The avg_bw and peak_bw with value 0
+  * will be updated by the clock rate of PPE.
+  */
+@@ -229,7 +234,8 @@ static int qcom_ppe_probe(struct platfor
+ 		return dev_err_probe(dev, PTR_ERR(ppe_dev->regmap),
+ 				     "PPE initialize regmap failed\n");
+ 	ppe_dev->dev = dev;
+-	ppe_dev->clk_rate = PPE_CLK_RATE;
++	ppe_dev->clk_rate = ppe_is_ipq5332(ppe_dev) ? PPE_CLK_RATE_IPQ5332 :
++			    PPE_CLK_RATE;
+ 	ppe_dev->num_ports = num_ports;
+ 	ppe_dev->num_icc_paths = num_icc;
+ 
