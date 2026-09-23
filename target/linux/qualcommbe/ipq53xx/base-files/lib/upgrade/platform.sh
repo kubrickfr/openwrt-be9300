@@ -1,11 +1,12 @@
 REQUIRE_IMAGE_METADATA=1
+RAMFS_COPY_BIN='dumpimage'
 
 platform_do_upgrade() {
 	case "$(board_name)" in
 	gl.inet,gl-be9300)
 		CI_KERNPART="0:HLOS"
 		CI_ROOTPART="rootfs"
-		emmc_do_upgrade "$1"
+		glinet_emmc_do_upgrade "$1" || exit 1
 		;;
 	*)
 		echo "Sysupgrade is not supported on your board yet."
@@ -19,7 +20,7 @@ platform_check_image() {
 
 	case "$(board_name)" in
 	gl.inet,gl-be9300)
-		return 0
+		glinet_emmc_check_image "$1"
 		;;
 	*)
 		echo "Sysupgrade is not supported on your board yet."
