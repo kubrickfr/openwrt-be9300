@@ -1,0 +1,39 @@
+#!/bin/sh
+# Release firmware coredumps so crash recovery can continue.
+#
+# The IPQ53xx WCSS remoteproc takes its coredump "inline": recovery of the
+# crashed Wi-Fi firmware waits until the devcoredump is released (by
+# writing to its data file) or expires after five minutes; reading it does
+# not release it. Until then every radio is dead
+# while hostapd still reports them up. Release each dump as it appears.
+#
+# No copy is kept: the dumps are firmware RAM and can hold Wi-Fi key
+# material, and saving them would wear the eMMC. To capture one for
+# debugging, disable this handler, copy /sys/class/devcoredump/devcdN/data
+# and then write to it to let recovery continue.
+
+[ "$ACTION" = "add" ] || exit 0
+[ "$SUBSYSTEM" = "devcoredump" ] || exit 0
+
+# Exactly /devices/virtual/devcoredump/devcdN with N all digits, nothing
+# deeper: in a case pattern '*' also matches '/'.
+name=${DEVPATH##*/}
+num=${name#devcd}
+case "$num" in
+"$name"|""|*[!0-9]*) exit 0 ;;
+esac
+[ "$DEVPATH" = "/devices/virtual/devcoredump/${DEVPATH##*/}" ] || exit 0
+
+dev="/sys$DEVPATH"
+[ -L "$dev/data" ] && exit 0
+[ -f "$dev/data" ] && [ -w "$dev/data" ] || exit 0
+
+src=$(printf '%s' "$(basename "$(readlink -f "$dev/failing_device")")" |
+	tr -c 'A-Za-z0-9._:-' '_')
+[ -n "$src" ] || src=unknown
+
+if echo 1 2>/dev/null > "$dev/data"; then
+	logger -t coredump "released $src firmware dump"
+else
+	logger -t coredump "could not release $src firmware dump (already gone?)"
+fi
