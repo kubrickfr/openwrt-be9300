@@ -261,7 +261,7 @@ static int rtl837x_switch_probe(struct rtk_gsw *gsw)
 
 		if (switch_probe(&sw_chip) != RT_ERR_OK) {
 			dev_warn(gsw->dev , "Error: Detect switch type failed\n");
-			mdelay(50);
+			msleep(50);
 		}else
 			break;
 	}
@@ -332,11 +332,11 @@ static int rtl837x_hw_reset(struct rtk_gsw *gsw)
 	if (!IS_ERR_OR_NULL(gsw->reset_pin)) {
 		dev_info(gsw->dev, "START HW RESET");
 		gpiod_set_value_cansleep(gsw->reset_pin, 1);
-		mdelay(100);
+		msleep(100);
 		gpiod_set_value_cansleep(gsw->reset_pin, 0);
-		mdelay(100);
+		msleep(100);
 		gpiod_set_value_cansleep(gsw->reset_pin, 1);
-		mdelay(100);
+		msleep(100);
 		dev_info(gsw->dev, "FINISH HW RESET");
 	}
 
@@ -696,7 +696,7 @@ static void rtl837x_status_check_work_func(struct work_struct *work)
 		if (ret)
 			dev_warn_ratelimited(gsw->dev,
 					     "failed to disable CPU SerDes: %d\n", ret);
-		mdelay(200);
+		msleep(200);
 
 		rtnl_lock();
 		ret = dev_open(gsw->ethernet_master, NULL);
@@ -710,7 +710,7 @@ static void rtl837x_status_check_work_func(struct work_struct *work)
 			dev_warn_ratelimited(gsw->dev,
 					     "failed to restore CPU SerDes mode: %d\n", ret);
 
-		mdelay(2000);
+		msleep(2000);
 	}
 
 reschedule:
