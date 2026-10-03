@@ -907,18 +907,20 @@ static void rtl837x_stats_stop(struct rtk_gsw *gsw)
  * accepted" -- the exact combination that lets whatever is plugged into a user
  * port choose its own VLAN. The two SDK calls are separate register writes and
  * are never atomic with each other, and the off direction is routine, not just
- * an admin toggle: DSA calls us with vlan_filtering=false from
- * dsa_port_reset_vlan_filtering() whenever the last VLAN-aware bridge on the
- * switch goes away.
+ * an admin toggle: DSA calls us with vlan_filtering=false whenever a port
+ * leaves a VLAN-aware bridge or the bridge turns vlan_filtering off.
  *
- * KNOWN GAP, deliberately not addressed here: a VLAN-AWARE bridge port stays at
- * ACCEPT_FRAME_TYPE_ALL, and dsa_tag_8021q_bridge_join() has made it a hardware
- * member of the shared bridge VID. Ingress filtering therefore does NOT stop it
- * injecting a frame tagged with that VID -- the port genuinely is a member --
- * which floods within the bridge VID and also reaches the CPU, where the VBID
- * path attributes it to some port of that bridge. Closing that needs the user
- * port's bridge-VID membership dropped while vlan_filtering is on (the tagger
- * does not use that VID in VLAN-aware mode), which is a separate change.
+ * A VLAN-aware bridge port accepts every frame type, so ingress filtering is
+ * all that stands between it and the VLANs it is a member of. It must
+ * therefore not be a member of any tag_8021q VLAN another port depends on:
+ * rtl837x_apply_vlan_mode() takes it out of the bridge VID while filtering is
+ * on, port_vlan_add() refuses the tag_8021q range, and the seed leaves VLAN 1
+ * empty. Its own standalone VID only egresses the port itself.
+ *
+ * Not covered: bridge VLANs live in one global table, and with
+ * configure_vlan_while_not_filtering a VLAN-unaware bridge's ports are
+ * programmed into that bridge's VLANs too (VLAN 1 by default). A VLAN-aware
+ * bridge and any other bridge sharing a VID are joined in hardware on it.
  */
 static int rtl837x_set_ingress_policy(struct rtk_gsw *gsw, int port,
 				      bool vlan_filtering)
@@ -1028,7 +1030,6 @@ static int rtl837x_seed_vlan_table(struct rtk_gsw *gsw)
 			if (ret)
 				return rtl837x_to_errno(ret);
 		}
-
 	}
 
 	return 0;
@@ -1103,10 +1104,11 @@ static int rtl837x_tag_8021q_vlan_del(struct dsa_switch *ds, int port, u16 vid)
 
 	/* Joining a bridge drops the port's standalone VLAN in favour of
 	 * the bridge's. Keep it in hardware anyway: the tagger still
-	 * addresses this port by its standalone VID for link-local frames
-	 * (STP, LLDP, PTP), which have to reach one specific link. Nothing
-	 * else uses the VID -- the port's PVID is the bridge VLAN, so
-	 * ingress and isolation are unaffected.
+	 * addresses this port by its standalone VID for unmarked multicast
+	 * and broadcast (link-local frames, the bridge's per-port IGMP/MLD
+	 * copies), which have to reach this one port. The port's PVID is
+	 * the bridge VLAN and the VLAN has no other egress member, so
+	 * untagged ingress and isolation are unaffected.
 	 */
 	if (dsa_port_bridge_dev_get(dp) && vid == dsa_tag_8021q_standalone_vid(dp))
 		return 0;
@@ -1809,8 +1811,9 @@ static int rtl837x_port_vlan_fast_age(struct dsa_switch *ds, int port, u16 vid)
 /* The shared tag_8021q bridge VID is only meaningful while the bridge is
  * VLAN-UNAWARE: there the tagger classifies by it and the switch picks the
  * egress port from its own FDB. Once the bridge becomes VLAN-aware the tagger
- * stops using it entirely (tag_vsc73xx_8021q returns the skb untouched when
- * br_vlan_enabled()), but dsa_tag_8021q_bridge_join() has already made the
+ * stops using it entirely (tag_vsc73xx_8021q passes a forwarded skb through
+ * untouched when br_vlan_enabled(), and tags anything else with the
+ * standalone VID), but dsa_tag_8021q_bridge_join() has already made the
  * user port a hardware member of it -- and a member is exactly what ingress
  * filtering lets through. A client on such a port could therefore inject a
  * frame carrying that internal VID and have it flooded inside the bridge VID
