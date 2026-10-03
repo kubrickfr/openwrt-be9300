@@ -1,0 +1,117 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: dsa: tag_vsc73xx_8021q: use the bridge VID for unicast
+ transmitted directly to a bridged port
+
+Joining a bridge replaces a port's standalone tag_8021q VLAN with the
+bridge's VLAN (dsa_tag_8021q_bridge_join() adds the bridge VID and
+deletes the standalone one). The xmit path, however, only uses
+the bridge VID when skb->offload_fwd_mark is set, and otherwise tags with
+the standalone VID.
+
+That is not reachable for unicast while everything goes through the
+bridge, because bridge-forwarded frames carry the mark (IGMP/MLD are the
+exception, see below). It is reachable as soon as something transmits
+unicast straight onto the user port instead: the netfilter flowtable's
+direct transmit path does exactly this once dev_fill_forward_path() has
+resolved a bridge port. Two things then go wrong:
+
+ - unless the driver keeps the standalone VLAN, the switch no longer has
+   that VID for the port and drops the frame;
+ - even where it is kept, the port is usually the wrong one. Bridged
+   traffic is received on the bridge VID, which does not identify the
+   ingress port, so dsa_tag_8021q_find_user() attributes it to the first
+   forwarding port of the bridge and the software FDB learns every
+   station behind the switch there.
+
+Measured on an IPQ5332 board with an RTL8372N switch (rtl837x, which
+reuses this tagger): with the flowtable forwarding through the bridge,
+frames towards the client carry the bridge VID 3088 and arrive; with the
+flowtable transmitting directly to the port, they carry the standalone
+VID 3076 and the client receives nothing, while the switch's own FDB has
+the client on a different port entirely.
+
+So for an unmarked unicast frame to a port of a VLAN-unaware bridge, use
+the bridge VID as well and let the switch select the egress port from
+its own FDB, exactly as it does for bridge-forwarded traffic. This also
+applies to unicast deliberately sent on one port, e.g. through a packet
+socket: it goes where the switch's FDB has the destination, or is
+flooded within the bridge if the destination is unknown, rather than out
+of the port it was sent on.
+
+Multicast and broadcast keep the standalone VID. Group-addressed
+link-local traffic (STP, LLDP, EAPOL, PTP) is meant for one specific
+link, and the bridge sends some frames unmarked once per port, such as
+IGMP/MLD (nbp_switchdev_can_offload_tx_fwd() refuses to offload them):
+with the bridge VID the switch would flood every copy to the whole
+bridge. These frames leave a bridged port only if the driver keeps the
+standalone VLAN in hardware while the port is bridged; otherwise they
+are dropped, as before this patch.
+
+Everything else is left as it was. Marked frames keep their existing
+handling in full: the bridge transmits only one copy per offloaded
+hardware domain and relies on the switch to flood it, so they must not be
+narrowed to a single port. VLAN-aware bridges are untouched as well --
+there every forwarded frame carries one of the bridge's own VLANs and
+tag_8021q does not decide the egress port.
+
+Signed-off-by: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+[François Guerraz: restrict to unicast so the per-port multicast copies
+ the bridge sends unmarked are not flooded; describe the receive
+ attribution that makes the stack's port choice unreliable]
+Signed-off-by: François Guerraz <kubrick@fgv6.net>
+---
+--- a/net/dsa/tag_vsc73xx_8021q.c
++++ b/net/dsa/tag_vsc73xx_8021q.c
+@@ -2,6 +2,7 @@
+ /* Copyright (C) 2024 Pawel Dembicki <paweldembicki@gmail.com>
+  */
+ #include <linux/dsa/8021q.h>
++#include <linux/etherdevice.h>
+ 
+ #include "tag.h"
+ #include "tag_8021q.h"
+@@ -13,17 +14,41 @@
+ {
+ 	struct dsa_port *dp = dsa_user_to_port(netdev);
+ 	u16 queue_mapping = skb_get_queue_mapping(skb);
++	unsigned int bridge_num = dsa_port_bridge_num_get(dp);
++	struct net_device *br = dsa_port_bridge_dev_get(dp);
+ 	u16 tx_vid = dsa_tag_8021q_standalone_vid(dp);
+ 	u8 pcp;
+ 
++	/* A frame the bridge forwarded or flooded is marked, and for an
++	 * offloaded hardware domain the bridge transmits only one copy and
++	 * relies on the switch to flood it. Leave that path exactly as it
++	 * was.
++	 */
+ 	if (skb->offload_fwd_mark) {
+-		unsigned int bridge_num = dsa_port_bridge_num_get(dp);
+-		struct net_device *br = dsa_port_bridge_dev_get(dp);
+-
+ 		if (br_vlan_enabled(br))
+ 			return skb;
+ 
+ 		tx_vid = dsa_tag_8021q_bridge_vid(bridge_num);
++	} else if (bridge_num && br && !br_vlan_enabled(br) &&
++		   is_unicast_ether_addr(eth_hdr(skb)->h_dest)) {
++		/* An unmarked unicast frame bypassed bridge forwarding and was
++		 * transmitted straight onto a port of a VLAN-unaware bridge --
++		 * the netfilter flowtable's direct transmit path does exactly
++		 * this. The port it was given is not reliable: bridged traffic
++		 * is received on the bridge VID, which does not identify the
++		 * ingress port, so the software FDB learns every station behind
++		 * the switch on one port. Use the bridge VID and let the switch
++		 * pick the egress port from its own FDB, as it does for
++		 * bridge-forwarded frames.
++		 *
++		 * Multicast and broadcast keep the standalone VID. Link-local
++		 * group frames (STP, LLDP, EAPOL) are for one specific link,
++		 * and the bridge sends some frames unmarked once per port
++		 * (IGMP/MLD), so the bridge VID would make the switch flood
++		 * each copy to the whole bridge. They only leave the port if
++		 * the driver keeps the standalone VLAN while it is bridged.
++		 */
++		tx_vid = dsa_tag_8021q_bridge_vid(bridge_num);
+ 	}
+ 
+ 	pcp = netdev_txq_to_tc(netdev, queue_mapping);
