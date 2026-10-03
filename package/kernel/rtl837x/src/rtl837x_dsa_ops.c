@@ -976,11 +976,14 @@ static int rtl837x_seed_vlan_table(struct rtk_gsw *gsw)
 
 	memset(gsw->vlan_table, 0, sizeof(gsw->vlan_table));
 
-	gsw->vlan_table[1].valid = 1;
-	gsw->vlan_table[1].vid = 1;
-	gsw->vlan_table[1].mbr = gsw->valid_port_mask;
-	gsw->vlan_table[1].untag = gsw->valid_port_mask;
-
+	/* Overwrite the SDK's default VLAN 1 with an empty one. Every user
+	 * port's PVID becomes a tag_8021q VLAN once dsa_tag_8021q_register()
+	 * runs, and a bridge that wants VLAN 1 adds its ports through
+	 * port_vlan_add(). A port left in VLAN 1 here would stay a member
+	 * whatever bridge it later joins, or none, so a VLAN-aware bridge
+	 * port (which accepts tagged frames) could flood a VID 1 frame to
+	 * standalone ports.
+	 */
 	ret = rtl837x_write_vlan(gsw, 1);
 	if (ret)
 		return ret;
