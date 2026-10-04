@@ -46,6 +46,12 @@ define Device/glinet_gl-be9300
 	DEVICE_DTS_CONFIG := config-1
 	SOC := ipq5332
 	SUPPORTED_DEVICES += gl.inet,gl-be9300
+	# The kernel FIT is written raw into 0:HLOS (7340032 bytes) by
+	# emmc_upgrade_tar (sysupgrade) and glinet_emmc_flash_fit_part (GL
+	# factory image), neither of which checks its size, and a truncated
+	# kernel never boots. image.mk runs check-size on the kernel whenever
+	# KERNEL_SIZE is set.
+	KERNEL_SIZE := 7168k
 	IMAGE/factory.bin := append-rootfs | pad-rootfs | pad-to 64k | \
 		gl-be9300-factory | append-gl-metadata
 	DEVICE_PACKAGES := kmod-ath12k ath12k-firmware-ipq5332-legacy \
