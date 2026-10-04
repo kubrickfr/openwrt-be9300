@@ -19,6 +19,7 @@
 /*
  * Include Files
  */
+#include <linux/printk.h>
 #include <dal/rtl8373/dal_rtl8373_switch.h>
 #include <dal/rtl8373/rtl8373_asicdrv.h>
 #include <dal_rtl8373_drv.h>
@@ -275,6 +276,141 @@ void Pin_Reset_8224_via_8373(void)
     delay_loop(100);
     rtl8373_setAsicRegBit(RTL8373_GPIO_OUT1_ADDR, 4, 1);
     delay_loop(500);
+}
+
+/*
+ * Lockstep PHY access for the RTL8224 patch below. Every PHY in phymask sees
+ * exactly the access sequence a per-port call would give it -- its own read,
+ * then its write -- but a write that is identical for all of them goes out as
+ * one broadcast command (the SMI PHY access takes a port mask). The patch
+ * tables are the same for every port, so this cuts the patch time ~4x.
+ */
+static rtk_api_ret_t phy_regbits_write_lockstep(rtk_uint32 phymask, rtk_uint32 dev_addr,
+                                                rtk_uint32 reg_addr, rtk_uint32 bitmask,
+                                                rtk_uint32 value)
+{
+    rtk_api_ret_t retVal, err = RT_ERR_OK;
+    rtk_uint32 newval[9];
+    rtk_uint32 port, regdata, readmask = 0, bitsShift = 0, valueShifted, common = 0;
+    int same = 1;
+
+    if (!bitmask)
+        return RT_ERR_INPUT;
+
+    while (!(bitmask & (1U << bitsShift)))
+    {
+        bitsShift++;
+        if (bitsShift >= RTL8373_REGBITLENGTH)
+            return RT_ERR_INPUT;
+    }
+
+    valueShifted = value << bitsShift;
+    if (valueShifted > RTL8373_REGDATAMAX)
+        return RT_ERR_INPUT;
+
+    /* A port whose read fails is left out of this step, as a per-port
+     * call would only have lost that port; the others still get written.
+     */
+    for (port = 0; port < 9; port++)
+    {
+        if (!((1U << port) & phymask))
+            continue;
+
+        if ((retVal = dal_rtl8373_phy_read(port, dev_addr, reg_addr, &regdata)) != RT_ERR_OK)
+        {
+            pr_warn("rtl8373: PHY %u reg 0x%x read failed (%d), skipped\n",
+                    port, reg_addr, retVal);
+            err = retVal;
+            continue;
+        }
+
+        newval[port] = (regdata & ~bitmask) | (valueShifted & bitmask);
+        if (!readmask)
+            common = newval[port];
+        else if (newval[port] != common)
+            same = 0;
+        readmask |= 1U << port;
+    }
+
+    if (!readmask)
+        return err;
+
+    if (same)
+    {
+        retVal = dal_rtl8373_phy_write(readmask, dev_addr, reg_addr, common);
+        if (retVal != RT_ERR_OK)
+            pr_warn("rtl8373: PHY mask 0x%x reg 0x%x write failed (%d)\n",
+                    readmask, reg_addr, retVal);
+        return retVal != RT_ERR_OK ? retVal : err;
+    }
+
+    for (port = 0; port < 9; port++)
+    {
+        if (!((1U << port) & readmask))
+            continue;
+
+        if ((retVal = dal_rtl8373_phy_write(1U << port, dev_addr, reg_addr, newval[port])) != RT_ERR_OK)
+        {
+            pr_warn("rtl8373: PHY %u reg 0x%x write failed (%d)\n",
+                    port, reg_addr, retVal);
+            err = retVal;
+        }
+    }
+
+    return err;
+}
+
+/*
+ * Wait, on one PHY, until (reg & bitmask) reads back as want: at most 30
+ * tries, with delay_loop(10) before or after each read as the per-port
+ * code had it. Only a successful read can end the wait, so a failed read
+ * never passes for a value left over from another port or an earlier step.
+ * A timeout is logged and the patch carries on, as before.
+ */
+static void phy_bits_wait(rtk_uint32 port, rtk_uint32 reg_addr, rtk_uint32 bitmask,
+                          rtk_uint32 want, int delay_first, const char *what)
+{
+    rtk_uint32 val;
+    int counter;
+
+    for (counter = 30; counter > 0; counter--)
+    {
+        if (delay_first)
+            delay_loop(10);
+        if (dal_rtl8373_phy_regbits_read(port, 31, reg_addr, bitmask, &val) == RT_ERR_OK &&
+            val == want)
+        {
+            if (!delay_first)
+                delay_loop(10);
+            return;
+        }
+        if (!delay_first)
+            delay_loop(10);
+    }
+
+    pr_warn("rtl8373: PHY %u %s timed out (reg 0x%x)\n", port, what, reg_addr);
+}
+
+static void uc1_sram_write_8b_lockstep(rtk_uint32 phymask, rtk_uint32 addr, rtk_uint32 val)
+{
+    phy_regbits_write_lockstep(phymask, 31, 0xa436, 0xffff, addr);
+    phy_regbits_write_lockstep(phymask, 31, 0xa438, 0xff << 8, val);
+}
+
+static void uc2_sram_write_8b_lockstep(rtk_uint32 phymask, rtk_uint32 addr, rtk_uint32 val)
+{
+    phy_regbits_write_lockstep(phymask, 31, 0xb87c, 0xffff, addr);
+    phy_regbits_write_lockstep(phymask, 31, 0xb87e, 0xff << 8, val);
+}
+
+static void data_ram_write_8b_lockstep(rtk_uint32 phymask, rtk_uint32 addr, rtk_uint32 val)
+{
+    phy_regbits_write_lockstep(phymask, 31, 0xb88e, 0xffff, addr);
+
+    if (addr % 2)
+        phy_regbits_write_lockstep(phymask, 31, 0xB890, 0xff, val);
+    else
+        phy_regbits_write_lockstep(phymask, 31, 0xB890, 0xff << 8, val);
 }
 
 void uc1_sram_write_8b(rtk_uint32 port, rtk_uint32 addr, rtk_uint32 val)
@@ -1963,158 +2099,124 @@ void RL6818C_pwr_on_patch_phy_v008_rls_lockmain(rtk_uint32 phymask)
 
 void RL6818C_pwr_on_patch_phy_v008(rtk_uint32 phymask)
 {
-    rtk_uint32 port, xg_patch_en, patch_key_addr, patch_key;
-    rtk_uint32 patch_rdy, counter, pcs_state;
+    rtk_uint32 port, pm = 0, xg_patch_en, patch_key_addr, patch_key;
     rtk_uint32 sel_patch_nc0, sel_patch_nc1, sel_patch_nc2, sel_patch_uc, sel_patch_uc2;
-    rtk_uint32 tmp, regdata;
+    rtk_uint32 regdata;
     rtk_uint32 ICVersion;
-
     currentVersion = 0x008;
 
+    /* Qualify every port as before; the ones that need the patch then get
+     * the whole sequence in lockstep (see phy_regbits_write_lockstep()),
+     * each PHY seeing the same ordered accesses a per-port run gave it.
+     */
     for (port = 0; port < 8; port++)
     {
-        tmp = (1 << port) & phymask;
-        if (tmp == 0)
+        if (!((1 << port) & phymask))
             continue;
-
         ICVersion = uc1_sram_read_8b(port, 0x0005);
         if (ICVersion != 2)
             continue;
-
         dal_rtl8373_phy_write(1 << port, 31, 0xa436, 0x801e);
-
         dal_rtl8373_phy_read(port, 31, 0xa438, &regdata);
         FWVersion = regdata;
         if (FWVersion == currentVersion)
             continue;
-
-        xg_patch_en = 1;
-
-        patch_key_addr = 0x8023;
-        patch_key = 0x1802;
-
-        sel_patch_nc0 = xg_patch_en;
-        sel_patch_nc1 = xg_patch_en;
-        sel_patch_nc2 = xg_patch_en;
-        sel_patch_uc = xg_patch_en;
-        sel_patch_uc2 = xg_patch_en;
-
-        if (sel_patch_nc0 | sel_patch_nc1 | sel_patch_nc2 | sel_patch_uc | sel_patch_uc2)
-        {
-
-            dal_rtl8373_phy_regbits_write(1 << port, 31, 0xb820, 1 << 4, 1);
-
-            counter = 30;
-            patch_rdy = 0;
-
-            do
-            {
-                dal_rtl8373_phy_regbits_read(port, 31, 0xb800, 1 << 6, &patch_rdy);
-                delay_loop(10);
-                counter--;
-			} while (!(patch_rdy == 1 || counter == 0));
-
-            // # Set patch_key & patch_lock
-            dal_rtl8373_phy_regbits_write(1 << port, 31, 0xa436, 0xffff, patch_key_addr);
-            dal_rtl8373_phy_regbits_write(1 << port, 31, 0xa438, 0xffff, patch_key);
-            dal_rtl8373_phy_regbits_write(1 << port, 31, 0xa436, 0xffff, 0xb82e);
-            dal_rtl8373_phy_regbits_write(1 << port, 31, 0xa438, 0xffff, 1);
-
-            dal_rtl8373_phy_regbits_write(1 << port, 31, 0xb820, 1 << 7, 1);
-
-            if (sel_patch_nc0)
-            {
-                n0_patch_RL6818C_230703(1 << port);
-            }
-            if (sel_patch_nc1)
-            {
-            }
-            if (sel_patch_nc2)
-            {
-                n2_patch_6818C_231206(1 << port);
-            }
-            if (sel_patch_uc2)
-            {
-                uc2_patch_6818C_231206(1 << port);
-            }
-        }
-
-        dal_rtl8373_phy_regbits_write(1 << port, 31, 0xb820, 1 << 7, 0);
-
-        if (sel_patch_uc)
-        {
-            uc_patch_6818C_221117(1 << port);
-        }
-
-        // # ----------------------------- data_ram_patch START--------------------------------
-        data_ram_patch_6818C_221026(1 << port);
-
-        //  # Clear patch_key & patch_lock
-        dal_rtl8373_phy_regbits_write(1 << port, 31, 0xa436, 0xffff, 0);
-        dal_rtl8373_phy_regbits_write(1 << port, 31, 0xa438, 0xffff, 0);
-        dal_rtl8373_phy_regbits_write(1 << port, 31, 0xb82e, 1, 0);
-        dal_rtl8373_phy_regbits_write(1 << port, 31, 0xa436, 0xffff, patch_key_addr);
-        dal_rtl8373_phy_regbits_write(1 << port, 31, 0xa438, 0xffff, 0);
-
-        // # Release patch request & wait patch_rdy = 0
-        dal_rtl8373_phy_regbits_write(1 << port, 31, 0xb820, 1 << 4, 0);
-
-        counter = 30;
-        do
-        {
-            delay_loop(10);
-            dal_rtl8373_phy_regbits_read(port, 31, 0xb800, 1 << 6, &patch_rdy);
-            counter--;
-		} while (!(patch_rdy == 0 || counter == 0));
-
-        // ## Lock Main
-        dal_rtl8373_phy_regbits_write(1 << port, 31, 0xa4a0, 1 << 10, 1);
-
-        counter = 30;
-        do
-        {
-            delay_loop(10);
-            dal_rtl8373_phy_regbits_read(port, 31, 0xa600, 0xff, &pcs_state);
-            counter--;
-		} while (!(pcs_state == 1 || counter == 0));
-
-        // RTCT patch
-
-        RTCT_para_6818C_231206(1 << port);
-
-        uc1_sram_write_8b(port, 0x8ffb, 0x1);
-        uc1_sram_write_8b(port, 0x80dc, 0xa);
-        uc1_sram_write_8b(port, 0x8378, 0x22);
-
-        dal_rtl8373_phy_regbits_write(1 << port, 31, 0xa47e, 0x3 << 6, 0x1);
-        uc2_sram_write_8b(port, 0x8217, 0x1e);
-        uc2_sram_write_8b(port, 0x8384, 0x4);
-
-        // # add for sub_echo_chnest
-        uc2_sram_write_8b(port, 0x8fd6, 0x00);
-        uc2_sram_write_8b(port, 0x8fd7, 0x00);
-        uc2_sram_write_8b(port, 0x8fd8, 0x0c);
-        uc2_sram_write_8b(port, 0x8fd9, 0x80);
-        uc2_sram_write_8b(port, 0x8fda, 0x0a);
-        uc2_sram_write_8b(port, 0x8fdb, 0x19);
-        uc2_sram_write_8b(port, 0x8fdc, 0x19);
-        uc2_sram_write_8b(port, 0x8fdd, 0x00);
-        uc2_sram_write_8b(port, 0x8fde, 0x00);
-        uc2_sram_write_8b(port, 0x8fdf, 0x00);
-        uc2_sram_write_8b(port, 0x8fe0, 0x00);
-        uc2_sram_write_8b(port, 0x8fe1, 0x20);
-        uc2_sram_write_8b(port, 0x8fe2, 0x0c);
-
-        uc2_sram_write_8b(port, 0x8fd3, 0x00);
-        uc2_sram_write_8b(port, 0x8fd4, 0x15);
-        uc2_sram_write_8b(port, 0x8fd5, 0x15);
-
-        afe_patch_6818C_220607(1 << port);
-
-        dal_rtl8373_phy_write(1 << port, 31, 0xa5d0, 0);
-        dal_rtl8373_phy_regbits_write(1 << port, 31, 0xa428, 1 << 9, 0);
+        pm |= 1 << port;
     }
 
+    if (!pm)
+        goto out;
+
+    xg_patch_en = 1;
+    patch_key_addr = 0x8023;
+    patch_key = 0x1802;
+    sel_patch_nc0 = xg_patch_en;
+    sel_patch_nc1 = xg_patch_en;
+    sel_patch_nc2 = xg_patch_en;
+    sel_patch_uc = xg_patch_en;
+    sel_patch_uc2 = xg_patch_en;
+    if (sel_patch_nc0 | sel_patch_nc1 | sel_patch_nc2 | sel_patch_uc | sel_patch_uc2)
+    {
+        phy_regbits_write_lockstep(pm, 31, 0xb820, 1 << 4, 1);
+        for (port = 0; port < 8; port++)
+        {
+            if (!((1 << port) & pm))
+                continue;
+            phy_bits_wait(port, 0xb800, 1 << 6, 1, 0, "patch request");
+        }
+        phy_regbits_write_lockstep(pm, 31, 0xa436, 0xffff, patch_key_addr);
+        phy_regbits_write_lockstep(pm, 31, 0xa438, 0xffff, patch_key);
+        phy_regbits_write_lockstep(pm, 31, 0xa436, 0xffff, 0xb82e);
+        phy_regbits_write_lockstep(pm, 31, 0xa438, 0xffff, 1);
+        phy_regbits_write_lockstep(pm, 31, 0xb820, 1 << 7, 1);
+        if (sel_patch_nc0)
+        {
+            n0_patch_RL6818C_230703(pm);
+        }
+        if (sel_patch_nc1)
+        {
+        }
+        if (sel_patch_nc2)
+        {
+            n2_patch_6818C_231206(pm);
+        }
+        if (sel_patch_uc2)
+        {
+            uc2_patch_6818C_231206(pm);
+        }
+    }
+    phy_regbits_write_lockstep(pm, 31, 0xb820, 1 << 7, 0);
+    if (sel_patch_uc)
+    {
+        uc_patch_6818C_221117(pm);
+    }
+    data_ram_patch_6818C_221026(pm);
+    phy_regbits_write_lockstep(pm, 31, 0xa436, 0xffff, 0);
+    phy_regbits_write_lockstep(pm, 31, 0xa438, 0xffff, 0);
+    phy_regbits_write_lockstep(pm, 31, 0xb82e, 1, 0);
+    phy_regbits_write_lockstep(pm, 31, 0xa436, 0xffff, patch_key_addr);
+    phy_regbits_write_lockstep(pm, 31, 0xa438, 0xffff, 0);
+    phy_regbits_write_lockstep(pm, 31, 0xb820, 1 << 4, 0);
+    for (port = 0; port < 8; port++)
+    {
+        if (!((1 << port) & pm))
+            continue;
+        phy_bits_wait(port, 0xb800, 1 << 6, 0, 1, "patch release");
+    }
+    phy_regbits_write_lockstep(pm, 31, 0xa4a0, 1 << 10, 1);
+    for (port = 0; port < 8; port++)
+    {
+        if (!((1 << port) & pm))
+            continue;
+        phy_bits_wait(port, 0xa600, 0xff, 1, 1, "main lock");
+    }
+    RTCT_para_6818C_231206(pm);
+    uc1_sram_write_8b_lockstep(pm, 0x8ffb, 0x1);
+    uc1_sram_write_8b_lockstep(pm, 0x80dc, 0xa);
+    uc1_sram_write_8b_lockstep(pm, 0x8378, 0x22);
+    phy_regbits_write_lockstep(pm, 31, 0xa47e, 0x3 << 6, 0x1);
+    uc2_sram_write_8b_lockstep(pm, 0x8217, 0x1e);
+    uc2_sram_write_8b_lockstep(pm, 0x8384, 0x4);
+    uc2_sram_write_8b_lockstep(pm, 0x8fd6, 0x00);
+    uc2_sram_write_8b_lockstep(pm, 0x8fd7, 0x00);
+    uc2_sram_write_8b_lockstep(pm, 0x8fd8, 0x0c);
+    uc2_sram_write_8b_lockstep(pm, 0x8fd9, 0x80);
+    uc2_sram_write_8b_lockstep(pm, 0x8fda, 0x0a);
+    uc2_sram_write_8b_lockstep(pm, 0x8fdb, 0x19);
+    uc2_sram_write_8b_lockstep(pm, 0x8fdc, 0x19);
+    uc2_sram_write_8b_lockstep(pm, 0x8fdd, 0x00);
+    uc2_sram_write_8b_lockstep(pm, 0x8fde, 0x00);
+    uc2_sram_write_8b_lockstep(pm, 0x8fdf, 0x00);
+    uc2_sram_write_8b_lockstep(pm, 0x8fe0, 0x00);
+    uc2_sram_write_8b_lockstep(pm, 0x8fe1, 0x20);
+    uc2_sram_write_8b_lockstep(pm, 0x8fe2, 0x0c);
+    uc2_sram_write_8b_lockstep(pm, 0x8fd3, 0x00);
+    uc2_sram_write_8b_lockstep(pm, 0x8fd4, 0x15);
+    uc2_sram_write_8b_lockstep(pm, 0x8fd5, 0x15);
+    afe_patch_6818C_220607(pm);
+    dal_rtl8373_phy_write(pm, 31, 0xa5d0, 0);
+    phy_regbits_write_lockstep(pm, 31, 0xa428, 1 << 9, 0);
+out:
     rtlglue_printf("%d, RL6818C_pwr_on_patch_phy_v008 , patch 0x%x finished!\n", __LINE__, phymask);
 }
 
@@ -2163,21 +2265,18 @@ rtk_uint16 rst_smtr_patch_6818C_230703_patch[][2]=
 
 void n0_patch_RL6818C_230703(rtk_uint32 phymask)
 {
-    rtk_uint16 port, i, addr, val, len;
+    rtk_uint16 i, addr, val, len;
+
+    if (!(phymask & 0xff))
+        return;
 
     len = sizeof(rst_smtr_patch_6818C_230703_patch) / 4;
-    for (port = 0; port < 8; port++)
+    for (i = 0; i < len; i++)
     {
-        if ((1 << port) & phymask)
-        {
-            for (i = 0; i < len; i++)
-            {
-                addr = rst_smtr_patch_6818C_230703_patch[i][0];
-                val = rst_smtr_patch_6818C_230703_patch[i][1];
+        addr = rst_smtr_patch_6818C_230703_patch[i][0];
+        val = rst_smtr_patch_6818C_230703_patch[i][1];
 
-                dal_rtl8373_phy_write(1 << port, 31, addr, val);
-            }
-        }
+        dal_rtl8373_phy_write(phymask & 0xff, 31, addr, val);
     }
 }
 
@@ -2319,22 +2418,18 @@ rtk_uint16 uc2_patch_6818C_231206_patch[][2]=
 };
 void uc2_patch_6818C_231206(rtk_uint32 phymask)
 {
-    rtk_uint16 port, i, addr, val, len;
+    rtk_uint16 i, addr, val, len;
+
+    if (!(phymask & 0xff))
+        return;
 
     len = sizeof(uc2_patch_6818C_231206_patch) / 4;
-
-    for (port = 0; port < 8; port++)
+    for (i = 0; i < len; i++)
     {
-        if ((1 << port) & phymask)
-        {
-            for (i = 0; i < len; i++)
-            {
-                addr = uc2_patch_6818C_231206_patch[i][0];
-                val = uc2_patch_6818C_231206_patch[i][1];
+        addr = uc2_patch_6818C_231206_patch[i][0];
+        val = uc2_patch_6818C_231206_patch[i][1];
 
-                dal_rtl8373_phy_write(1 << port, 31, addr, val);
-            }
-        }
+        dal_rtl8373_phy_write(phymask & 0xff, 31, addr, val);
     }
 }
 
@@ -2366,21 +2461,18 @@ rtk_uint16 n2_patch_6818C_231206_patch[][2]=
 
 void n2_patch_6818C_231206(rtk_uint32 phymask)
 {
+    rtk_uint16 i, addr, val, len;
 
-    rtk_uint16 port, i, addr, val, len;
+    if (!(phymask & 0xff))
+        return;
 
     len = sizeof(n2_patch_6818C_231206_patch) / 4;
-    for (port = 0; port < 8; port++)
+    for (i = 0; i < len; i++)
     {
-        if ((1 << port) & phymask)
-        {
-            for (i = 0; i < len; i++)
-            {
-                addr = n2_patch_6818C_231206_patch[i][0];
-                val = n2_patch_6818C_231206_patch[i][1];
-                dal_rtl8373_phy_write(1 << port, 31, addr, val);
-            }
-        }
+        addr = n2_patch_6818C_231206_patch[i][0];
+        val = n2_patch_6818C_231206_patch[i][1];
+
+        dal_rtl8373_phy_write(phymask & 0xff, 31, addr, val);
     }
 }
 
@@ -2429,21 +2521,18 @@ rtk_uint16 uc_patch_6818C_221117_patch[][2]=
 
 void uc_patch_6818C_221117(rtk_uint32 phymask)
 {
-    rtk_uint16 port, i, addr, val, len;
+    rtk_uint16 i, addr, val, len;
+
+    if (!(phymask & 0xff))
+        return;
 
     len = sizeof(uc_patch_6818C_221117_patch) / 4;
-    for (port = 0; port < 8; port++)
+    for (i = 0; i < len; i++)
     {
-        if ((1 << port) & phymask)
-        {
-            for (i = 0; i < len; i++)
-            {
-                addr = uc_patch_6818C_221117_patch[i][0];
-                val = uc_patch_6818C_221117_patch[i][1];
+        addr = uc_patch_6818C_221117_patch[i][0];
+        val = uc_patch_6818C_221117_patch[i][1];
 
-                dal_rtl8373_phy_write(1 << port, 31, addr, val);
-            }
-        }
+        dal_rtl8373_phy_write(phymask & 0xff, 31, addr, val);
     }
 }
 
@@ -2452,37 +2541,32 @@ rtk_uint16 data_ram_patch_6818C_221026_patch[][2] =
         {0xC206, 0xB1}};
 void data_ram_patch_6818C_221026(rtk_uint32 phymask)
 {
-    rtk_uint16 port, i, data_ram_addr, data_ram_val, len;
+    rtk_uint16 i, data_ram_addr, data_ram_val, len;
+
+    phymask &= 0xff;
+    if (!phymask)
+        return;
 
     len = sizeof(data_ram_patch_6818C_221026_patch) / 4;
-    for (port = 0; port < 8; port++)
+    phy_regbits_write_lockstep(phymask, 31, 0xb896, 0x1, 0);    // #disable data_mem_auto_inc
+    phy_regbits_write_lockstep(phymask, 31, 0xb892, 0xff00, 0); // #set uc2 data ram page
+    for (i = 0; i < len; i++)
     {
-        if ((1 << port) & phymask)
-        {
-            dal_rtl8373_phy_regbits_write(1 << port, 31, 0xb896, 0x1, 0);    // #disable data_mem_auto_inc
-            dal_rtl8373_phy_regbits_write(1 << port, 31, 0xb892, 0xff00, 0); // #set uc2 data ram page
-            for (i = 0; i < len; i++)
-            {
-                data_ram_addr = data_ram_patch_6818C_221026_patch[i][0];
-                data_ram_val = data_ram_patch_6818C_221026_patch[i][1];
-                data_ram_write_8b(port, data_ram_addr, data_ram_val);
-            }
-            dal_rtl8373_phy_regbits_write(1 << port, 31, 0xb896, 0x1, 1); // # enable data_mem_auto_inc
-        }
+        data_ram_addr = data_ram_patch_6818C_221026_patch[i][0];
+        data_ram_val = data_ram_patch_6818C_221026_patch[i][1];
+        data_ram_write_8b_lockstep(phymask, data_ram_addr, data_ram_val);
     }
+    phy_regbits_write_lockstep(phymask, 31, 0xb896, 0x1, 1); // # enable data_mem_auto_inc
 }
 
 void afe_patch_6818C_220607(rtk_uint16 phymask)
 {
-    rtk_uint16 port;
-    for (port = 0; port < 8; port++)
-    {
-        if ((1 << port) & phymask)
-        {
-            dal_rtl8373_phy_regbits_write(1 << port, 31, 0xbf84, 0x7, 4);
-            dal_rtl8373_phy_regbits_write(1 << port, 31, 0xbf8c, 0x1f << 6, 0);
-        }
-    }
+    phymask &= 0xff;
+    if (!phymask)
+        return;
+
+    phy_regbits_write_lockstep(phymask, 31, 0xbf84, 0x7, 4);
+    phy_regbits_write_lockstep(phymask, 31, 0xbf8c, 0x1f << 6, 0);
 }
 
 rtk_uint16 RTCT_para_6818C_231206_patch[][4]=
@@ -2533,32 +2617,30 @@ rtk_uint16 RTCT_para_6818C_231206_patch[][4]=
 
 void RTCT_para_6818C_231206(rtk_uint32 phymask)
 {
-    rtk_uint16 port, i, addr, val, len, msb, lsb;
+    rtk_uint16 i, addr, val, len, msb, lsb;
     rtk_uint32 maskbits, j, masklen;
+
+    phymask &= 0xff;
+    if (!phymask)
+        return;
 
     len = sizeof(RTCT_para_6818C_231206_patch) / 8;
 
-    for (port = 0; port < 8; port++)
+    for (i = 0; i < len; i++)
     {
-        if ((1 << port) & phymask)
-        {
-            for (i = 0; i < len; i++)
-            {
-                addr = RTCT_para_6818C_231206_patch[i][0];
-                msb = RTCT_para_6818C_231206_patch[i][1];
-                lsb = RTCT_para_6818C_231206_patch[i][2];
-                val = RTCT_para_6818C_231206_patch[i][3];
+        addr = RTCT_para_6818C_231206_patch[i][0];
+        msb = RTCT_para_6818C_231206_patch[i][1];
+        lsb = RTCT_para_6818C_231206_patch[i][2];
+        val = RTCT_para_6818C_231206_patch[i][3];
 
-                masklen = msb - lsb;
-                maskbits = 1;
-                for (j = 0; j < masklen; j++)
-                {
-                    maskbits = (maskbits << 1) | 1;
-                }
-                maskbits = maskbits << lsb;
-                dal_rtl8373_phy_regbits_write(1 << port, 31, addr, maskbits, val);
-            }
+        masklen = msb - lsb;
+        maskbits = 1;
+        for (j = 0; j < masklen; j++)
+        {
+            maskbits = (maskbits << 1) | 1;
         }
+        maskbits = maskbits << lsb;
+        phy_regbits_write_lockstep(phymask, 31, addr, maskbits, val);
     }
 }
 
