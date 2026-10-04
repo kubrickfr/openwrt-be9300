@@ -1,0 +1,35 @@
+#!/bin/sh /etc/rc.common
+# Warn when a GL-BE9300 has no factory country in ART and a radio is left
+# without a valid two-letter country. board.d takes the default country
+# from ART offset 0x88, but it runs before logd, so a unit with an
+# unprogrammed ART would otherwise give no hint why its 6 GHz radio stays
+# down (country '00').
+
+START=99
+
+boot() {
+	local art country radio missing=
+
+	case "$(board_name)" in
+	gl.inet,gl-be9300) ;;
+	*) return 0 ;;
+	esac
+
+	art=$(find_mmc_part "0:ART")
+	[ -n "$art" ] || return 0
+	country=$(dd if="$art" bs=1 skip=136 count=2 2>/dev/null)
+	case "$country" in
+	[A-Za-z][A-Za-z]) return 0 ;;
+	esac
+
+	for radio in $(uci -q show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
+		case "$(uci -q get wireless.$radio.country)" in
+		[A-Za-z][A-Za-z]) ;;
+		*) missing="$missing $radio" ;;
+		esac
+	done
+	[ -n "$missing" ] || return 0
+
+	logger -t gl-be9300 -p daemon.warn \
+		"ART has no country code and${missing} lack(s) one; set it with: uci set wireless.radioN.country=XX; uci commit wireless; wifi"
+}
