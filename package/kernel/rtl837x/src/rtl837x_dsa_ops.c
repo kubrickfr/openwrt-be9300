@@ -1435,7 +1435,18 @@ static int rtl837x_mdio_setup(struct dsa_switch *ds)
 {
 	struct rtk_gsw *gsw = ds->priv;
 	struct mii_bus *bus;
-	int ret;
+	u32 dt_user_ports = 0;
+	int port, ret;
+
+	/* Scan only the user ports the device tree declares. A port the chip
+	 * has but the board leaves unwired (port 8 on the GL-BE9300) has no
+	 * PHY behind it, and every C45 read of the bus scan there times out
+	 * after ~250 ms: some 60 of them held DSA setup up for ~15 s.
+	 */
+	for (port = 0; port < ds->num_ports; port++)
+		if (dsa_is_user_port(ds, port))
+			dt_user_ports |= BIT(port);
+	ds->phys_mii_mask &= dt_user_ports;
 
 	ret = rtl837x_phy_driver_get();
 	if (ret)
