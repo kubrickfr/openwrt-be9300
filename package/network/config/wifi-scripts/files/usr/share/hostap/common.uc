@@ -83,15 +83,29 @@ function wdev_set_radio_mask(name, mask)
 }
 
 // a driver without ndo_set_mac_address keeps the old address
+// rtnl.request() returns null for a plain ACK, and also for invalid input,
+// which only rtnl.error() reports
+function rtnl_setlink(req)
+{
+	rtnl.error();
+	let ret = rtnl.request(rtnl.const.RTM_SETLINK, 0, req);
+	let err = rtnl.error();
+	if (ret === false || err)
+		return err ?? "Could not set the interface flags";
+
+	return null;
+}
+
 function netdev_macaddr_set(name, macaddr)
 {
 	let cur = readfile(`/sys/class/net/${name}/address`);
 	if (cur && lc(trim(cur)) == lc(macaddr))
 		return;
 
-	if (!rtnl.request(rtnl.const.RTM_SETLINK, 0, { dev: name, change: 1, flags: 0 }) ||
-	    !rtnl.request(rtnl.const.RTM_SETLINK, 0, { dev: name, address: macaddr }))
-		warn(`Could not set MAC address ${macaddr} on ${name}: ${rtnl.error()}\n`);
+	let err = rtnl_setlink({ dev: name, change: 1, flags: 0 }) ??
+		  rtnl_setlink({ dev: name, address: macaddr });
+	if (err)
+		warn(`Could not set MAC address ${macaddr} on ${name}: ${err}\n`);
 }
 
 function wdev_create(phy, name, data)
@@ -177,11 +191,7 @@ function wdev_set_mesh_params(name, data)
 
 function wdev_set_up(name, up)
 {
-	let ret = rtnl.request(rtnl.const.RTM_SETLINK, 0, { dev: name, change: 1, flags: up ? 1 : 0 });
-	if (!ret)
-		return rtnl.error() ?? "Could not set the interface flags";
-
-	return null;
+	return rtnl_setlink({ dev: name, change: 1, flags: up ? 1 : 0 });
 }
 
 // netifd rejects null fields and fields of a mismatched type
