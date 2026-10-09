@@ -1,0 +1,71 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] netfilter: flowtable: tear down flows when a device loses
+ carrier or changes upper
+
+Flows are torn down when a device goes administratively down, but not
+when it only loses carrier. A flow that transmits straight to such a
+device keeps being refreshed by the packets it then drops: when the
+cable of a bridge port is moved to another port of the same bridge,
+downloads to the station behind it stall until the peer gives up, and a
+UDP stream stalls for as long as the peer keeps sending.
+
+A flow set up through a bridge port also outlives the port leaving the
+bridge or joining another one, and keeps transmitting through the old
+topology, marking its frames for TX forwarding offload into whatever
+bridge the port is in now.
+
+Also tear flows down on NETDEV_CHANGE when the device has no carrier,
+and on NETDEV_CHANGEUPPER when the upper is a bridge or a LAG. The next
+packet takes the slow path, and the flow is offloaded again along the
+current path. Like NETDEV_DOWN, each such event walks every flowtable;
+NETDEV_CHANGE does not say what changed, so this also runs for other
+state changes while the device has no carrier.
+
+The notifier lives in nf_flow_table_core.c here because of the pending
+patch that moves it there; upstream it is in nft_flow_offload.c.
+
+Assisted-by: LLM
+---
+ net/netfilter/nf_flow_table_core.c | 30 +++++++++++++++++++++++++++++-
+ 1 file changed, 29 insertions(+), 1 deletion(-)
+
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -826,8 +826,36 @@ static int nf_flow_table_netdev_event(struct notifier_block *this,
+ {
+ 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+-	if (event != NETDEV_DOWN)
++	switch (event) {
++	case NETDEV_DOWN:
++		break;
++	case NETDEV_CHANGE:
++		/* A flow transmits to the device it was set up with for as
++		 * long as packets refresh it, and a device without carrier
++		 * drops them. Tear down the flows using the device, so that
++		 * the next packet takes the slow path and a new flow follows
++		 * the current topology, e.g. a station that moved to another
++		 * bridge port.
++		 */
++		if (netif_carrier_ok(dev))
++			return NOTIFY_DONE;
++		break;
++	case NETDEV_CHANGEUPPER: {
++		struct netdev_notifier_changeupper_info *info = ptr;
++
++		/* The device joined or left a bridge, or a LAG that can be in
++		 * one. A flow set up through the old topology could transmit
++		 * into the wrong bridge, or mark frames for a bridge the
++		 * device has left.
++		 */
++		if (!netif_is_bridge_master(info->upper_dev) &&
++		    !netif_is_lag_master(info->upper_dev))
++			return NOTIFY_DONE;
++		break;
++	}
++	default:
+ 		return NOTIFY_DONE;
++	}
+ 
+ 	nf_flow_table_cleanup(dev);
+ 
