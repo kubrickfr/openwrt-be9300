@@ -1,0 +1,281 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] netfilter: flowtable: let the switch forward frames sent
+ straight to a bridge port
+
+With the ports of a bridge in the flowtable, dev_fill_forward_path()
+resolves a destination behind the bridge to the port the bridge FDB has
+for it, and the flowtable transmits straight onto that port.
+
+On a switch port that offloads TX forwarding, that port is not reliably
+where the station is. Taggers built on tag_8021q cannot tell which port
+of a VLAN-unaware bridge a frame came in on: bridged traffic reaches the
+CPU on the bridge's VLAN, dsa_tag_8021q_find_user() attributes it to the
+first forwarding port, and the software FDB learns every station behind
+the switch there. The bridge does not depend on that FDB for these
+ports: it marks the frames it forwards to them (skb->offload_fwd_mark),
+the tagger sends them on the bridge's VLAN, and the switch picks the
+egress port from its own FDB. A frame the flowtable transmits directly
+is unmarked, so it is tagged for the one port the software FDB named,
+or dropped if the switch no longer has that port's standalone VLAN.
+
+Mark the frames the flowtable transmits to such a port, as the bridge
+would. A new bridge helper, br_port_can_offload_tx_fwd(), tells whether
+a port offloads TX forwarding and its bridge is VLAN-unaware: on a
+VLAN-aware bridge the bridge keeps the VLAN tag on frames it forwards
+this way for the switch to strip, which the forward path does not
+describe. br_fill_forward_path() reports it, the flow keeps it, and on
+transmit the frame is marked only if the helper still agrees, so a port
+leaving its bridge or the bridge turning VLAN filtering on stops the
+marking at once. That is the port-level test the bridge applies to
+every frame it forwards (it also checks the source hardware domain and
+IGMP, which do not apply to routed unicast). DSA clears
+BR_TX_FWD_OFFLOAD before it releases the port's bridge, which taggers
+read for a marked frame. As for frames the bridge forwards, the mark
+carries no bridge identity: a frame marked just before its port moves
+to another bridge, still in flight or in a qdisc, is tagged for the new
+bridge. The flows themselves are torn down when the port changes
+bridge.
+
+Every other frame the flowtable transmits, XFRM included, leaves
+unmarked. That also clears the mark a frame keeps from receive when the
+flowtable catches it on ingress of a bridged switch port; the bridge
+clears it in br_pass_frame_up() before routing. Without this, such a
+frame routed straight to a standalone DSA port reached the tagger with
+the mark set and a NULL bridge.
+
+NF_FLOW_TABLE now depends on BRIDGE || !BRIDGE, so that the bridge
+helper is reachable whenever the bridge is built at all; otherwise a
+flow could go straight to a port whose frames it cannot mark.
+
+Assisted-by: LLM
+---
+ include/linux/if_bridge.h             |  6 ++++++
+ include/linux/netdevice.h             |  1 +
+ include/net/netfilter/nf_flow_table.h |  2 ++
+ net/bridge/br_device.c                |  9 +++++++++
+ net/bridge/br_if.c                    | 23 +++++++++++++++++++++++
+ net/netfilter/Kconfig                 |  1 +
+ net/netfilter/nf_flow_table_core.c    |  2 ++
+ net/netfilter/nf_flow_table_ip.c      | 24 ++++++++++++++++++++++++
+ net/netfilter/nf_flow_table_path.c    |  3 +++
+ 9 files changed, 71 insertions(+)
+
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -178,6 +178,7 @@ struct net_device *br_fdb_find_port(const struct net_device *br_dev,
+ 				    __u16 vid);
+ void br_fdb_clear_offload(const struct net_device *dev, u16 vid);
+ bool br_port_flag_is_set(const struct net_device *dev, unsigned long flag);
++bool br_port_can_offload_tx_fwd(const struct net_device *dev);
+ u8 br_port_get_stp_state(const struct net_device *dev);
+ clock_t br_get_ageing_time(const struct net_device *br_dev);
+ #else
+@@ -199,6 +200,11 @@ br_port_flag_is_set(const struct net_device *dev, unsigned long flag)
+ 	return false;
+ }
+ 
++static inline bool br_port_can_offload_tx_fwd(const struct net_device *dev)
++{
++	return false;
++}
++
+ static inline u8 br_port_get_stp_state(const struct net_device *dev)
+ {
+ 	return BR_STATE_DISABLED;
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -898,6 +898,7 @@ struct net_device_path {
+ 			}		vlan_mode;
+ 			u16		vlan_id;
+ 			__be16		vlan_proto;
++			bool		tx_fwd_offload;
+ 		} bridge;
+ 		struct {
+ 			int port;
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -149,6 +149,7 @@ struct flow_offload_tuple {
+ 			u32		hw_ifidx;
+ 			u8		h_source[ETH_ALEN];
+ 			u8		h_dest[ETH_ALEN];
++			u8		tx_fwd_offload:1;
+ 		} out;
+ 		struct {
+ 			u32		iifidx;
+@@ -215,6 +216,7 @@ struct nf_flow_route {
+ 			u32			hw_ifindex;
+ 			u8			h_source[ETH_ALEN];
+ 			u8			h_dest[ETH_ALEN];
++			u8			tx_fwd_offload:1;
+ 		} out;
+ 		enum flow_offload_xmit_type	xmit_type;
+ 	} tuple[FLOW_OFFLOAD_DIR_MAX];
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@ -411,6 +411,15 @@ static int br_fill_forward_path(struct net_device_path_ctx *ctx,
+ 	path->dev = dst->br->dev;
+ 	ctx->dev = dst->dev;
+ 
++	/* Tell the caller whether the egress port offloads TX forwarding.
++	 * The switch forwards a frame marked for that from its own FDB, as
++	 * it does when the bridge forwards it, so a caller transmitting
++	 * straight onto the port can mark the frame too. VLAN-aware bridges
++	 * are left out: there the bridge keeps the VLAN tag on such frames
++	 * for the switch to strip, which this path does not describe.
++	 */
++	path->bridge.tx_fwd_offload = br_port_can_offload_tx_fwd(dst->dev);
++
+ 	switch (path->bridge.vlan_mode) {
+ 	case DEV_PATH_BR_VLAN_TAG:
+ 		if (ctx->num_vlans >= ARRAY_SIZE(ctx->vlan))
+--- a/net/bridge/br_if.c
++++ b/net/bridge/br_if.c
+@@ -780,3 +780,26 @@ bool br_port_flag_is_set(const struct net_device *dev, unsigned long flag)
+ 	return p->flags & flag;
+ }
+ EXPORT_SYMBOL_GPL(br_port_flag_is_set);
++
++/**
++ * br_port_can_offload_tx_fwd - whether frames to a port may use TX
++ *	forwarding offload without VLAN processing
++ * @dev: the bridge port
++ *
++ * True if the port offloads TX forwarding and its bridge is VLAN-unaware.
++ * The bridge then marks the frames it forwards to the port and the switch
++ * picks the egress port from its own FDB, without any VLAN tag kept on the
++ * frame for the switch to strip. Called under RCU or RTNL.
++ */
++bool br_port_can_offload_tx_fwd(const struct net_device *dev)
++{
++	struct net_bridge_port *p;
++
++	p = br_port_get_rtnl_rcu(dev);
++	if (!p)
++		return false;
++
++	return (p->flags & BR_TX_FWD_OFFLOAD) &&
++	       !br_opt_get(p->br, BROPT_VLAN_ENABLED);
++}
++EXPORT_SYMBOL_GPL(br_port_can_offload_tx_fwd);
+--- a/net/netfilter/Kconfig
++++ b/net/netfilter/Kconfig
+@@ -727,6 +727,7 @@ config NF_FLOW_TABLE
+ 	depends on NETFILTER_INGRESS
+ 	depends on NF_CONNTRACK
+ 	depends on NF_TABLES
++	depends on BRIDGE || !BRIDGE
+ 	help
+ 	  This option adds the flow table core infrastructure.
+ 
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -128,6 +128,8 @@ static int flow_offload_fill_route(struct flow_offload *flow,
+ 		       ETH_ALEN);
+ 		flow_tuple->out.ifidx = route->tuple[dir].out.ifindex;
+ 		flow_tuple->out.hw_ifidx = route->tuple[dir].out.hw_ifindex;
++		flow_tuple->out.tx_fwd_offload =
++			route->tuple[dir].out.tx_fwd_offload;
+ 		dst_release(dst);
+ 		break;
+ 	case FLOW_OFFLOAD_XMIT_XFRM:
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -8,6 +8,7 @@
+ #include <linux/ipv6.h>
+ #include <linux/netdevice.h>
+ #include <linux/if_ether.h>
++#include <linux/if_bridge.h>
+ #include <net/gso.h>
+ #include <net/ip.h>
+ #include <net/ipv6.h>
+@@ -267,6 +268,24 @@ static inline bool nf_flow_dst_check(struct flow_offload_tuple *tuple)
+ 	return dst_check(tuple->dst_cache, tuple->dst_cookie);
+ }
+ 
++/* Mark a frame for TX forwarding offload if the flow was set up for it
++ * (tx_fwd_offload) and the port and its bridge still allow it, which is
++ * the port-level test the bridge applies to every frame it forwards. DSA
++ * clears BR_TX_FWD_OFFLOAD before it releases the port's bridge, which
++ * taggers read for a marked frame. Any other frame leaves unmarked: one
++ * caught on ingress of a bridged switch port still carries the forwarding
++ * mark set on receive, which the bridge clears in br_pass_frame_up()
++ * before routing.
++ */
++static void nf_flow_set_offload_fwd_mark(struct sk_buff *skb,
++					 bool tx_fwd_offload)
++{
++#ifdef CONFIG_NET_SWITCHDEV
++	skb->offload_fwd_mark = tx_fwd_offload &&
++				br_port_can_offload_tx_fwd(skb->dev);
++#endif
++}
++
+ static unsigned int nf_flow_xmit_xfrm(struct sk_buff *skb,
+ 				      const struct nf_hook_state *state,
+ 				      struct dst_entry *dst)
+@@ -274,6 +293,7 @@ static unsigned int nf_flow_xmit_xfrm(struct sk_buff *skb,
+ 	skb_orphan(skb);
+ 	skb_dst_drop(skb);
+ 	skb_dst_set_noref(skb, dst);
++	nf_flow_set_offload_fwd_mark(skb, false);
+ 	dst_output(state->net, state->sk, skb);
+ 	return NF_STOLEN;
+ }
+@@ -338,6 +358,7 @@ struct nf_flow_xmit {
+ 	const void		*dest;
+ 	const void		*source;
+ 	struct net_device	*outdev;
++	bool			tx_fwd_offload;
+ };
+ 
+ static unsigned int nf_flow_queue_xmit(struct net *net, struct sk_buff *skb,
+@@ -353,6 +374,7 @@ static unsigned int nf_flow_queue_xmit(struct net *net, struct sk_buff *skb,
+ 	}
+ 
+ 	skb->dev = dev;
++	nf_flow_set_offload_fwd_mark(skb, xmit->tx_fwd_offload);
+ 	dev_hard_header(skb, dev, ntohs(skb->protocol),
+ 			xmit->dest, xmit->source, skb->len);
+ 	dev_queue_xmit(skb);
+@@ -485,6 +507,7 @@ nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
+ 		}
+ 		xmit.dest = tuplehash->tuple.out.h_dest;
+ 		xmit.source = tuplehash->tuple.out.h_source;
++		xmit.tx_fwd_offload = tuplehash->tuple.out.tx_fwd_offload;
+ 		break;
+ 	default:
+ 		WARN_ON_ONCE(1);
+@@ -790,6 +813,7 @@ nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
+ 		}
+ 		xmit.dest = tuplehash->tuple.out.h_dest;
+ 		xmit.source = tuplehash->tuple.out.h_source;
++		xmit.tx_fwd_offload = tuplehash->tuple.out.tx_fwd_offload;
+ 		break;
+ 	default:
+ 		WARN_ON_ONCE(1);
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -86,6 +86,7 @@ struct nft_forward_info {
+ 	u8 ingress_vlans;
+ 	u8 h_source[ETH_ALEN];
+ 	u8 h_dest[ETH_ALEN];
++	bool tx_fwd_offload;
+ 	enum flow_offload_xmit_type xmit_type;
+ };
+ 
+@@ -155,6 +156,7 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+ 			case DEV_PATH_BR_VLAN_KEEP:
+ 				break;
+ 			}
++			info->tx_fwd_offload = path->bridge.tx_fwd_offload;
+ 			info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
+ 			break;
+ 		default:
+@@ -223,6 +225,7 @@ static void nft_dev_forward_path(struct nf_flow_route *route,
+ 		memcpy(route->tuple[dir].out.h_source, info.h_source, ETH_ALEN);
+ 		memcpy(route->tuple[dir].out.h_dest, info.h_dest, ETH_ALEN);
+ 		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
++		route->tuple[dir].out.tx_fwd_offload = info.tx_fwd_offload;
+ 		route->tuple[dir].xmit_type = info.xmit_type;
+ 	}
+ }

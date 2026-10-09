@@ -13,10 +13,10 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
  	depends on NETFILTER_INGRESS
  	depends on NF_CONNTRACK
 -	depends on NF_TABLES
+ 	depends on BRIDGE || !BRIDGE
  	help
  	  This option adds the flow table core infrastructure.
- 
-@@ -1031,6 +1030,15 @@ config NETFILTER_XT_TARGET_NOTRACK
+@@ -1032,6 +1031,15 @@ config NETFILTER_XT_TARGET_NOTRACK
  	depends on NETFILTER_ADVANCED
  	select NETFILTER_XT_TARGET_CT
  
@@ -44,7 +44,7 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
  obj-$(CONFIG_NETFILTER_XT_TARGET_LED) += xt_LED.o
 --- /dev/null
 +++ b/net/netfilter/xt_FLOWOFFLOAD.c
-@@ -0,0 +1,709 @@
+@@ -0,0 +1,712 @@
 +/*
 + * Copyright (C) 2018-2021 Felix Fietkau <nbd@nbd.name>
 + *
@@ -89,6 +89,7 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
 +	u8 ingress_vlans;
 +	u8 h_source[ETH_ALEN];
 +	u8 h_dest[ETH_ALEN];
++	bool tx_fwd_offload;
 +	enum flow_offload_xmit_type xmit_type;
 +};
 +
@@ -387,6 +388,7 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
 +			case DEV_PATH_BR_VLAN_KEEP:
 +				break;
 +			}
++			info->tx_fwd_offload = path->bridge.tx_fwd_offload;
 +			break;
 +		default:
 +			info->indev = NULL;
@@ -471,6 +473,7 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
 +		memcpy(route->tuple[dir].out.h_source, info.h_source, ETH_ALEN);
 +		memcpy(route->tuple[dir].out.h_dest, info.h_dest, ETH_ALEN);
 +		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
++		route->tuple[dir].out.tx_fwd_offload = info.tx_fwd_offload;
 +		route->tuple[dir].xmit_type = info.xmit_type;
 +	}
 +}
