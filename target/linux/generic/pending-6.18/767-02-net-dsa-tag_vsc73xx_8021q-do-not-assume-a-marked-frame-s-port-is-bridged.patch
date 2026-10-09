@@ -1,0 +1,55 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: dsa: tag_vsc73xx_8021q: do not assume a marked
+ frame's port is bridged
+
+vsc73xx_xmit() handles a frame marked for TX forwarding offload by
+looking up the port's bridge and passing it to br_vlan_enabled(), which
+dereferences it. Frames are only marked while the port offloads
+forwarding for its bridge, but a marked frame can still reach the tagger
+after the port left the bridge, for example from a qdisc installed on
+the user port, and dsa_port_bridge_dev_get() and
+dsa_port_bridge_num_get() each read dp->bridge again while
+dsa_port_bridge_destroy() may be clearing it.
+
+Read dp->bridge once, and send a marked frame for a port without a
+bridge like an unmarked one: on the port's standalone VLAN, out of that
+port only.
+
+tag_sja1105 (sja1105_imprecise_xmit()) and tag_dsa make the same
+assumption about marked frames and would need the same treatment; they
+are not used on the target this was written for.
+
+Assisted-by: LLM
+---
+ net/dsa/tag_vsc73xx_8021q.c | 20 +++++++++++++-------
+ 1 file changed, 13 insertions(+), 7 deletions(-)
+
+--- a/net/dsa/tag_vsc73xx_8021q.c
++++ b/net/dsa/tag_vsc73xx_8021q.c
+@@ -17,13 +17,19 @@ vsc73xx_xmit(struct sk_buff *skb, struct net_device *netdev)
+ 	u8 pcp;
+ 
+ 	if (skb->offload_fwd_mark) {
+-		unsigned int bridge_num = dsa_port_bridge_num_get(dp);
+-		struct net_device *br = dsa_port_bridge_dev_get(dp);
+-
+-		if (br_vlan_enabled(br))
+-			return skb;
+-
+-		tx_vid = dsa_tag_8021q_bridge_vid(bridge_num);
++		/* Frames are marked only while the port offloads forwarding
++		 * for its bridge, but a marked frame can still reach the port
++		 * after it left the bridge, e.g. from a qdisc. Read the bridge
++		 * once and send such a frame like an unmarked one.
++		 */
++		const struct dsa_bridge *bridge = READ_ONCE(dp->bridge);
++
++		if (bridge) {
++			if (br_vlan_enabled(bridge->dev))
++				return skb;
++
++			tx_vid = dsa_tag_8021q_bridge_vid(bridge->num);
++		}
+ 	}
+ 
+ 	pcp = netdev_txq_to_tc(netdev, queue_mapping);
