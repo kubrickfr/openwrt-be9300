@@ -1,0 +1,97 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: dsa: keep a port's bridge valid for taggers until
+ they are done with it
+
+A tagger reads dp->bridge on transmit, without locks, to handle a frame
+marked for TX forwarding offload, while dsa_port_bridge_create() and
+dsa_port_bridge_destroy() set and clear it under RTNL. Nothing orders
+the publication of a new bridge after its initialisation, the
+dsa_port_bridge_dev_get() and dsa_port_bridge_num_get() helpers load
+dp->bridge twice, and the last port to leave a bridge releases its
+number and frees it immediately. DSA clears BR_TX_FWD_OFFLOAD at
+NETDEV_PRECHANGEUPPER, before it destroys the bridge at
+NETDEV_CHANGEUPPER, but does not wait in between for frames already past
+that test, and a marked frame can also wait in a qdisc installed on the
+user port (DSA user ports have none by default). A tagger can then
+dereference a NULL or freed bridge, or tag a frame with a bridge number
+that a new bridge already reuses.
+
+Publish dp->bridge with smp_store_release() and clear it with
+WRITE_ONCE(), make the two helpers load it once, and when the last
+reference goes, wait for an RCU grace period (synchronize_net(), as the
+bridge does when a port leaves) before giving the number back and
+freeing the bridge. The transmit path, including qdisc dequeue, runs
+under rcu_read_lock_bh().
+
+This keeps dp->bridge a plain pointer rather than converting it to
+__rcu, which would touch every driver that reads it under RTNL.
+
+Assisted-by: LLM
+---
+ include/net/dsa.h |  8 ++++++--
+ net/dsa/port.c    | 15 ++++++++++++---
+ 2 files changed, 18 insertions(+), 5 deletions(-)
+
+--- a/include/net/dsa.h
++++ b/include/net/dsa.h
+@@ -766,12 +766,16 @@ struct net_device *dsa_port_to_bridge_port(const struct dsa_port *dp)
+ static inline struct net_device *
+ dsa_port_bridge_dev_get(const struct dsa_port *dp)
+ {
+-	return dp->bridge ? dp->bridge->dev : NULL;
++	const struct dsa_bridge *bridge = READ_ONCE(dp->bridge);
++
++	return bridge ? bridge->dev : NULL;
+ }
+ 
+ static inline unsigned int dsa_port_bridge_num_get(struct dsa_port *dp)
+ {
+-	return dp->bridge ? dp->bridge->num : 0;
++	const struct dsa_bridge *bridge = READ_ONCE(dp->bridge);
++
++	return bridge ? bridge->num : 0;
+ }
+ 
+ static inline bool dsa_port_bridge_same(const struct dsa_port *a,
+--- a/net/dsa/port.c
++++ b/net/dsa/port.c
+@@ -427,7 +427,8 @@ static int dsa_port_bridge_create(struct dsa_port *dp,
+ 	bridge = dsa_tree_bridge_find(ds->dst, br);
+ 	if (bridge) {
+ 		refcount_inc(&bridge->refcount);
+-		dp->bridge = bridge;
++		/* Taggers read dp->bridge locklessly on transmit */
++		smp_store_release(&dp->bridge, bridge);
+ 		return 0;
+ 	}
+ 
+@@ -447,7 +448,8 @@ static int dsa_port_bridge_create(struct dsa_port *dp,
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	dp->bridge = bridge;
++	/* Taggers read dp->bridge locklessly on transmit */
++	smp_store_release(&dp->bridge, bridge);
+ 
+ 	return 0;
+ }
+@@ -457,11 +459,18 @@ static void dsa_port_bridge_destroy(struct dsa_port *dp,
+ {
+ 	struct dsa_bridge *bridge = dp->bridge;
+ 
+-	dp->bridge = NULL;
++	WRITE_ONCE(dp->bridge, NULL);
+ 
+ 	if (!refcount_dec_and_test(&bridge->refcount))
+ 		return;
+ 
++	/* A tagger may still be using this bridge for a frame marked for TX
++	 * forwarding offload, from the transmit path under RCU. Let it finish
++	 * before the bridge number can go to a new bridge and the memory is
++	 * freed.
++	 */
++	synchronize_net();
++
+ 	if (bridge->num)
+ 		dsa_bridge_num_put(br, bridge->num);
+ 
