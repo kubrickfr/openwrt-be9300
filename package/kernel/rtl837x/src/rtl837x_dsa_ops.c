@@ -1104,11 +1104,14 @@ static int rtl837x_tag_8021q_vlan_del(struct dsa_switch *ds, int port, u16 vid)
 
 	/* Joining a bridge drops the port's standalone VLAN in favour of
 	 * the bridge's. Keep it in hardware anyway: the tagger still
-	 * addresses this port by its standalone VID for unmarked multicast
-	 * and broadcast (link-local frames, the bridge's per-port IGMP/MLD
-	 * copies), which have to reach this one port. The port's PVID is
-	 * the bridge VLAN and the VLAN has no other egress member, so
-	 * untagged ingress and isolation are unaffected.
+	 * addresses this port by its standalone VID for every unmarked
+	 * frame (link-local frames, the bridge's per-port IGMP/MLD copies,
+	 * unicast sent to this port on purpose), which has to reach this
+	 * one port. Frames the switch should forward from its own FDB come
+	 * marked and use the bridge VID: those the bridge forwards, and
+	 * those the software flowtable sends straight to this port. The
+	 * port's PVID is the bridge VLAN and the VLAN has no other egress
+	 * member, so untagged ingress and isolation are unaffected.
 	 */
 	if (dsa_port_bridge_dev_get(dp) && vid == dsa_tag_8021q_standalone_vid(dp))
 		return 0;
