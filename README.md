@@ -102,14 +102,51 @@ uci commit firewall && fw4 reload
   its probe pass. The flowtable is then built on `lan1`–`lan4` and the Wi-Fi
   interfaces instead of `br-lan`, and flows to wired clients are sent straight
   to a switch port.
-- With patch 766, such flows through the default VLAN-unaware `br-lan` work
-  (tested 2026-10-04), but nothing is gained, and there is a cost. Such a
-  flow stays pinned to the port where the bridge last saw the client. In testing, a download to a client on `lan1`
-  stalled for as long as `lan4` was down, because the bridge had learned the
-  client on `lan4`. With `flow_offloading_hw=0` the same test did not stall.
-- 766 does not cover ports of a VLAN-filtering bridge: with VLAN filtering
-  and `flow_offloading_hw=1`, put the LAN on a `br-lan.N` VLAN interface, not
-  directly on `br-lan`.
+- The flowtable marks the frames it sends straight to a switch port for TX
+  forwarding offload (pending patch 708), as the bridge does for the frames
+  it forwards: they go out on the bridge's VLAN and the switch delivers them
+  from its own FDB. This is needed because under `tag_8021q` the bridge FDB
+  has every wired client on the first forwarding port. For software
+  flowtable traffic (nftables, and iptables `FLOWOFFLOAD`), 708 replaces
+  patch 766, which did the same inside the tagger for every unmarked unicast
+  frame. Unicast sent to one port on purpose, e.g. through a packet socket,
+  now leaves through that port again. Pending patches 767-01/02 keep the
+  tagger from dereferencing a missing or freed bridge if a marked frame
+  reaches a port that just left its bridge.
+- A flow sent straight to a port used to stay pinned to it: in testing with
+  766, a download to a client on `lan1` stalled for as long as `lan4` was
+  down, because the bridge had learned the client on `lan4`. Pending patch
+  709 tears flows down when their port loses carrier or joins or leaves a
+  bridge, so the next packet takes the bridge and the flow is set up again.
+  708, 709 and 767-01/02 are not yet tested on hardware.
+- Known limits of sending flows straight to the ports:
+  - a station that moves between a switch port and the router's own Wi-Fi
+    without changing address gets nothing on its existing flows until they
+    go idle, as nothing tells the flowtable that the bridge saw it move
+    (this holds for any switch);
+  - the switch does not tell which port a bridged frame came in on, so
+    received traffic is attributed to the first forwarding port; when a port
+    with a lower number comes up, attribution moves to it, and the upload
+    direction of existing flows misses the flowtable and takes the slow path
+    until the flow ends;
+  - turning `vlan_filtering` on or off at runtime leaves existing flows
+    unmarked until they end, so their frames leave by the port the bridge
+    FDB names;
+  - with proxy ARP (`proxy_arp` on a Wi-Fi interface) or neighbour
+    suppression on `br-lan`, the bridge answers a wired client itself and
+    sends the reply unmarked out of the port it attributed the request to,
+    the first forwarding port: wired clients on the other ports cannot
+    resolve the stations answered for. 766 hid this; both are off by
+    default, so leave them off on this board.
+- Bypassing the bridge is worth a few percent on a single stream: with
+  `lan1`–`lan4` added to the software flowtable by hand
+  (`nft add flowtable inet fw4 ft '{ hook ingress priority filter; devices = { "lan1", "lan2", "lan3", "lan4" }; }'`),
+  one PPPoE download went from ~1.84 to ~1.92–2.08 Gbit/s (2026-10-09, RPS on
+  the WAN). That was measured with 766, before 708 replaced it. fw4 does not
+  add the ports in software mode.
+- 708 does not cover ports of a VLAN-filtering bridge, nor flows offloaded
+  to hardware: with VLAN filtering and the ports in the flowtable, put the
+  LAN on a `br-lan.N` VLAN interface, not directly on `br-lan`.
 - A PPPoE WAN cannot be hardware-offloaded even with the experimental PPE
   offload series in perceival/openwrt-flint3: that driver declines PPPoE in
   both directions.
@@ -321,7 +358,8 @@ Patches from this work that have gone upstream or are in review:
 ## Credits
 
 Kamil Bienkiewicz (perceival) wrote the rtl837x VLAN ingress and
-standalone-VLAN fixes, the `tag_8021q` bridge-VID patch (766), the coredump
+standalone-VLAN fixes, the `tag_8021q` bridge-VID patch (766, since replaced
+by the flowtable patch 708), the coredump
 release handler, the faster switch bring-up and the ARMv8 crypto
 configuration carried here.
 
