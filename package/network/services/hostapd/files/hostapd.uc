@@ -257,6 +257,26 @@ function iface_macaddr_sync(phydev, config)
 			   iface_macaddr_options(config));
 }
 
+// hostapd gives a BSS it creates the radio mask of the first BSS of the
+// phy. Where that is an AP MLD, the mask covers every radio of the MLD,
+// and bss_create cannot narrow it: hostapd has brought the netdev up by
+// then, and the kernel refuses a new radio mask on a running netdev. On a
+// multi-radio wiphy, create the netdev of a further BSS here with the
+// radio of the phy; hostapd uses it, as it does for a BSS that is not the
+// first one. If this fails, hostapd creates the netdev as before.
+function bss_wdev_add(phydev, bss)
+{
+	if (bss.mld_ap || phydev.radio == null || phydev.radio < 0)
+		return;
+
+	let err = phydev.wdev_add(bss.ifname, {
+		mode: "ap",
+		macaddr: bss.bssid,
+	});
+	if (err)
+		hostapd.printf(`Failed to create ${bss.ifname} on phy ${phydev.name}: ${err}`);
+}
+
 function iface_supplicant_start(phydev)
 {
 	ubus.defer("wpa_supplicant", "phy_set_state", {
@@ -295,6 +315,9 @@ function __iface_pending_next(pending, state, ret, data)
 				return null;
 			}
 		}
+
+		for (let i = 1; i < length(config.bss); i++)
+			bss_wdev_add(phydev, config.bss[i]);
 
 		pending.call("wpa_supplicant", "phy_status", {
 			phy: phydev.phy,
@@ -1150,6 +1173,7 @@ function iface_reload_config(name, phydev, config, old_config)
 			continue;
 
 		hostapd.printf(`Add bss ${ifname} on phy ${name}`);
+		bss_wdev_add(phydev, config.bss[i]);
 		bss_list[i] = iface.add_bss(config_inline, i);
 		if (!bss_list[i]) {
 			hostapd.printf(`Failed to add new bss ${ifname} on phy ${name}`);
