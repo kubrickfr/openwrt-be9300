@@ -1,0 +1,30 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] ucode: handle a break of the handler
+
+ucode 2026-10-18 adds STATUS_BREAK to uc_vm_status_t.  uc_vm_execute()
+returns it when a break is requested while the program runs, which
+only the remote debugger does.  The switch over the result of the
+handler in uh_ucode_state_init() does not handle it, which fails the
+build with -Werror=switch:
+
+  ucode.c:295:9: error: enumeration value 'STATUS_BREAK' not handled
+  in switch [-Werror=switch]
+
+A break leaves the handler only partly run, so treat it as a failure,
+as the ucode command line does outside the remote debug mode.
+
+Assisted-by: LLM
+---
+--- a/ucode.c
++++ b/ucode.c
+@@ -300,6 +300,10 @@
+ 		fprintf(stderr, "Error: The ucode handler invoked exit(%d)\n", exitcode);
+ 		exit(exitcode ? exitcode : 1);
+ 
++	case STATUS_BREAK:
++		fprintf(stderr, "Error: The ucode handler was interrupted\n");
++		exit(1);
++
+ 	case ERROR_COMPILE:
+ 		fprintf(stderr, "Error: Compilation error while executing ucode handler\n");
+ 		exit(1);
