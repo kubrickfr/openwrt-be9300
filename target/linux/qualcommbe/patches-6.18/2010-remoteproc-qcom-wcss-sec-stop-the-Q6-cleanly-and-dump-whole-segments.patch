@@ -1,0 +1,202 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] remoteproc: qcom: wcss_sec: stop the Q6 cleanly and dump whole segments
+
+The secure WCSS driver in generic/pending-6.18 (830-03 and 830-04) comes
+from qualcommax and predates v14 of the upstream series [1].  Port v14's
+fixes to the stop, start and coredump paths, and close the holes that
+both versions leave:
+
+ - Stop: before the PAS or TME-L teardown, ask the Q6 to stop through
+   SMP2P with qcom_q6v5_request_stop(), as v14 and qcom_q6v5_pas do.
+   The helper sends the request only while the core considers the
+   remote running, so not when it rolls back a failed boot.  Without
+   it the Q6 is torn down without warning, and q6v5->running stays
+   true, so the watchdog interrupt that a stop sometimes raises instead
+   of a stop-ack is reported as a crash.
+
+   If the teardown fails in rproc_stop(), keep the Q6 prepared, as
+   830-03 does, because rproc_stop() then leaves the remote running.
+   When the core rolls back a failed boot, it ignores the error and
+   leaves the remote offline, so unprepare there regardless.
+
+ - Start: when the Q6 does not come up in time, clear q6v5->running and
+   try to tear the subsystem down, so that TrustZone does not keep it
+   authenticated and running for the next start.  Log the error if the
+   teardown fails.  The core is not running yet, so
+   qcom_q6v5_request_stop() only clears the flag here.  Unprepare
+   either way, as qcom_q6v5_pas does, because the core treats the
+   remote as offline after a failed start.
+
+   Do not unprepare after a successful start: unprepare disables the
+   handover interrupt, stop then disables it again, and each start/stop
+   cycle leaves it disabled one level deeper.  It also drops the
+   interconnect vote and the QMP load state, which IPQ5332 does not
+   use.
+
+ - TME-L teardown: return the error of mbox_send_message(), which waits
+   for the transfer and reports its status, instead of ignoring it.
+
+ - Coredump: rproc_coredump_read() always ends a segment with a chunk
+   that reaches its end exactly.  830-03 unmaps the segment for that
+   chunk instead of copying it, so the tail of every segment is missing
+   from the dump, and the reader gets whatever was in its buffer.  v14
+   copies it but caches the mapping in the segment and never unmaps it.
+   Both versions share that one mapping between devcoredump readers,
+   which are not serialised.  Map, copy with memcpy_fromio() and unmap
+   each chunk instead.  This also leaves nothing mapped when a reader
+   stops early.  Fill the chunk with 0xff when it cannot be mapped, as
+   the core does for a segment it cannot read.
+
+ - da_to_va(): report the carveout as I/O memory, as v14 does.  No core
+   path that honours is_iomem reaches this driver today, because it
+   loads its firmware itself and registers only custom dump segments.
+   A future caller that asks can then choose I/O accessors.
+
+One case is left as qcom_q6v5_pas has it.  If the Q6 neither
+acknowledges the stop nor is torn down, rproc_stop() leaves it running,
+but qcom_q6v5_request_stop() has already cleared q6v5->running, so a
+later crash of it is not reported.
+
+Only IPQ5424 uses the TME-L path, and qualcommbe builds no IPQ5424
+image.  The fixes belong in 830-03 eventually.  They live here until
+then, so the qualcommax driver stays unchanged.
+
+[1] https://lore.kernel.org/r/20260803-rproc-v14-3-a1f87b0b0ad2@oss.qualcomm.com
+
+Assisted-by: LLM
+---
+ drivers/remoteproc/qcom_q6v5_wcss_sec.c | 85 +++++++++++++++++--------
+ 1 file changed, 57 insertions(+), 28 deletions(-)
+
+--- a/drivers/remoteproc/qcom_q6v5_wcss_sec.c
++++ b/drivers/remoteproc/qcom_q6v5_wcss_sec.c
+@@ -52,6 +52,26 @@ struct wcss_data {
+ 	bool use_tmelcom;
+ };
+ 
++static int wcss_sec_shutdown(struct wcss_sec *wcss)
++{
++	int ret;
++
++	if (wcss->desc->use_tmelcom) {
++		struct tmel_sec_auth tsa = {0};
++		struct tmel_qmp_msg tqm;
++
++		tsa.pas_id = wcss->desc->pasid;
++		tqm.msg = &tsa;
++		tqm.msg_id = TMEL_MSG_UID_SECBOOT_SS_TEAR_DOWN;
++
++		ret = mbox_send_message(wcss->mbox_chan, (void *)&tqm);
++
++		return ret < 0 ? ret : 0;
++	}
++
++	return qcom_scm_pas_shutdown(wcss->desc->pasid);
++}
++
+ static int wcss_sec_start(struct rproc *rproc)
+ {
+ 	struct wcss_sec *wcss = rproc->priv;
+@@ -86,8 +106,16 @@ static int wcss_sec_start(struct rproc *rproc)
+ 	}
+ 
+ 	ret = qcom_q6v5_wait_for_start(&wcss->q6, Q6_WAIT_TIMEOUT);
+-	if (ret == -ETIMEDOUT)
++	if (ret == -ETIMEDOUT) {
+ 		dev_err(dev, "start timed out\n");
++		/* the core is not running yet, so this only clears q6v5.running */
++		qcom_q6v5_request_stop(&wcss->q6, NULL);
++		if (wcss_sec_shutdown(wcss))
++			dev_err(dev, "not able to shutdown after the timeout\n");
++		goto unprepare;
++	}
++
++	return 0;
+ 
+ unprepare:
+ 	qcom_q6v5_unprepare(&wcss->q6);
+@@ -101,26 +129,24 @@ static int wcss_sec_stop(struct rproc *rproc)
+ 	struct device *dev = wcss->dev;
+ 	int ret;
+ 
+-	if (wcss->desc->use_tmelcom) {
+-		struct tmel_sec_auth tsa = {0};
+-		struct tmel_qmp_msg tqm;
+-
+-		tsa.pas_id = wcss->desc->pasid;
+-		tqm.msg = &tsa;
+-		tqm.msg_id = TMEL_MSG_UID_SECBOOT_SS_TEAR_DOWN;
+-
+-		mbox_send_message(wcss->mbox_chan, (void *)&tqm);
+-	} else {
+-		ret = qcom_scm_pas_shutdown(wcss->desc->pasid);
+-		if (ret) {
+-			dev_err(dev, "not able to shutdown\n");
++	ret = qcom_q6v5_request_stop(&wcss->q6, NULL);
++	if (ret == -ETIMEDOUT)
++		dev_err(dev, "timed out on wait\n");
++
++	ret = wcss_sec_shutdown(wcss);
++	if (ret) {
++		dev_err(dev, "not able to shutdown: %d\n", ret);
++		/*
++		 * rproc_stop() then keeps the remote running, so stay prepared.
++		 * A failed boot is rolled back regardless, with the remote offline.
++		 */
++		if (rproc->state != RPROC_OFFLINE)
+ 			return ret;
+-		}
+ 	}
+ 
+ 	qcom_q6v5_unprepare(&wcss->q6);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static void *wcss_sec_da_to_va(struct rproc *rproc, u64 da, size_t len,
+@@ -133,6 +159,9 @@ static void *wcss_sec_da_to_va(struct rproc *rproc, u64 da, size_t len,
+ 	if (offset < 0 || offset + len > wcss->mem_size)
+ 		return NULL;
+ 
++	if (is_iomem)
++		*is_iomem = true;
++
+ 	return wcss->mem_region + offset;
+ }
+ 
+@@ -207,22 +236,22 @@ static void wcss_sec_copy_segment(struct rproc *rproc,
+ {
+ 	struct wcss_sec *wcss = rproc->priv;
+ 	struct device *dev = wcss->dev;
++	void __iomem *ptr;
+ 
+-	if (!segment->io_ptr)
+-		segment->io_ptr = ioremap_wc(segment->da, segment->size);
+-
+-	if (!segment->io_ptr) {
+-		dev_err(dev, "Failed to ioremap segment %pad size 0x%zx\n",
+-			&segment->da, segment->size);
++	/*
++	 * Map only this chunk: readers of a devcoredump are not serialised,
++	 * and one may stop before the end of a segment.
++	 */
++	ptr = ioremap_wc(segment->da + offset, size);
++	if (!ptr) {
++		dev_err(dev, "Failed to ioremap segment %pad at 0x%zx+0x%zx\n",
++			&segment->da, offset, size);
++		memset(dest, 0xff, size);
+ 		return;
+ 	}
+ 
+-	if (offset + size < segment->size) {
+-		memcpy(dest, segment->io_ptr + offset, size);
+-	} else {
+-		iounmap(segment->io_ptr);
+-		segment->io_ptr = NULL;
+-	}
++	memcpy_fromio(dest, ptr, size);
++	iounmap(ptr);
+ }
+ 
+ static int wcss_sec_dump_segments(struct rproc *rproc,
