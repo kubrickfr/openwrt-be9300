@@ -3,7 +3,7 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=rtl837x-dsa
 PKG_VERSION:=0.0.2
-PKG_RELEASE:=3
+PKG_RELEASE:=7
 PKG_MAINTAINER:=air jinkela (air_jinkela@163.com)
 
 include $(INCLUDE_DIR)/package.mk
@@ -11,12 +11,16 @@ include $(INCLUDE_DIR)/package.mk
 define KernelPackage/$(PKG_NAME)
   SUBMENU:=Other modules
   TITLE:=$(PKG_NAME)
-  KCONFIG:=CONFIG_NET_DSA_TAG_VSC73XX_8021Q
+  # The switch uses its native RTL8_4 DSA tag.
+  KCONFIG:=CONFIG_NET_DSA_TAG_RTL8_4
   FILES:= \
-	$(PKG_BUILD_DIR)/rtl837x_dsa.ko \
-	$(LINUX_DIR)/net/dsa/tag_vsc73xx_8021q.ko
-  AUTOLOAD:=$(call AutoLoad,99,rtl837x_dsa)
-  DEPENDS:=+kmod-dsa +kmod-regmap-core
+	$(PKG_BUILD_DIR)/rtl8372n_dsa.ko \
+	$(LINUX_DIR)/net/dsa/tag_rtl8_4.ko
+  AUTOLOAD:=$(call AutoLoad,17,rtl8372n_dsa)
+  # Needs the qualcommbe EDMA checksum fallback (target patch 0431).
+  DEPENDS:=@TARGET_qualcommbe +kmod-dsa +kmod-regmap-core +kmod-mdio-devres
+  # kmod-dsa-rtl8365mb packages tag_rtl8_4.ko too.
+  CONFLICTS:=kmod-dsa-rtl8365mb
 endef
 
 define Build/Compile

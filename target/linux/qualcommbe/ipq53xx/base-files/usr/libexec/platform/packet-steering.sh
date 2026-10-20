@@ -10,7 +10,9 @@
 # threaded NAPI on these devices it takes the single-device path and writes
 # one single-CPU mask across every rx-* queue of both lan and wan, which
 # would funnel the whole datapath back onto one core through the RPS
-# backlog.
+# backlog. That holds for the WAN. On lan, the switch's rtl8_4 tag hides L3
+# from the PPE, so LAN ingress probably all arrives on one ring and RPS does
+# all the spreading (package/kernel/rtl837x/TESTING.md, section 7).
 #
 # A single flow still lands on one ring. Receiving and forwarding it on
 # that ring's CPU caps one TCP stream at about 1.5 Gbit/s on a PPPoE WAN.
