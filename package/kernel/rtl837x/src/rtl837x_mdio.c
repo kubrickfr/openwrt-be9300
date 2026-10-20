@@ -326,6 +326,13 @@ MODULE_DEVICE_TABLE(of, rtl837x_mdio_match);
 
 static struct mdio_driver rtl837x_mdio_driver = {
 	.mdiodrv.driver = {
+		/*
+		 * mdio_driver_register() leaves the owner unset. phy_attach_direct()
+		 * then sees a user port's parent driver owned by no module, unlike
+		 * the internal MDIO bus, and pins this module once per attached
+		 * PHY, so rmmod could never succeed.
+		 */
+		.owner = THIS_MODULE,
 		.name = "rtl8372n-mdio",
 		.of_match_table = rtl837x_mdio_match,
 	},
