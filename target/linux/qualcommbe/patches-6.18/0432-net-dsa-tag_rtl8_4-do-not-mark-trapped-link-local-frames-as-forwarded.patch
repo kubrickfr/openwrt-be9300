@@ -1,0 +1,53 @@
+From: Francois Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: dsa: tag_rtl8_4: do not mark trapped link-local frames
+ as forwarded
+
+The RTL8372N driver (package/kernel/rtl837x) sets the switch's
+reserved-multicast actions to trap 01:80:c2:00:00:00 and 02-0f (STP,
+LACP, EAPOL, LLDP, ...) to the CPU, so the switch never forwards these
+frames between its ports. The trapped frames are expected to carry an
+RTL8373-family reason code (0x5f is predicted, nothing is measured
+yet), not the 80 that rtl8_4_read_tag() takes for a trap, so the tagger
+calls dsa_default_offload_fwd_mark() for them. Once the ingress port
+offloads a bridge, such a frame is marked as forwarded by hardware
+although the hardware forwarded it nowhere, and
+nbp_switchdev_allowed_egress() then keeps the bridge from sending it to
+the other ports of the switch.
+
+That matters wherever the bridge forwards link-local frames itself:
+BPDUs while STP is off, and the group_fwd_mask addresses (EAPOL, LLDP).
+They still reach ports outside the switch, such as Wi-Fi, but no longer
+the other LAN ports. Two STP switches on different LAN ports that are
+also cabled to each other no longer hear each other's BPDUs through the
+router, so neither blocks a port, and broadcasts loop through the
+switch's hardware flooding at line rate.
+
+Do what tag_brcm and tag_mxl862xx do: never mark a frame with a
+link-local destination, whatever its REASON. The mac header still points
+at the DA in both the rtl8_4 and the rtl8_4t receive paths. PAUSE
+(01:80:c2:00:00:01), which the driver does not trap, is dropped by the
+bridge in any case.
+
+This is right only while the switch does trap these frames. A frame the
+switch forwards as well as delivering it to the CPU would be sent a
+second time by a bridge with STP off. That is possibly the case with
+RTL8365MB, the other user of this tagger, which programs no
+reserved-multicast actions. No qualcommbe image uses it, which is why
+this is a target patch and not proposed upstream as it is.
+---
+--- a/net/dsa/tag_rtl8_4.c
++++ b/net/dsa/tag_rtl8_4.c
+@@ -193,7 +193,12 @@ static int rtl8_4_read_tag(struct sk_buf
+ 		return -ENOENT;
+ 	}
+ 
+-	if (reason != RTL8_4_REASON_TRAP)
++	/* The switch traps link-local frames to the CPU instead of forwarding
++	 * them, and need not report that as RTL8_4_REASON_TRAP: never mark
++	 * them, so that the bridge forwards them in software.
++	 */
++	if (reason != RTL8_4_REASON_TRAP &&
++	    !is_link_local_ether_addr(eth_hdr(skb)->h_dest))
+ 		dsa_default_offload_fwd_mark(skb);
+ 
+ 	return 0;
