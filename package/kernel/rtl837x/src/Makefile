@@ -4,4 +4,4 @@
 ccflags-y += -Wall
 
 obj-$(CONFIG_RTL837X_DSA) += rtl8372n_dsa.o
-rtl8372n_dsa-objs := rtl8372n.o rtl837x_mdio.o rtl837x_common.o rtl8372n_phy.o
+rtl8372n_dsa-objs := rtl8372n.o rtl837x_mdio.o rtl837x_common.o

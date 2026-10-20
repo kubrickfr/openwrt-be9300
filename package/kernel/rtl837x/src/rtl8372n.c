@@ -9,7 +9,6 @@
 #include <linux/ethtool.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
-#include <linux/mii.h>
 #include <linux/of.h>
 #include <linux/phy.h>
 #include <linux/regmap.h>
@@ -73,35 +72,6 @@ static enum dsa_tag_protocol rtl8372n_get_tag_protocol(struct dsa_switch *ds,
 	return DSA_TAG_PROTO_RTL8_4;
 }
 
-static int rtl8372n_mdio_phy_read_c22(struct mii_bus *bus, int addr, int regnum)
-{
-	struct rtl837x_priv *priv = bus->priv;
-	u16 val;
-	int ret;
-
-	ret = priv->ops->phy_read_c22(priv, addr, regnum, &val);
-	if (regnum == MII_PHYSID1 || regnum == MII_PHYSID2)
-		dev_info(priv->dev,
-			 "PHY ID port %d reg %d: value=0x%04x err=%d\n",
-			 addr, regnum, ret ? 0 : val, ret);
-
-	if (ret) {
-		dev_err_ratelimited(priv->dev,
-				    "PHY C22 read failed: port=%d reg=%d err=%d\n",
-				    addr, regnum, ret);
-		return ret;
-	}
-
-	return val;
-}
-
-static int rtl8372n_mdio_phy_write_c22(struct mii_bus *bus, int addr, int regnum, u16 val)
-{
-	struct rtl837x_priv *priv = bus->priv;
-
-	return priv->ops->phy_write_c22(priv, addr, regnum, val);
-}
-
 static int rtl8372n_mdio_phy_read_c45(struct mii_bus *bus, int port, int devad, int regnum)
 {
 	struct rtl837x_priv *priv = bus->priv;
@@ -125,11 +95,6 @@ static int rtl8372n_mdio_phy_write_c45(struct mii_bus *bus, int port, int devad,
 	return priv->ops->phy_write_c45(priv, port, devad, regnum, val);
 }
 
-bool rtl8372n_phy_bus_match(struct mii_bus *bus)
-{
-	return bus && bus->read == rtl8372n_mdio_phy_read_c22;
-}
-
 static int rtl8372n_register_phys(struct rtl837x_priv *priv,
 				  struct mii_bus *bus, struct device_node *mnp)
 {
@@ -143,12 +108,6 @@ static int rtl8372n_register_phys(struct rtl837x_priv *priv,
 		if (of_node_name_eq(child, "ethernet-phy-package")) {
 			dev_err(priv->dev,
 				"PHY packages are not supported on the private MDIO bus\n");
-			of_node_put(child);
-			return -EOPNOTSUPP;
-		}
-		if (of_device_is_compatible(child, "ethernet-phy-ieee802.3-c45")) {
-			dev_err(priv->dev,
-				"Clause 45 PHYs are not supported on internal ports 4-7\n");
 			of_node_put(child);
 			return -EOPNOTSUPP;
 		}
@@ -171,20 +130,24 @@ static int rtl8372n_register_phys(struct rtl837x_priv *priv,
 		if (!(dsa_user_ports(priv->ds) & BIT(port)))
 			continue;
 
-		/* Discover the real ID, but constrain matching before registration. */
-		phy = get_phy_device(bus, port, false);
+		/*
+		 * The switch reaches its internal PHYs through an MMD-addressed
+		 * access engine, so register them as the Clause 45 devices they
+		 * are and let phylib bind the matching driver by ID (the RTL8224
+		 * entry of the Realtek PHY driver).
+		 */
+		phy = get_phy_device(bus, port, true);
 		if (IS_ERR(phy)) {
 			ret = PTR_ERR(phy);
 			dev_err(priv->dev, "PHY discovery port %d failed: %d\n", port, ret);
 			return ret;
 		}
-		if (phy->is_c45) {
-			dev_err(priv->dev,
-				"Clause 45 PHY detected at internal port %d\n", port);
-			phy_device_free(phy);
-			return -EOPNOTSUPP;
-		}
-		phy->mdio.bus_match = rtl8372n_phy_device_match;
+		/*
+		 * This bus has no Clause 22 accessors. Drop the "C22 registers
+		 * present" bit so that phylib's generic aneg restart and
+		 * fallbacks stay on the C45 path.
+		 */
+		phy->c45_ids.devices_in_package &= ~BIT(0);
 
 		for_each_available_child_of_node(mnp, child) {
 			if (of_mdio_parse_addr(priv->dev, child) == port)
@@ -228,18 +191,16 @@ static int rtl8372n_setup_mdio(struct rtl837x_priv *priv)
 		goto out;
 	}
 
-	if (!mnp)
-		ds->user_mii_bus = bus;
+	/* DSA falls back to this bus for user ports without a phy-handle. */
+	ds->user_mii_bus = bus;
 
 	bus->priv = priv;
 	bus->name = KBUILD_MODNAME "-mii";
 	snprintf(bus->id, MII_BUS_ID_SIZE, "%s", dev_name(dev));
-	bus->read = rtl8372n_mdio_phy_read_c22;
-	bus->write = rtl8372n_mdio_phy_write_c22;
 	bus->read_c45 = rtl8372n_mdio_phy_read_c45;
 	bus->write_c45 = rtl8372n_mdio_phy_write_c45;
 	bus->parent = dev;
-	/* Automatic scanning would bind an already loaded RTL8224 driver. */
+	/* Internal PHYs are registered explicitly, for enabled ports only. */
 	bus->phy_mask = ~0;
 	if (mnp) {
 		device_set_node(&bus->dev, of_fwnode_handle(mnp));
@@ -258,32 +219,27 @@ static int rtl8372n_setup_mdio(struct rtl837x_priv *priv)
 				continue;
 			phy = mdiobus_get_phy(bus, port);
 			if (!phy) {
-				dev_err(dev, "PHY binding port %d: phy_device absent\n",
-					port);
+				dev_err(dev, "port %d: PHY device absent\n", port);
 				ret = -ENODEV;
 				continue;
 			}
+			/*
+			 * phy->drv survives a failed phylib probe, so check the
+			 * binding itself. Unbound, phylib falls back to genphy.
+			 */
 			device_lock(&phy->mdio.dev);
-			dev_info(dev,
-				 "PHY binding port %d: id=0x%08x clause=%s bound=%d driver=%s private_phy=%d\n",
-				 port, phy->phy_id, phy->is_c45 ? "C45" : "C22",
-				 device_is_bound(&phy->mdio.dev),
-				 phy->mdio.dev.driver ? phy->mdio.dev.driver->name : "none",
-				 phy->drv == &rtl8372n_phy_driver);
-			/* phy->drv can survive an unsuccessful phylib probe. */
-			if (!device_is_bound(&phy->mdio.dev) ||
-			    phy->mdio.dev.driver != &rtl8372n_phy_driver.mdiodrv.driver ||
-			    phy->drv != &rtl8372n_phy_driver) {
-				dev_err(dev, "port %d did not bind to the private PHY driver\n",
-					port);
-				ret = -ENODEV;
-			}
+			if (!device_is_bound(&phy->mdio.dev))
+				dev_warn(dev,
+					 "port %d: no PHY driver bound to C45 ID %#010x (probe failed or kmod-phy-realtek missing)\n",
+					 port, phy->c45_ids.device_ids[MDIO_MMD_PMAPMD]);
+			else
+				dev_dbg(dev, "port %d: PHY driver %s\n", port,
+					phy->drv->name);
 			device_unlock(&phy->mdio.dev);
 		}
 	}
 	if (ret) {
-		if (!mnp)
-			ds->user_mii_bus = NULL;
+		ds->user_mii_bus = NULL;
 		dev_err(dev, "failed to register MDIO bus: %d\n", ret);
 	}
 
@@ -1027,8 +983,6 @@ static const struct dsa_switch_ops rtl8372n_switch_ops_mdio = {
 static const struct rtl837x_ops rtl8372n_ops = {
 	.detect		= rtl8372n_detect,
 
-	.phy_read_c22   = rtl837x_phy_read_c22,
-	.phy_write_c22  = rtl837x_phy_write_c22,
 	.phy_read_c45   = rtl837x_phy_read_c45,
 	.phy_write_c45  = rtl837x_phy_write_c45,
 };
