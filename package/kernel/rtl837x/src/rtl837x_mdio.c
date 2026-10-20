@@ -231,6 +231,12 @@ static int rtl837x_mdio_probe(struct mdio_device *mdiodev)
 	mutex_init(&priv->map_lock);
 	mutex_init(&priv->sds_lock);
 	mutex_init(&priv->phy_lock);
+	mutex_init(&priv->table_lock);
+	mutex_init(&priv->vlan_lock);
+	mutex_init(&priv->fdb_lock);
+	INIT_LIST_HEAD(&priv->fdb_aliases);
+	INIT_LIST_HEAD(&priv->fdb_pending);
+	INIT_DELAYED_WORK(&priv->fdb_resync_work, rtl8372n_fdb_resync_work);
 	priv->map = devm_regmap_init(dev, NULL, priv, &regmap_config);
 	if (IS_ERR(priv->map)) {
 		ret = PTR_ERR(priv->map);
@@ -305,6 +311,8 @@ static void rtl837x_mdio_shutdown(struct mdio_device *mdiodev)
 	struct rtl837x_priv *priv = dev_get_drvdata(&mdiodev->dev);
 
 	if (priv) {
+		/* Teardown cancels it too, but shutdown runs no teardown. */
+		cancel_delayed_work_sync(&priv->fdb_resync_work);
 		dsa_switch_shutdown(priv->ds);
 		dev_set_drvdata(&mdiodev->dev, NULL);
 	}
