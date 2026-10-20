@@ -3,7 +3,7 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=rtl837x-dsa
 PKG_VERSION:=0.0.2
-PKG_RELEASE:=7
+PKG_RELEASE:=8
 PKG_MAINTAINER:=air jinkela (air_jinkela@163.com)
 
 include $(INCLUDE_DIR)/package.mk
@@ -18,7 +18,7 @@ define KernelPackage/$(PKG_NAME)
 	$(LINUX_DIR)/net/dsa/tag_rtl8_4.ko
   AUTOLOAD:=$(call AutoLoad,17,rtl8372n_dsa)
   # Needs the qualcommbe EDMA checksum fallback (target patch 0431).
-  DEPENDS:=@TARGET_qualcommbe +kmod-dsa +kmod-regmap-core +kmod-mdio-devres
+  DEPENDS:=@TARGET_qualcommbe +kmod-dsa +kmod-phy-realtek +kmod-regmap-core +kmod-mdio-devres
   # kmod-dsa-rtl8365mb packages tag_rtl8_4.ko too.
   CONFLICTS:=kmod-dsa-rtl8365mb
 endef

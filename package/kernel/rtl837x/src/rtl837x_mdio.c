@@ -325,27 +325,8 @@ static struct mdio_driver rtl837x_mdio_driver = {
 	.remove = rtl837x_mdio_remove,
 	.shutdown = rtl837x_mdio_shutdown,
 };
-static int __init rtl8372n_init(void)
-{
-	int ret;
 
-	/* Register the private PHY driver before creating its child bus. */
-	ret = phy_drivers_register(&rtl8372n_phy_driver, 1, THIS_MODULE);
-	if (ret)
-		return ret;
-	ret = mdio_driver_register(&rtl837x_mdio_driver);
-	if (ret)
-		phy_drivers_unregister(&rtl8372n_phy_driver, 1);
-	return ret;
-}
-module_init(rtl8372n_init);
-
-static void __exit rtl8372n_exit(void)
-{
-	mdio_driver_unregister(&rtl837x_mdio_driver);
-	phy_drivers_unregister(&rtl8372n_phy_driver, 1);
-}
-module_exit(rtl8372n_exit);
+mdio_module_driver(rtl837x_mdio_driver);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("StarField Xu <air_jinkela@163.com>");
