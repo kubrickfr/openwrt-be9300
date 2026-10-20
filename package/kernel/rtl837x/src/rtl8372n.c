@@ -236,6 +236,12 @@ static int rtl8372n_setup_mdio(struct rtl837x_priv *priv)
 				dev_dbg(dev, "port %d: PHY driver %s\n", port,
 					phy->drv->name);
 			device_unlock(&phy->mdio.dev);
+			/*
+			 * The MACs implement no LPI, so phylink leaves EEE alone.
+			 * Keep it off, as the SDK-based driver did, instead of
+			 * advertising the PHY's reset default.
+			 */
+			phy_disable_eee(phy);
 		}
 	}
 	if (ret) {
@@ -473,42 +479,6 @@ static int rtl8372n_port_set_isolation(struct rtl837x_priv *priv, int port,
 					u32 mask)
 {
 	return rtl837x_reg_write(priv, RTL837X_PORT_ISOLATION_REG(port), mask);
-}
-
-static bool rtl8372n_is_internal_phy_port(int port)
-{
-	return port >= 0 && port < RTL8372N_NUM_PORTS &&
-	       (RTL8372N_PHY_PORT_MASK & BIT(port));
-}
-
-static int rtl8372n_port_enable(struct dsa_switch *ds, int port,
-			       struct phy_device *phy)
-{
-	struct rtl837x_priv *priv = ds->priv;
-	int ret;
-
-	if (!rtl8372n_is_internal_phy_port(port))
-		return 0;
-
-	ret = priv->ops->phy_write_c45(priv, port, 31, 0xa610, 0x2058);
-	if (ret)
-		return ret;
-
-	return 0;
-}
-
-static void rtl8372n_port_disable(struct dsa_switch *ds, int port)
-{
-	struct rtl837x_priv *priv = ds->priv;
-	int ret;
-
-	if (!rtl8372n_is_internal_phy_port(port))
-		return;
-
-	ret = priv->ops->phy_write_c45(priv, port, 31, 0xa610, 0x2858);
-	if (ret)
-		dev_warn(priv->dev, "failed to power down PHY on port %d: %d\n",
-			 port, ret);
 }
 
 /*
@@ -959,7 +929,11 @@ static int rtl8372n_setup(struct dsa_switch *ds)
 	ret = rtl8372n_set_tag_rtl(ds);
 	if (ret)
 		goto fail;
-	/* Register PHYs only after forwarding and the PHY power policy are set. */
+	/*
+	 * Register PHYs only after forwarding is set up. They stay in PMA low
+	 * power (OCP 0xa610 mirrors PMA/PMD control 1) until phylib resumes
+	 * them on attach; from then on phylib owns their power state.
+	 */
 	ret = rtl8372n_setup_mdio(priv);
 	if (ret)
 		goto fail;
@@ -976,8 +950,6 @@ static const struct dsa_switch_ops rtl8372n_switch_ops_mdio = {
 	.setup = rtl8372n_setup,
 	.teardown = rtl8372n_quiesce,
 	.phylink_get_caps = rtl8372n_phylink_get_caps,
-	.port_enable = rtl8372n_port_enable,
-	.port_disable = rtl8372n_port_disable,
 };
 
 static const struct rtl837x_ops rtl8372n_ops = {
