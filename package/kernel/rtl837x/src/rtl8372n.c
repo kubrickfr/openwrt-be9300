@@ -555,6 +555,49 @@ static void rtl8372n_port_disable(struct dsa_switch *ds, int port)
 			 port, ret);
 }
 
+/*
+ * DSA expects standalone and software-bridged ports to be VLAN-unaware: the
+ * switch must accept a frame whatever its VID and hand it to the CPU exactly as
+ * received, so that 8021q uppers and the software bridge's VLAN filtering work.
+ * As in rtl8365mb, the VLAN function stays enabled and VLAN awareness is a
+ * per-port state. A VLAN-unaware port has no ingress membership filter, its
+ * frames are exempt from the egress membership check on every available port,
+ * and frames leave it with their tag format, VID and priority untouched
+ * (REAL_KEEP). A VLAN-aware port is filtered on both sides and egresses frames
+ * tagged or untagged as its VLAN entries say. Isolation, not VLAN membership,
+ * keeps standalone ports apart.
+ */
+static int rtl8372n_port_set_vlan_filtering(struct dsa_switch *ds, int port,
+					    bool filtering)
+{
+	struct rtl837x_priv *priv = ds->priv;
+	struct dsa_port *dp;
+	int ret;
+
+	ret = rtl837x_reg_bits_write(priv, RTL837X_VLAN_INGRESS_FILTER,
+				     BIT(port), filtering);
+	if (ret)
+		return ret;
+	ret = rtl837x_reg_bits_write(priv, RTL837X_VLAN_INGRESS_CTRL,
+				     RTL837X_VLAN_ACCEPT_FRAME_TYPE_MASK(port),
+				     RTL837X_VLAN_ACCEPT_FRAME_TYPE_ALL);
+	if (ret)
+		return ret;
+	dsa_switch_for_each_available_port(dp, ds) {
+		u32 bit = RTL837X_VLAN_EGRESS_TRANS_BIT(dp->index, port);
+
+		ret = regmap_update_bits(priv->map,
+					 RTL837X_VLAN_EGRESS_TRANS_REG(dp->index),
+					 bit, filtering ? 0 : bit);
+		if (ret)
+			return ret;
+	}
+	return rtl837x_reg_bits_write(priv, RTL837X_VLAN_EGRESS_TAG,
+				      RTL837X_VLAN_EGRESS_TAG_MODE_MASK(port),
+				      filtering ? RTL837X_VLAN_EGRESS_MODE_ORIGINAL :
+						  RTL837X_VLAN_EGRESS_MODE_REAL_KEEP);
+}
+
 static int rtl8372n_setup_default_vlan(struct rtl837x_priv *priv,
 				       u16 members, u16 untagged)
 {
@@ -662,6 +705,7 @@ static void rtl8372n_report_p0_readback(struct dsa_switch *ds, u16 members)
 	struct dsa_port *dp;
 	unsigned int cpu_mask = dsa_cpu_ports(ds);
 	unsigned int user_mask = dsa_user_ports(ds);
+	u32 accept_mask = 0, egress_tag_mask = 0, egress_tag = 0;
 	u32 expected_vlan, vlan_data;
 	int port, i, ret;
 
@@ -712,12 +756,22 @@ static void rtl8372n_report_p0_readback(struct dsa_switch *ds, u16 members)
 					 RTL837X_PORT_PVID_REG(dp->index),
 					 RTL837X_PORT_PVID_MASK(dp->index), 1);
 
-	rtl8372n_report_p0_reg(priv, "VLAN ingress control",
-			       RTL837X_VLAN_INGRESS_CTRL, U32_MAX, 0);
+	dsa_switch_for_each_available_port(dp, ds) {
+		accept_mask |= RTL837X_VLAN_ACCEPT_FRAME_TYPE_MASK(dp->index);
+		egress_tag_mask |= RTL837X_VLAN_EGRESS_TAG_MODE_MASK(dp->index);
+		egress_tag |= RTL837X_VLAN_EGRESS_MODE_REAL_KEEP <<
+			      __ffs(RTL837X_VLAN_EGRESS_TAG_MODE_MASK(dp->index));
+		rtl8372n_report_p0_field(priv, "VLAN egress transparent ports",
+					 RTL837X_VLAN_EGRESS_TRANS_REG(dp->index),
+					 RTL837X_VLAN_EGRESS_TRANS_MASK(dp->index),
+					 members);
+	}
+	rtl8372n_report_p0_reg(priv, "VLAN accepted frame types",
+			       RTL837X_VLAN_INGRESS_CTRL, accept_mask, 0);
 	rtl8372n_report_p0_reg(priv, "VLAN ingress filter",
-			       RTL837X_VLAN_INGRESS_FILTER, GENMASK(9, 0), members);
-	rtl8372n_report_p0_reg(priv, "VLAN egress tag control",
-			       RTL837X_VLAN_EGRESS_TAG, U32_MAX, 0);
+			       RTL837X_VLAN_INGRESS_FILTER, members, 0);
+	rtl8372n_report_p0_reg(priv, "VLAN egress tag mode",
+			       RTL837X_VLAN_EGRESS_TAG, egress_tag_mask, egress_tag);
 	rtl8372n_report_p0_field(priv, "VLAN filter enable",
 				 RTL837X_VLAN_CTRL, RTL837X_VLAN_CTRL_FILTER, 1);
 }
@@ -923,16 +977,24 @@ static int rtl8372n_setup(struct dsa_switch *ds)
 	ret = rtl8372n_setup_cpu_forwarding(ds);
 	if (ret)
 		goto fail;
-	ret = rtl837x_reg_write(priv, RTL837X_VLAN_INGRESS_CTRL, 0);
-	if (ret)
-		goto fail;
-	ret = regmap_update_bits(priv->map, RTL837X_VLAN_INGRESS_FILTER,
-				 GENMASK(RTL8372N_NUM_PORTS - 1, 0), members);
-	if (ret)
-		goto fail;
-	ret = rtl837x_reg_write(priv, RTL837X_VLAN_EGRESS_TAG, 0);
-	if (ret)
-		goto fail;
+	/*
+	 * Make every port VLAN-unaware before the VLAN function is enabled.
+	 * Clear the egress transparency fields first so that they hold
+	 * exactly the available ports afterwards, whatever their reset value.
+	 */
+	dsa_switch_for_each_available_port(dp, ds) {
+		ret = rtl837x_reg_bits_write(priv,
+					     RTL837X_VLAN_EGRESS_TRANS_REG(dp->index),
+					     RTL837X_VLAN_EGRESS_TRANS_MASK(dp->index),
+					     0);
+		if (ret)
+			goto fail;
+	}
+	dsa_switch_for_each_available_port(dp, ds) {
+		ret = rtl8372n_port_set_vlan_filtering(ds, dp->index, false);
+		if (ret)
+			goto fail;
+	}
 	ret = rtl837x_reg_bits_write(priv, RTL837X_VLAN_CTRL,
 				     RTL837X_VLAN_CTRL_FILTER, 1);
 	if (ret)
