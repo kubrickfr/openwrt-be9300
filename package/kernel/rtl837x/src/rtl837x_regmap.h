@@ -114,11 +114,31 @@
 #define RTL837X_VLAN_MEMBER_MASK                    GENMASK(9, 0)
 #define RTL837X_VLAN_UNTAG_MASK                     GENMASK(19, 10)
 
+/*
+ * VLAN port controls; see the PROVENANCE.md rows for each. The 0x4e10 and
+ * 0x6738 per-port fields are in RTLPlayground and the ZTE driver; the mode
+ * encodings follow the equivalent RTL8365MB controls in Linux rtl8365mb.
+ * The egress transparency register has no pinned public source: its only
+ * source is the RTL8373 SDK formerly shipped in this package.
+ */
 #define RTL837X_VLAN_CTRL                           0x4e14
 #define RTL837X_VLAN_CTRL_FILTER                    BIT(2)
+/* Accepted frame types, two bits per port; 0 accepts all frames. */
 #define RTL837X_VLAN_INGRESS_CTRL                   0x4e10
+#define RTL837X_VLAN_ACCEPT_FRAME_TYPE_MASK(port)   (GENMASK(1, 0) << ((port) * 2))
+#define RTL837X_VLAN_ACCEPT_FRAME_TYPE_ALL          0
+/* Per-port ingress VLAN membership filter. */
 #define RTL837X_VLAN_INGRESS_FILTER                 0x4e18
+/* Per egress port: ingress ports whose frames skip VLAN membership checks. */
+#define RTL837X_VLAN_EGRESS_TRANS_REG(port)         (0x4eb8 + ((port) / 3) * 4)
+#define RTL837X_VLAN_EGRESS_TRANS_MASK(port)        (GENMASK(9, 0) << (((port) % 3) * 10))
+#define RTL837X_VLAN_EGRESS_TRANS_BIT(egress, ingress) \
+	BIT((ingress) + ((egress) % 3) * 10)
+/* Egress tag mode, two bits per port. */
 #define RTL837X_VLAN_EGRESS_TAG                     0x6738
+#define RTL837X_VLAN_EGRESS_TAG_MODE_MASK(port)     (GENMASK(1, 0) << ((port) * 2))
+#define RTL837X_VLAN_EGRESS_MODE_ORIGINAL           0
+#define RTL837X_VLAN_EGRESS_MODE_REAL_KEEP          3
 #define RTL837X_PORT_PVID_BASE                      0x4e1c
 #define RTL837X_PORT_PVID_REG(port) \
 	(RTL837X_PORT_PVID_BASE + (((port) >> 1) * 4))
