@@ -53,7 +53,7 @@ profiles of the trees it grew from are not carried.
 | SoC | Qualcomm IPQ5332, 4× Cortex-A53 |
 | Wi-Fi 2.4 GHz | on-SoC radio, ath12k over AHB |
 | Wi-Fi 5 / 6 GHz | 2× QCN9274, ath12k over PCIe |
-| Switch | RTL8372N, out-of-tree DSA driver (`realtek,rtl837x`); SoC↔switch link is 10GBASE-R |
+| Switch | RTL8372N, out-of-tree SDK-free DSA driver (`realtek,rtl8372n`, native `rtl8_4` tag; not yet run on hardware as assembled here, see `package/kernel/rtl837x/TESTING.md`); SoC↔switch link is 10GBASE-R |
 | WAN | RTL8221B 2.5G PHY, `2500base-x` to the SoC |
 | Storage | eMMC |
 
@@ -62,9 +62,9 @@ profiles of the trees it grew from are not carried.
 | Subsystem | State |
 |---|---|
 | Boot / procd / SSH | working |
-| LAN (RTL8372N via DSA + EDMA/PPE) | working |
+| LAN (RTL8372N via DSA + EDMA/PPE) | new driver, not yet run on hardware here (its base was benched on perceival's tree); see `package/kernel/rtl837x/TESTING.md` |
 | WAN (2.5G) | working at 2.5 Gbps; 1G/100M link rates untested |
-| VLANs (bridge-vlan on DSA) | working, with one VLAN-filtering bridge on the switch ports (see Known issues) |
+| VLANs (bridge-vlan on DSA) | in software by default; hardware offload of one bridge is a build option, not yet bench-tested |
 | Flow offloading | software flowtable only; no PPE hardware flow offload (see below) |
 | Wi-Fi 7, all three bands | working |
 | MLO (AP MLD across 2.4/5/6 GHz) | working |
@@ -72,10 +72,18 @@ profiles of the trees it grew from are not carried.
 | 802.11k / 802.11v | working |
 | eMMC sysupgrade + return to stock | working |
 
-Throughput measured between two units over a 2.5G trunk: **~1.8–1.9 Gbit/s**.
-Through a PPPoE WAN with software flowtable offload: **2.04 Gbit/s down**
+Measured with the previous, SDK-based switch driver (`tag_8021q`), not yet
+with this one: between two units over a 2.5G trunk, **~1.8–1.9 Gbit/s**;
+through a PPPoE WAN with software flowtable offload, **2.04 Gbit/s down**
 (4 TCP streams, PPE clock 200 MHz, 2026-10-04), with no drops in the
 EDMA/PPE counters. The busiest core was at 78% softirq.
+
+The `rtl8_4` tag costs the EDMA/PPE datapath: the PPE parser does not walk
+past its 8 bytes, so frames from the LAN ports probably all land on one EDMA
+Rx ring and CPU (RSS needs L3; RPS still spreads the protocol work) without
+Rx checksum offload, and frames to them go without Tx checksum offload or TSO
+(patch 0431 falls back to software). `lanN` counters count only what crosses
+the CPU; the previous driver read the switch MIB.
 
 The kernel's AES and GCM use the ARMv8 Crypto Extensions (`aes-ce`,
 `gcm-aes-ce`; `39df06d866`, checked 2026-10-04), which helps IPsec, OpenVPN
@@ -102,51 +110,37 @@ uci commit firewall && fw4 reload
   its probe pass. The flowtable is then built on `lan1`–`lan4` and the Wi-Fi
   interfaces instead of `br-lan`, and flows to wired clients are sent straight
   to a switch port.
-- The flowtable marks the frames it sends straight to a switch port for TX
-  forwarding offload (pending patch 708), as the bridge does for the frames
-  it forwards: they go out on the bridge's VLAN and the switch delivers them
-  from its own FDB. This is needed because under `tag_8021q` the bridge FDB
-  has every wired client on the first forwarding port. For software
-  flowtable traffic (nftables, and iptables `FLOWOFFLOAD`), 708 replaces
-  patch 766, which did the same inside the tagger for every unmarked unicast
-  frame. Unicast sent to one port on purpose, e.g. through a packet socket,
-  now leaves through that port again. Pending patches 767-01/02 keep the
-  tagger from dereferencing a missing or freed bridge if a marked frame
-  reaches a port that just left its bridge.
+- Pending patch 708 marks the frames the flowtable sends straight to a
+  switch port for TX forwarding offload, as the bridge does for the frames
+  it forwards, so that the switch delivers them from its own FDB; for
+  software flowtable traffic (nftables, and iptables `FLOWOFFLOAD`) it
+  replaced patch 766, which did the same inside the tagger for every
+  unmarked unicast frame. Pending patches 767-01/02 keep the tagger from
+  dereferencing a missing or freed bridge if a marked frame reaches a port
+  that just left its bridge. All three serve the previous `tag_8021q`
+  driver, whose bridge FDB had every wired client on the first forwarding
+  port. With the `rtl8_4` driver the bridge sees each frame's real ingress
+  port and the driver offers no TX forwarding offload: 708 marks nothing,
+  767-02 (the `tag_vsc73xx_8021q` half) never runs, and 767-01 still runs in
+  the DSA core, though no tagger reads the bridge. A flow sent straight to a
+  port leaves by the port the bridge FDB named when the flow was set up.
 - A flow sent straight to a port used to stay pinned to it: in testing with
   766, a download to a client on `lan1` stalled for as long as `lan4` was
   down, because the bridge had learned the client on `lan4`. Pending patch
   709 tears flows down when their port loses carrier or joins or leaves a
   bridge, so the next packet takes the bridge and the flow is set up again.
   708, 709 and 767-01/02 are not yet tested on hardware.
-- Known limits of sending flows straight to the ports:
-  - a station that moves between a switch port and the router's own Wi-Fi
-    without changing address gets nothing on its existing flows until they
-    go idle, as nothing tells the flowtable that the bridge saw it move
-    (this holds for any switch);
-  - the switch does not tell which port a bridged frame came in on, so
-    received traffic is attributed to the first forwarding port; when a port
-    with a lower number comes up, attribution moves to it, and the upload
-    direction of existing flows misses the flowtable and takes the slow path
-    until the flow ends;
-  - turning `vlan_filtering` on or off at runtime leaves existing flows
-    unmarked until they end, so their frames leave by the port the bridge
-    FDB names;
-  - with proxy ARP (`proxy_arp` on a Wi-Fi interface) or neighbour
-    suppression on `br-lan`, the bridge answers a wired client itself and
-    sends the reply unmarked out of the port it attributed the request to,
-    the first forwarding port: wired clients on the other ports cannot
-    resolve the stations answered for. 766 hid this; both are off by
-    default, so leave them off on this board.
+- Known limit of sending flows straight to the ports: a station that moves
+  to another switch port, or between a switch port and the router's own
+  Wi-Fi, without changing address and while its old port keeps carrier,
+  gets nothing on its existing flows until they go idle, as nothing tells
+  the flowtable that the bridge saw it move (this holds for any switch).
 - Bypassing the bridge is worth a few percent on a single stream: with
   `lan1`–`lan4` added to the software flowtable by hand
   (`nft add flowtable inet fw4 ft '{ hook ingress priority filter; devices = { "lan1", "lan2", "lan3", "lan4" }; }'`),
   one PPPoE download went from ~1.84 to ~1.92–2.08 Gbit/s (2026-10-09, RPS on
-  the WAN). That was measured with 766, before 708 replaced it. fw4 does not
-  add the ports in software mode.
-- 708 does not cover ports of a VLAN-filtering bridge, nor flows offloaded
-  to hardware: with VLAN filtering and the ports in the flowtable, put the
-  LAN on a `br-lan.N` VLAN interface, not directly on `br-lan`.
+  the WAN). That was measured with 766 and the previous switch driver,
+  before 708 replaced it. fw4 does not add the ports in software mode.
 - A PPPoE WAN cannot be hardware-offloaded even with the experimental PPE
   offload series in perceival/openwrt-flint3: that driver declines PPPoE in
   both directions.
@@ -185,18 +179,12 @@ uci commit firewall && fw4 reload
   awareness — do not enable 11r on an MLO SSID. 11k/11v are fine. An
   experimental FT-over-MLO hostapd series exists in perceival/openwrt-flint3
   (patches 992–999a); it is not carried here.
-- **VLAN filtering next to another bridge.** The switch has one global VLAN
-  table, and isolation between bridges relies on VLAN membership alone. A
-  VLAN-filtering bridge and any other bridge on the switch ports that share a
-  VID (VLAN 1 by default) are joined in hardware on that VID: in testing
-  (2026-10-04),
-  broadcasts from a VLAN-filtering `br-lan` reached a port in a second bridge.
-  Standalone ports are not affected. Until this is fixed, put all switch ports
-  that use VLAN filtering in a single bridge, and use `br-lan.N` VLAN
-  interfaces rather than more bridges.
-- **IGMP snooping.** With `igmp_snooping` enabled on `br-lan`, the router's
-  IGMP queries reached `lan1` but not `lan4` in testing (2026-10-04).
-  Snooping is off by default; leave it off.
+- **Switch driver limits.** With offload on, one bridge is switched in
+  hardware and a second one runs in software; there is no MDB, so multicast
+  floods per `mcast_flood` whatever IGMP snooping decides. The full list is
+  section 7 of `package/kernel/rtl837x/TESTING.md`. The VLAN-filtering and
+  IGMP-snooping issues seen with the previous driver (2026-10-04) have not
+  been retested.
 - **Unprogrammed ART country.** The regulatory country is read from the ART
   partition at first boot. Some units have none, and their 6 GHz radio then
   fails to come up with country `00`. When ART has no country and a radio has
@@ -217,6 +205,12 @@ make menuconfig     # Target System: Qualcomm Atheros 802.11be
                     # Target Profile: GL.iNet GL-BE9300
 make -j"$(nproc)"
 ```
+
+The switch driver bridges in software unless the image is built with
+`CONFIG_RTL837X_DSA_OFFLOAD=y` (hardware bridge and VLAN offload, not yet
+bench-tested); `options rtl8372n_dsa offload=1` (or `=0`) in
+`/etc/modules.conf` overrides that at boot. See
+`package/kernel/rtl837x/TESTING.md`.
 
 Images land in `bin/targets/qualcommbe/ipq53xx/`. The build fails if the
 kernel image is larger than the 7 MiB `0:HLOS` partition, rather than
@@ -241,8 +235,9 @@ Both trees evolve in parallel. This tree was rebased from perceival's
 `flint3-be9300` as of 2026-09-22 (`b12c85403f`), and some later work was
 picked from it since.
 
-- **Not carried:** the PPE hardware flow offload series, the native `rtl8_4`
-  switch tag (this tree uses `tag_8021q` only), the FT-over-MLO hostapd series
+- **Not carried:** the PPE hardware flow offload series, including its
+  `rtl8_4` parser alias (the switch now uses the native `rtl8_4` tag, with
+  perceival's EDMA checksum fallback carried as patch 0431), the FT-over-MLO hostapd series
   (992–999a), and the vendor Q6 memory contract described below.
 - **IPQ5332 UserPD boot.** ath12k describes the UserPD to the RootPD through
   the legacy boot-info path (DT `qcom,legacy-userpd-bootinfo`, patches
@@ -357,7 +352,13 @@ Patches from this work that have gone upstream or are in review:
 
 ## Credits
 
-Kamil Bienkiewicz (perceival) wrote the rtl837x VLAN ingress and
+Maksims Neroba wrote the SDK-free RTL8372N DSA driver the switch package is
+based on (perceival/openwrt-flint3#104), adapting Airjinkela's DSA refactor;
+his P1 work found the switch's table locking, STP encoding and L2 flush
+completion bit used by the offload (see `package/kernel/rtl837x/PROVENANCE.md`).
+
+Kamil Bienkiewicz (perceival) wrote the EDMA checksum fallback (0431), the
+earlier rtl837x VLAN ingress and
 standalone-VLAN fixes, the `tag_8021q` bridge-VID patch (766, since replaced
 by the flowtable patch 708), the coredump
 release handler, the faster switch bring-up and the ARMv8 crypto
