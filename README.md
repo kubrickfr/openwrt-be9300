@@ -53,7 +53,7 @@ profiles of the trees it grew from are not carried.
 | SoC | Qualcomm IPQ5332, 4× Cortex-A53 |
 | Wi-Fi 2.4 GHz | on-SoC radio, ath12k over AHB |
 | Wi-Fi 5 / 6 GHz | 2× QCN9274, ath12k over PCIe |
-| Switch | RTL8372N, out-of-tree SDK-free DSA driver (`realtek,rtl8372n`, native `rtl8_4` tag; not yet run on hardware as assembled here, see `package/kernel/rtl837x/TESTING.md`); SoC↔switch link is 10GBASE-R |
+| Switch | RTL8372N, out-of-tree SDK-free DSA driver (`realtek,rtl8372n`, native `rtl8_4` tag; benched on a GL-BE9300 in October 2026, see `package/kernel/rtl837x/TESTING.md`); SoC↔switch link is 10GBASE-R |
 | WAN | RTL8221B 2.5G PHY, `2500base-x` to the SoC |
 | Storage | eMMC |
 
@@ -62,9 +62,9 @@ profiles of the trees it grew from are not carried.
 | Subsystem | State |
 |---|---|
 | Boot / procd / SSH | working |
-| LAN (RTL8372N via DSA + EDMA/PPE) | new driver, not yet run on hardware here (its base was benched on perceival's tree); see `package/kernel/rtl837x/TESTING.md` |
+| LAN (RTL8372N via DSA + EDMA/PPE) | working with the new driver, one bridge switched in hardware (bench results in `package/kernel/rtl837x/TESTING.md`) |
 | WAN (2.5G) | working at 2.5 Gbps; 1G/100M link rates untested |
-| VLANs (bridge-vlan on DSA) | in software by default; hardware offload of one bridge is a build option, not yet bench-tested |
+| VLANs (bridge-vlan on DSA) | working: one VLAN-aware bridge offloaded, access and trunk ports, tagged-only ports (some checks still need more hosts, see `TESTING.md`) |
 | Flow offloading | software flowtable only; no PPE hardware flow offload (see below) |
 | Wi-Fi 7, all three bands | working |
 | MLO (AP MLD across 2.4/5/6 GHz) | working |
@@ -72,18 +72,19 @@ profiles of the trees it grew from are not carried.
 | 802.11k / 802.11v | working |
 | eMMC sysupgrade + return to stock | working |
 
-Measured with the previous, SDK-based switch driver (`tag_8021q`), not yet
-with this one: between two units over a 2.5G trunk, **~1.8–1.9 Gbit/s**;
-through a PPPoE WAN with software flowtable offload, **2.04 Gbit/s down**
-(4 TCP streams, PPE clock 200 MHz, 2026-10-04), with no drops in the
-EDMA/PPE counters. The busiest core was at 78% softirq.
+With this driver, through a PPPoE WAN with software flowtable offload and
+the core split in `packet-steering.sh`: **one TCP download at 2.00–2.16
+Gbit/s** (7 of 8 runs, 2026-10-21). With the previous, SDK-based driver
+(`tag_8021q`): between two units over a 2.5G trunk, **~1.8–1.9 Gbit/s**;
+**2.04 Gbit/s down** with 4 TCP streams (PPE clock 200 MHz, 2026-10-04).
 
 The `rtl8_4` tag costs the EDMA/PPE datapath: the PPE parser does not walk
-past its 8 bytes, so frames from the LAN ports probably all land on one EDMA
-Rx ring and CPU (RSS needs L3; RPS still spreads the protocol work) without
-Rx checksum offload, and frames to them go without Tx checksum offload or TSO
-(patch 0431 falls back to software). `lanN` counters count only what crosses
-the CPU; the previous driver read the switch MIB.
+past its 8 bytes, so frames from the LAN ports nearly all land on one EDMA
+Rx ring and CPU (95% on one queue, measured; RSS needs L3, RPS still spreads
+the protocol work) without Rx checksum offload, and frames to them go
+without Tx checksum offload or TSO (patch 0431 falls back to software).
+`lanN` counters count only what crosses the CPU; the previous driver read
+the switch MIB.
 
 The kernel's AES and GCM use the ARMv8 Crypto Extensions (`aes-ce`,
 `gcm-aes-ce`; `39df06d866`, checked 2026-10-04), which helps IPsec, OpenVPN
@@ -206,10 +207,10 @@ make menuconfig     # Target System: Qualcomm Atheros 802.11be
 make -j"$(nproc)"
 ```
 
-The switch driver bridges in software unless the image is built with
-`CONFIG_RTL837X_DSA_OFFLOAD=y` (hardware bridge and VLAN offload, not yet
-bench-tested); `options rtl8372n_dsa offload=1` (or `=0`) in
-`/etc/modules.conf` overrides that at boot. See
+The switch driver offloads one bridge and its VLANs to the switch
+(`CONFIG_RTL837X_DSA_OFFLOAD`, on by default). `options rtl8372n_dsa
+offload=0` (or `=1`) in `/etc/modules.conf` overrides that at boot; with
+offload off, every bridge runs in software. See
 `package/kernel/rtl837x/TESTING.md`.
 
 Images land in `bin/targets/qualcommbe/ipq53xx/`. The build fails if the

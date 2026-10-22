@@ -1356,10 +1356,10 @@ static int rtl8372n_setup_cpu_forwarding(struct dsa_switch *ds)
  * port stays standalone and CPU-only. Setup is otherwise unchanged and still
  * writes what only offload needs (RMA trap, pinned VLAN and L2 controls, L2
  * clear), so the standalone checks see the same switch state either way. It
- * is the bench's phase-1 mode and, until the offload has passed the bench,
- * the default: the package option RTL837X_DSA_OFFLOAD builds with
- * RTL8372N_OFFLOAD_DEFAULT=1 instead. "options rtl8372n_dsa offload=0" (or
- * =1) in /etc/modules.conf overrides either default. OpenWrt's kmodloader
+ * is the bench's phase-1 mode and the field escape hatch. The package option
+ * RTL837X_DSA_OFFLOAD, on by default, builds with RTL8372N_OFFLOAD_DEFAULT=1;
+ * without it offload is off. "options rtl8372n_dsa offload=0" (or =1) in
+ * /etc/modules.conf overrides either default. OpenWrt's kmodloader
  * does not read the kernel command line, where rtl8372n_dsa.offload=0 only
  * reaches a built-in driver. Setup reads it at probe, so it changes only on a
  * module reload, and only the boot-time loader and modprobe read
