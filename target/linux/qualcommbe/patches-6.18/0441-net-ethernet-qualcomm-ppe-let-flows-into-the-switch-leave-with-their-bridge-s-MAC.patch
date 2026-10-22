@@ -1,0 +1,460 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: let flows into the switch 
+ leave with their bridge's MAC
+
+A flow into the switch leaves with the bridge's MAC as its source (the
+flowtable's Ethernet mangle), and the bridge's MAC need not be the
+conduit's: on the GL-BE9300 it is not, and every such flow was declined.
+The source MAC comes from the egress L3 interface, so give each such MAC
+(up to four) an L3 interface of its own, past the PPPoE ones: the egress
+entry carries the MAC, the ingress entry the port's MTU and no routing.
+Accept it only for a DSA egress whose bridge has that MAC. Both are
+written empty and read back when the last flow using them goes, or when
+setting them up fails; a slot whose set-up or clearing does not read
+back is not used again until offload is enabled again. That such an
+interface, bound to no port and not routing, gives a nexthop its source
+MAC is a bench hypothesis (HB). Saved and restored with the rest.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../net/ethernet/qualcomm/ppe/ppe_offload.c   | 269 ++++++++++++++++--
+ 1 file changed, 244 insertions(+), 25 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -154,19 +154,19 @@
+  * flow_offload=1" in /etc/modules.conf). Enabling saves every static register
+  * it is about to change (exception actions and enables, the per-port L3
+  * interface, MY_MAC and L3_VP_PORT entries and MTU command, the PPPoE session
+- * entries and their L3 interfaces), programs and reads them back, and only
+- * then accepts flows. A port entry that does not read back restores the saved
+- * values and leaves offload off; an exception group that does not read back
+- * leaves it on with the flows that need it declined (TCP flows for the TCP
+- * flag exceptions, PPPoE flows for the PPPoE ones, every flow for the header
+- * ones), its registers written back on disable. Profile E's two registers
+- * (ppe_offload_egress_apply()) are saved, written and read back at enable when
+- * an rtl8_4 conduit exists, or else on the first flow towards one; a failure
+- * there restores those two and declines only the flows into the switch.
+- * Disabling, at runtime or on unbind, stops accepting flows, deletes every
+- * hardware entry this code owns and writes the saved values back. The flows
+- * the kernel still believes offloaded are then forwarded by the software
+- * flowtable, and declined when it offers them again.
++ * entries and their L3 interfaces, the source MAC L3 interfaces), programs and
++ * reads them back, and only then accepts flows. A port entry that does not
++ * read back restores the saved values and leaves offload off; an exception
++ * group that does not read back leaves it on with the flows that need it
++ * declined (TCP flows for the TCP flag exceptions, PPPoE flows for the PPPoE
++ * ones, every flow for the header ones), its registers written back on
++ * disable. Profile E's two registers (ppe_offload_egress_apply()) are saved,
++ * written and read back at enable when an rtl8_4 conduit exists, or else on
++ * the first flow towards one; a failure there restores those two and declines
++ * only the flows into the switch. Disabling, at runtime or on unbind, stops
++ * accepting flows, deletes every hardware entry this code owns and writes the
++ * saved values back. The flows the kernel still believes offloaded are then
++ * forwarded by the software flowtable, and declined when it offers them again.
+  */
+ 
+ #include <linux/atomic.h>
+@@ -260,6 +260,11 @@ struct ppe_offload_flow_entry {
+ 	/* A PPPoE flow holds a reference on priv->pppoe[pppoe_slot]. */
+ 	bool pppoe;
+ 	u8 pppoe_slot;
++	/* A flow leaving with its bridge's MAC holds a reference on
++	 * priv->smac[smac_slot].
++	 */
++	bool smac;
++	u8 smac_slot;
+ 	/* Set for every flow whose nexthop's tag inserts name a DSA user
+ 	 * port outright (struct ppe_offload_egress::dsa_fixed), bridged or
+ 	 * not: the entry sits in ppe_offload_priv::dsa_fixed_ht so that a
+@@ -392,6 +397,29 @@ struct ppe_offload_pppoe {
+ 	bool broken;
+ };
+ 
++/* Source MAC addresses other than a port's own that flows leave with, and
++ * the egress L3 interfaces carrying them: one each, past the PPPoE ones.
++ */
++#define PPE_OFFLOAD_SMAC_MAX		4
++#define PPE_OFFLOAD_SMAC_L3_IF_BASE	24
++
++/**
++ * struct ppe_offload_smac - An egress L3 interface for a source MAC address.
++ * @mac: The address.
++ * @mtu: MRU and MTU of its ingress entry, the EDMA port's MTU.
++ * @refs: Flows using it.
++ * @broken: Setting it up or clearing it did not read back; not used again
++ * until offload is enabled again.
++ *
++ * Slot n uses L3 interface PPE_OFFLOAD_SMAC_L3_IF_BASE + n. Under priv->lock.
++ */
++struct ppe_offload_smac {
++	u8 mac[ETH_ALEN];
++	unsigned int mtu;
++	unsigned int refs;
++	bool broken;
++};
++
+ /* Static registers enabling changes, saved before and restored after:
+  * at most PPE_OFFLOAD_SNAP_WORDS consecutive words each, a table entry
+  * being restored whole and in its own word order (some latch on their
+@@ -545,6 +573,7 @@ struct ppe_offload_counters {
+  * @pppoe_exceptions_ok: Whether the PPPoE header exceptions were programmed
+  * and read back at enable; PPPoE flows are declined otherwise.
+  * @pppoe: The PPPoE sessions in hardware; under @lock.
++ * @smac: The egress L3 interfaces for bridge MAC addresses; under @lock.
+  * @netdev_nb: Drops a switch port's port-addressed flows when its uppers
+  * change, and takes a PPPoE session out of hardware when its devices change.
+  * @pppoe_gen: Bumped by every such device change; a PPPoE flow is added
+@@ -620,6 +649,7 @@ struct ppe_offload_priv {
+ 	bool egress_failed;
+ 	bool pppoe_exceptions_ok;
+ 	struct ppe_offload_pppoe pppoe[PPE_OFFLOAD_PPPOE_MAX];
++	struct ppe_offload_smac smac[PPE_OFFLOAD_SMAC_MAX];
+ 	struct notifier_block netdev_nb;
+ 	atomic_t pppoe_gen;
+ 	bool pppoe_blocked;
+@@ -655,6 +685,7 @@ static int ppe_offload_flow_drop(struct ppe_offload_priv *priv,
+ 				 struct ppe_offload_flow_entry *entry);
+ static void ppe_offload_flow_stuck(struct ppe_offload_priv *priv,
+ 				   struct ppe_offload_flow_entry *entry, int err);
++static void ppe_offload_smac_put(struct ppe_offload_priv *priv, unsigned int slot);
+ static void ppe_offload_profile_a_timeout(struct work_struct *work);
+ static void ppe_offload_trip_work(struct work_struct *work);
+ static void ppe_offload_strip_work(struct work_struct *work);
+@@ -670,6 +701,8 @@ static void ppe_offload_flow_release(struct ppe_offload_priv *priv,
+ 		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
+ 	if (entry->pppoe)
+ 		ppe_offload_pppoe_put(priv, entry->pppoe_slot);
++	if (entry->smac)
++		ppe_offload_smac_put(priv, entry->smac_slot);
+ }
+ static int ppe_offload_flow_hw_del(struct ppe_offload_priv *priv,
+ 				   struct ppe_offload_flow_entry *entry);
+@@ -821,6 +854,7 @@ static bool ppe_offload_rule_has_vlan_key(const struct flow_rule *rule,
+  * @vlan_tagged: ... and leave the port tagged.
+  * @mtu_cap: MTU of the bridge that port is in and of its VLAN 1 upper, which caps the
+  * flow's PMTU; 0 if none.
++ * @bridge_mac: The MAC address of the bridge that port is in, if any.
+  */
+ struct ppe_offload_egress {
+ 	struct net_device *dev;
+@@ -837,6 +871,7 @@ struct ppe_offload_egress {
+ 	bool vlan_aware;
+ 	bool vlan_tagged;
+ 	unsigned int mtu_cap;
++	u8 bridge_mac[ETH_ALEN];
+ };
+ 
+ /* Apply profile E for the conduit on PPE port @port. Under priv->lock.
+@@ -1205,6 +1240,7 @@ static int ppe_offload_dsa_egress(struct ppe_offload_priv *priv, struct net_devi
+ 			if (upper)
+ 				egress->mtu_cap = min(egress->mtu_cap, READ_ONCE(upper->mtu));
+ 		}
++		ether_addr_copy(egress->bridge_mac, bridge->dev_addr);
+ 		/* The switch must bridge the port itself, with the bridge's
+ 		 * VLAN filtering: one it leaves to software bridging (it
+ 		 * refused the join, or the port has a VLAN upper) is a
+@@ -2286,6 +2322,118 @@ static const struct file_operations ppe_offload_pin_fops = {
+ 	.llseek = default_llseek,
+ };
+ 
++/* Write slot @slot's egress and ingress entries empty and read them back.
++ * A slot that does not read back empty is not used again until offload is
++ * enabled again; nothing more is needed: no flow points at it any longer,
++ * its ingress entry routes nothing, and disabling writes the saved entries
++ * back. Under priv->lock.
++ */
++static void ppe_offload_smac_clear(struct ppe_offload_priv *priv, unsigned int slot)
++{
++	const struct ppe_l3_if_eg_entry eg = {};
++	const struct ppe_l3_if_in_entry in = {};
++	u32 l3_if = PPE_OFFLOAD_SMAC_L3_IF_BASE + slot;
++	struct ppe_l3_if_eg_entry eg_back;
++	struct ppe_l3_if_in_entry in_back;
++
++	if (!ppe_l3_if_eg_entry_set(priv->ppe_dev, l3_if, &eg) &&
++	    !ppe_l3_if_in_entry_set(priv->ppe_dev, l3_if, &in) &&
++	    !ppe_l3_if_eg_entry_get(priv->ppe_dev, l3_if, &eg_back) &&
++	    !ppe_l3_if_in_entry_get(priv->ppe_dev, l3_if, &in_back) &&
++	    is_zero_ether_addr(eg_back.mac_addr) && !eg_back.pppoe_en &&
++	    !in_back.mru && !in_back.mtu && !in_back.ipv4_uc_route_en)
++		return;
++
++	priv->smac[slot].broken = true;
++	pr_err("ppe_offload: egress L3 interface %u not cleared; not used again\n", l3_if);
++}
++
++/* The egress L3 interface for flows leaving with source MAC @mac (and an
++ * ingress entry with the port's MTU, unrouted, since no frame arrives on
++ * it), programmed on first use and read back. Under priv->lock.
++ *
++ * Return: 0 with @slot set and a reference taken, a negative error code
++ * otherwise.
++ */
++static int ppe_offload_smac_get(struct ppe_offload_priv *priv, const u8 *mac, unsigned int mtu,
++				unsigned int *slot)
++{
++	struct ppe_l3_if_eg_entry eg = {}, eg_back;
++	struct ppe_l3_if_in_entry in = {}, in_back;
++	struct ppe_offload_smac *p;
++	int i, free = -1;
++	u32 l3_if;
++	int ret;
++
++	mtu = min_t(u32, mtu, FIELD_MAX(PPE_IN_L3_IF_TBL_MTU));
++
++	for (i = 0; i < PPE_OFFLOAD_SMAC_MAX; i++) {
++		p = &priv->smac[i];
++		if (!p->refs) {
++			if (free < 0 && !p->broken)
++				free = i;
++			continue;
++		}
++		if (ether_addr_equal(p->mac, mac) && p->mtu == mtu) {
++			p->refs++;
++			*slot = i;
++			return 0;
++		}
++	}
++
++	if (free < 0)
++		return -ENOSPC;
++
++	l3_if = PPE_OFFLOAD_SMAC_L3_IF_BASE + free;
++	ether_addr_copy(eg.mac_addr, mac);
++	in.mru = mtu;
++	in.mtu = mtu;
++	in.mru_ipv6 = mtu;
++	in.mtu_ipv6 = mtu;
++
++	ret = ppe_l3_if_eg_entry_set(priv->ppe_dev, l3_if, &eg);
++	if (!ret)
++		ret = ppe_l3_if_in_entry_set(priv->ppe_dev, l3_if, &in);
++	if (!ret)
++		ret = ppe_l3_if_eg_entry_get(priv->ppe_dev, l3_if, &eg_back);
++	if (!ret)
++		ret = ppe_l3_if_in_entry_get(priv->ppe_dev, l3_if, &in_back);
++	if (!ret && (!ether_addr_equal(eg_back.mac_addr, mac) || eg_back.pppoe_en ||
++		     in_back.mru != mtu || in_back.mtu != mtu || in_back.ipv4_uc_route_en))
++		ret = -EIO;
++	if (ret) {
++		/* Retired, or every later offer would try it again. */
++		pr_err("ppe_offload: egress L3 interface %u for %pM not set up: %d; not used until offload is enabled again\n",
++		       l3_if, mac, ret);
++		ppe_offload_smac_clear(priv, free);
++		priv->smac[free].broken = true;
++		return ret;
++	}
++
++	p = &priv->smac[free];
++	ether_addr_copy(p->mac, mac);
++	p->mtu = mtu;
++	p->refs = 1;
++	*slot = free;
++	pr_info("ppe_offload: egress L3 interface %u rewrites the source MAC to %pM\n", l3_if, mac);
++
++	return 0;
++}
++
++static void ppe_offload_smac_put(struct ppe_offload_priv *priv, unsigned int slot)
++{
++	struct ppe_offload_smac *p = &priv->smac[slot];
++
++	if (WARN_ON_ONCE(slot >= PPE_OFFLOAD_SMAC_MAX || !p->refs))
++		return;
++
++	if (--p->refs)
++		return;
++
++	memset(p, 0, sizeof(*p));
++	ppe_offload_smac_clear(priv, slot);
++}
++
+ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 				     struct ppe_offload_priv *priv,
+ 				     const struct flow_block *block,
+@@ -2325,6 +2473,9 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	unsigned int pppoe_slot = 0;
+ 	bool pppoe_ref = false;
+ 	bool pppoe_out = false;
++	unsigned int smac_slot = 0;
++	bool smac_ref = false;
++	bool smac = false;
+ 	u32 flow_l3_if;
+ 	u16 pppoe_sid = 0;
+ 	bool pub_ip = false;
+@@ -2852,12 +3003,20 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	 * (edma_port_l3_if_program()) is out of sync, and egressing
+ 	 * with the wrong source MAC either way is worse than declining.
+ 	 * Behind a DSA user port that is the conduit's MAC, which its
+-	 * user ports and (by default) their bridge inherit.
++	 * user ports inherit, or the MAC of the bridge the port is in:
++	 * software sends a routed frame with the address of the bridge
++	 * (or of its VLAN upper, which shares it), which need not be the
++	 * conduit's. Such a flow leaves through an egress L3 interface of
++	 * its own that rewrites to that address (ppe_offload_smac_get()).
+ 	 */
+-	if (!ether_addr_equal(eth.bytes + ETH_ALEN, egress.dev->dev_addr))
+-		return ppe_offload_decline("eth mangle src %pM != egress %s mac %pM",
+-					    eth.bytes + ETH_ALEN, netdev_name(egress.dev),
+-					    egress.dev->dev_addr);
++	if (!ether_addr_equal(eth.bytes + ETH_ALEN, egress.dev->dev_addr)) {
++		if (!egress.dsa || !egress.bridge_ifindex ||
++		    !ether_addr_equal(eth.bytes + ETH_ALEN, egress.bridge_mac))
++			return ppe_offload_decline("eth mangle src %pM != egress %s mac %pM",
++						    eth.bytes + ETH_ALEN, netdev_name(egress.dev),
++						    egress.dev->dev_addr);
++		smac = true;
++	}
+ 
+ 	/* PPPoE upload: the session must be the kernel's for the address
+ 	 * the flow is translated to, on the device and VLAN it leaves
+@@ -2985,12 +3144,22 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		}
+ 	}
+ 
++	if (smac) {
++		ret = ppe_offload_smac_get(priv, eth.bytes + ETH_ALEN, READ_ONCE(egress.dev->mtu),
++					   &smac_slot);
++		if (ret) {
++			stage = "smac";
++			goto unlock;
++		}
++		smac_ref = true;
++	}
++
+ 	flow_l3_if = ingress_l3_if;
+ 	if (pppoe_in || pppoe_out) {
+ 		ret = ppe_offload_pppoe_get(priv, dev_net(netdev), &pppoe_info, &pppoe_slot);
+ 		if (ret) {
+ 			stage = "pppoe";
+-			goto unlock;
++			goto deref_smac;
+ 		}
+ 		pppoe_ref = true;
+ 		if (pppoe_in)
+@@ -3026,8 +3195,12 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	/* A PPPoE upload leaves through the session's L3 interface, which
+ 	 * adds the PPPoE header with the session ID and the port's MAC.
+ 	 */
+-	nexthop.post_l3_if = pppoe_out ? PPE_OFFLOAD_PPPOE_L3_IF_BASE + pppoe_slot :
+-					 port_priv->l3_if_index;
++	if (pppoe_out)
++		nexthop.post_l3_if = PPE_OFFLOAD_PPPOE_L3_IF_BASE + pppoe_slot;
++	else if (smac)
++		nexthop.post_l3_if = PPE_OFFLOAD_SMAC_L3_IF_BASE + smac_slot;
++	else
++		nexthop.post_l3_if = port_priv->l3_if_index;
+ 	memcpy(nexthop.dmac, eth.bytes, ETH_ALEN);
+ 	if (snat)
+ 		nexthop.pub_addr_index = pub_ip_index;
+@@ -3105,6 +3278,8 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	entry->pub_ip_valid = pub_ip;
+ 	entry->pppoe = pppoe_ref;
+ 	entry->pppoe_slot = pppoe_slot;
++	entry->smac = smac_ref;
++	entry->smac_slot = smac_slot;
+ 	entry->block = block;
+ 
+ 	flow_index = 0;
+@@ -3214,6 +3389,9 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ deref_pppoe:
+ 	if (pppoe_ref)
+ 		ppe_offload_pppoe_put(priv, pppoe_slot);
++deref_smac:
++	if (smac_ref)
++		ppe_offload_smac_put(priv, smac_slot);
+ unlock:
+ 	mutex_unlock(&priv->lock);
+ 
+@@ -4840,6 +5018,29 @@ static int ppe_offload_snap_exceptions(struct ppe_offload_priv *priv)
+ 	return 0;
+ }
+ 
++/* Save the L3 interfaces the source MAC pool may use. */
++static int ppe_offload_snap_smac(struct ppe_offload_priv *priv)
++{
++	unsigned int slot;
++	u32 l3_if;
++	int ret;
++
++	for (slot = 0; slot < PPE_OFFLOAD_SMAC_MAX; slot++) {
++		l3_if = PPE_OFFLOAD_SMAC_L3_IF_BASE + slot;
++		ret = ppe_offload_snap_save(priv, PPE_IN_L3_IF_TBL_ADDR +
++					    l3_if * PPE_IN_L3_IF_TBL_INC,
++					    PPE_IN_L3_IF_TBL_WORDS);
++		if (!ret)
++			ret = ppe_offload_snap_save(priv, PPE_EG_L3_IF_TBL_ADDR +
++						    l3_if * PPE_EG_L3_IF_TBL_INC,
++						    PPE_EG_L3_IF_TBL_WORDS);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ /* Save the PPPoE session entries and L3 interfaces this code may use, after
+  * checking that nothing else has a session there: a valid entry would be
+  * some other user's, so offload stays off rather than overwrite it.
+@@ -5141,20 +5342,22 @@ static int ppe_offload_enable(struct ppe_offload_priv *priv)
+ 	}
+ 
+ 	/* Every entry enabling may save: the TCP flag parser words, four
+-	 * words per exception code, the PPPoE session slots (six entries
+-	 * each), profile E's two, and five per port.
++	 * words per exception code, the PPPoE session and source MAC slots
++	 * (six and two entries each), profile E's two, and five per port.
+ 	 */
+ 	BUILD_BUG_ON(DIV_ROUND_UP(ARRAY_SIZE(ppe_offload_tcp_exception_flags), 2) +
+ 		     4 * (ARRAY_SIZE(ppe_offload_tcp_exception_flags) +
+ 			  ARRAY_SIZE(ppe_offload_hdr_exception_codes) +
+ 			  ARRAY_SIZE(ppe_offload_pppoe_exception_codes)) +
+-		     6 * PPE_OFFLOAD_PPPOE_MAX + 2 +
++		     6 * PPE_OFFLOAD_PPPOE_MAX + 2 * PPE_OFFLOAD_SMAC_MAX + 2 +
+ 		     5 * PPE_OFFLOAD_PORTS_MAX > PPE_OFFLOAD_SNAP_MAX);
+ 
+ 	priv->snap_num = 0;
+ 	ret = ppe_offload_snap_exceptions(priv);
+ 	if (!ret)
+ 		ret = ppe_offload_snap_pppoe(priv);
++	if (!ret)
++		ret = ppe_offload_snap_smac(priv);
+ 	if (!ret)
+ 		ret = edma_port_for_each_netdev(ppe_offload_snap_port, priv);
+ 	if (ret) {
+@@ -5195,6 +5398,10 @@ static int ppe_offload_enable(struct ppe_offload_priv *priv)
+ 	priv->rearm_count = 0;
+ 	priv->pppoe_blocked = false;
+ 	priv->pppoe_short = 0;
++	/* No flow holds a slot here, and disable wrote their saved entries
++	 * back: a slot retired before may be tried again.
++	 */
++	memset(priv->smac, 0, sizeof(priv->smac));
+ 	WRITE_ONCE(priv->enabled, true);
+ 	pr_info("ppe_offload: enabled: TCP exceptions %s, header exceptions %s, PPPoE exceptions %s, profile E %s (port %u)\n",
+ 		priv->tcp_exceptions_ok ? "ok" : "FAILED (TCP declined)",
+@@ -5519,10 +5726,22 @@ static int ppe_offload_flows_show(struct seq_file *m, void *v)
+ 			seq_printf(m, "pppoe %u: RETIRED (entry not cleared, or a flow stuck)\n", i);
+ 	}
+ 
++	for (i = 0; i < PPE_OFFLOAD_SMAC_MAX; i++) {
++		const struct ppe_offload_smac *p = &priv->smac[i];
++
++		if (p->refs)
++			seq_printf(m, "smac %u: %pM refs %u l3_if %u\n", i, p->mac, p->refs,
++				   PPE_OFFLOAD_SMAC_L3_IF_BASE + i);
++		else if (p->broken)
++			seq_printf(m, "smac %u: RETIRED (l3_if %u not set up or not cleared)\n", i,
++				   PPE_OFFLOAD_SMAC_L3_IF_BASE + i);
++	}
++
+ 	list_for_each_entry(entry, &priv->flows, list) {
+-		seq_printf(m, "flow %u: valid %d nexthop %u host %u pppoe %d dsa_port %u%s packets %llu bytes %llu idle %ums\n",
++		seq_printf(m, "flow %u: valid %d nexthop %u host %u pppoe %d smac %d dsa_port %u%s packets %llu bytes %llu idle %ums\n",
+ 			   entry->flow_index, entry->flow_valid, entry->nexthop_index,
+ 			   entry->host_index, entry->pppoe ? entry->pppoe_slot : -1,
++			   entry->smac ? entry->smac_slot : -1,
+ 			   entry->dsa_fixed ? entry->dsa_index : 0,
+ 			   entry->dsa_vlan_aware ? (entry->dsa_vlan_tagged ? " vlan1-tagged" :
+ 						    " vlan1-untagged") : "",
