@@ -7,6 +7,7 @@
 #include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/ethtool.h>
+#include <linux/if_bridge.h>
 #include <linux/if_vlan.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
@@ -830,17 +831,18 @@ static bool rtl8372n_port_has_vlan_upper(struct dsa_switch *ds, int port)
 
 /*
  * Offload one bridge (ds->max_num_bridges = 1), VLAN-aware or not, unless
- * setup disabled offload or the port has an 8021q upper: -EOPNOTSUPP makes
- * DSA bridge it in software, standalone and CPU-only in the switch. The
- * port is unlinked, which a standalone port already is, so that a join also
- * clears whatever an earlier failure left, then put in CIST DISABLED, then
- * linked with the members in its VLAN mode (see the isolation invariant
- * above), which releases a hold an earlier failure left on it.
- * DISABLED is the state DSA's attribute sync writes next for a new bridge
- * port, followed by its flags (learning, flooding), VLAN awareness and the
- * ageing time. A port joining a VLAN-filtering bridge is thus linked with
- * the members only when that sync makes it VLAN-aware; its VLANs follow
- * from the bridge (rtl8372n_vlan.c), after any stale one is dropped.
+ * setup disabled offload, the port has an 8021q upper or the bridge's VLAN
+ * protocol is not 802.1Q: -EOPNOTSUPP makes DSA bridge it in software,
+ * standalone and CPU-only in the switch. The port is unlinked, which a
+ * standalone port already is, so that a join also clears whatever an
+ * earlier failure left, then put in CIST DISABLED, then linked with the
+ * members in its VLAN mode (see the isolation invariant above), which
+ * releases a hold an earlier failure left on it. DISABLED is the state
+ * DSA's attribute sync writes next for a new bridge port, followed by its
+ * flags (learning, flooding), VLAN awareness and the ageing time. A port
+ * joining a VLAN-filtering bridge is thus linked with the members only when
+ * that sync makes it VLAN-aware; its VLANs follow from the bridge
+ * (rtl8372n_vlan.c), after any stale one is dropped.
  */
 static int rtl8372n_port_bridge_join(struct dsa_switch *ds, int port,
 				     struct dsa_bridge bridge,
@@ -851,6 +853,7 @@ static int rtl8372n_port_bridge_join(struct dsa_switch *ds, int port,
 	struct rtl837x_priv *priv = ds->priv;
 	bool unlinked;
 	u16 peers = 0;
+	u16 proto;
 	int ret, err;
 
 	if (!dsa_is_user_port(ds, port))
@@ -866,6 +869,21 @@ static int rtl8372n_port_bridge_join(struct dsa_switch *ds, int port,
 	if (rtl8372n_port_has_vlan_upper(ds, port)) {
 		NL_SET_ERR_MSG_MOD(extack,
 				   "Port has 8021q uppers, bridged in software");
+		return -EOPNOTSUPP;
+	}
+	/*
+	 * The driver programs 802.1Q VLANs only: offloaded, a bridge with
+	 * another vlan_protocol (802.1ad) would have its S-tagged frames
+	 * switched by C-tag rules without any error. DSA does not pass a
+	 * later protocol change on to the driver, so this holds only for the
+	 * protocol the bridge has when the port joins.
+	 */
+	if (!br_vlan_get_proto(bridge.dev, &proto) && proto != ETH_P_8021Q) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Only 802.1Q bridges are offloaded, bridged in software");
+		dev_dbg(priv->dev,
+			"port %d: bridged in software: VLAN protocol 0x%04x\n",
+			port, proto);
 		return -EOPNOTSUPP;
 	}
 
