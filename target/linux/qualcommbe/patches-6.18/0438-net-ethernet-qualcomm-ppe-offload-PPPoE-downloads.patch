@@ -1,0 +1,1663 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: offload PPPoE downloads
+
+A download through a PPPoE interface arrives on the WAN port in a PPPoE
+session, which the flow entry cannot express: it has no PPPoE field. The
+PPE terminates a session in its session table, which gives the frames of
+one session from one access concentrator on one port an L3 interface of
+their own; a flow keyed on that L3 interface then matches only them.
+
+PPPoE flows need a second module parameter, pppoe_offload (default off),
+on top of flow_offload: the session match has no VLAN field, so the
+session ID from its concentrator's MAC on another VLAN of the port, or
+untagged, also reaches its flows, which software would not forward;
+setting it accepts that. Clearing it takes every session out of hardware.
+
+With the flowtable's FLOW_DISSECTOR_KEY_PPPOE match (generic pending
+patch 714), accept a direction of a flow received through a PPPoE
+interface (the reply of a connection routed out through it, or a port
+forward into the LAN) when its destination before translation is that
+interface's own address and the interface's forward path is exactly the
+rule's: the session, on a VLAN of the EDMA port or on the port itself.
+Program the session (at most four, refcounted by their flows): an
+ingress L3 interface (PPPoE termination, IPv4 routing, the port's
+MY_MAC, the PPP MTU) and an egress one, then the session entry, its
+valid word last, matching the session ID, the port and the
+concentrator's MAC; read everything back. Arm the PPPoE header
+exceptions (wrong version or type, wrong code, a PPP protocol other than
+IP) to redirect and de-accelerate on a flow hit, as the vendor does.
+
+A session goes out of hardware, valid word first, and its flows with it,
+when its PPP, VLAN or port device goes down, loses carrier, changes
+address, MTU or upper, or goes away, when its last flow goes, and at
+disable; a session entry that cannot be cleared keeps its slot out of
+use and declines every new flow until a reboot. A generation count keeps
+a flow resolved against the old devices from programming a stale
+session.
+
+The session entry terminates every frame of the session, not only those
+that hit a flow, and no source says how those that miss reach the CPU.
+The bench checks that before a session is written on a live line; in
+service, an IP frame from the concentrator to this host on the session's
+lower device itself (a session frame handed over decapsulated; frames
+the core hands over for an upper of that device do not count) takes the
+session out of hardware and keeps PPPoE in software until offload is
+enabled again, as do two sessions in a row that die within a minute of
+going into hardware (a PPP device going down or away; other device
+changes and clearing pppoe_offload do not count, nor does a session out
+of hardware when its device dies). A session is not used without that
+watch, nor while its port or lower device has no carrier. Two sessions
+in hardware differing only by VLAN are refused.
+
+Enabling now also checks that L3_ROUTE_CTRL redirects PPPoE multicast to
+the CPU, programs the PPPoE header exceptions, and saves the session
+entries and L3 interfaces 16-19 for disable to write back, whatever
+pppoe_offload says; a session entry found valid then refuses enabling,
+as someone else's.
+
+For the bench, /sys/kernel/debug/ppe/offload_pppoe_pin ("<ppp device>
+<seconds>") programs a PPP device's session without any flow, for at
+most ten minutes: what the session entry alone does to the session's
+frames. The pin is held to the same device generation check as an offer,
+and goes when its session is taken out of hardware.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../net/ethernet/qualcomm/ppe/ppe_offload.c   | 1174 ++++++++++++++++-
+ drivers/net/ethernet/qualcomm/ppe/ppe_regs.h  |   40 +
+ 2 files changed, 1169 insertions(+), 45 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -30,12 +30,12 @@
+  *   flow is accepted only when the address it translates is this
+  *   router's own on the interface (or VLAN upper) the packets arrive
+  *   through. A rule received through PPPoE carries
+- *   FLOW_DISSECTOR_KEY_PPPOE (generic patch 714), which the flow entry
+- *   has no field for and the key check declines; should a PPPoE WAN's
+- *   reply come without it, this test fails it (its address is the PPP
+- *   device's, not the port's) rather than program a plain-IPv4 entry
+- *   that a spoofed frame on the WAN segment could hit while software
+- *   drops it.
++ *   FLOW_DISSECTOR_KEY_PPPOE (generic patch 714) and is checked against
++ *   the session the kernel has instead (below); should a PPPoE WAN's
++ *   reply come without the key, this test fails it (its address is the
++ *   PPP device's, not the port's) rather than program a plain-IPv4
++ *   entry that a spoofed frame on the WAN segment could hit while
++ *   software drops it.
+  *   The same check keeps a DNAT flow entering through a DSA user port
+  *   (a redirect from the LAN) in software, and likewise one entering a
+  *   WAN that is a bridge over the EDMA port: the address is the
+@@ -69,6 +69,15 @@
+  *   Where the inserts name the port outright (rtl8_4), a client that
+  *   its own bridge later learns on another of its ports
+  *   has its flows re-pointed there, see ppe_offload_fdb_event().
++ * - PPPoE ingress (a flow received through a PPPoE interface: the reply of a
++ *   connection routed out through it, or a port forward) arrives with the
++ *   session in a FLOW_DISSECTOR_KEY_PPPOE match. It is accepted only for
++ *   traffic to the PPPoE interface's own address, with the session the kernel
++ *   has on that interface, and hardware is told about the session (session
++ *   table entry, its own L3 interface) so that only frames of that session
++ *   from its access concentrator reach the flow entry, see
++ *   ppe_offload_pppoe_get(). Without the key the reply of a PPPoE flow is
++ *   declined, as it always was.
+  * - Tagged ingress (the reply direction on a tagged WAN) arrives as a
+  *   FLOW_DISSECTOR_KEY_VLAN match on the real device plus a
+  *   FLOW_ACTION_VLAN_POP. The flow key cannot carry the VLAN, only the
+@@ -135,11 +144,12 @@
+  * (/sys/module/qcom_ppe/parameters/flow_offload, or "options qcom_ppe
+  * flow_offload=1" in /etc/modules.conf). Enabling saves every static register
+  * it is about to change (exception actions and enables, the per-port L3
+- * interface, MY_MAC and L3_VP_PORT entries and MTU command), programs and
+- * reads them back, and only then accepts flows. A port entry that does not
+- * read back restores the saved values and leaves offload off; an exception
+- * group that does not read back leaves it on with the flows that need it
+- * declined (TCP flows for the TCP flag exceptions, every flow for the header
++ * interface, MY_MAC and L3_VP_PORT entries and MTU command, the PPPoE session
++ * entries and their L3 interfaces), programs and reads them back, and only
++ * then accepts flows. A port entry that does not read back restores the saved
++ * values and leaves offload off; an exception group that does not read back
++ * leaves it on with the flows that need it declined (TCP flows for the TCP
++ * flag exceptions, PPPoE flows for the PPPoE ones, every flow for the header
+  * ones), its registers written back on disable. Profile E's two registers
+  * (ppe_offload_egress_apply()) are saved, written and read back at enable when
+  * an rtl8_4 conduit exists, or else on the first flow towards one; a failure
+@@ -158,6 +168,7 @@
+ #include <linux/etherdevice.h>
+ #include <linux/hashtable.h>
+ #include <linux/if_bridge.h>
++#include <linux/if_arp.h>
+ #include <linux/if_ether.h>
+ #include <linux/if_vlan.h>
+ #include <linux/in.h>
+@@ -169,6 +180,7 @@
+ #include <linux/mutex.h>
+ #include <linux/netdevice.h>
+ #include <linux/of.h>
++#include <linux/ppp_defs.h>
+ #include <linux/regmap.h>
+ #include <linux/rtnetlink.h>
+ #include <net/dsa.h>
+@@ -189,6 +201,7 @@
+ #include "ppe_host.h"
+ #include "ppe_host_ipv4.h"
+ #include "ppe_host_pool.h"
++#include "ppe_l3_if.h"
+ #include "ppe_nexthop.h"
+ #include "ppe_nexthop_pool.h"
+ #include "ppe_offload.h"
+@@ -235,6 +248,9 @@ struct ppe_offload_flow_entry {
+ 	bool stuck;
+ 	/* Only an SNAT flow holds a public IP table entry. */
+ 	bool pub_ip_valid;
++	/* A PPPoE flow holds a reference on priv->pppoe[pppoe_slot]. */
++	bool pppoe;
++	u8 pppoe_slot;
+ 	/* Set for every flow whose nexthop's tag inserts name a DSA user
+ 	 * port outright (struct ppe_offload_egress::dsa_fixed), bridged or
+ 	 * not: the entry sits in ppe_offload_priv::dsa_fixed_ht so that a
+@@ -296,6 +312,76 @@ static const struct rhashtable_params ppe_offload_flow_ht_params = {
+ 	.automatic_shrinking = true,
+ };
+ 
++/* PPPoE sessions offloaded at once, and the L3 interfaces they use: one
++ * each, past the ports' own (the port id is a port's L3 interface).
++ */
++#define PPE_OFFLOAD_PPPOE_MAX		4
++#define PPE_OFFLOAD_PPPOE_L3_IF_BASE	16
++
++/**
++ * struct ppe_offload_pppoe_info - A PPPoE session as the kernel has it.
++ * @sid: Session ID.
++ * @ac_mac: The access concentrator's MAC address (the session's peer).
++ * @local_mac: The source MAC address of the session, the EDMA port's.
++ * @ppp_ifindex: The PPP device.
++ * @lower_ifindex: The device the session runs on: a VLAN device on
++ * @port_ifindex, or that EDMA port itself.
++ * @port_ifindex: The EDMA port.
++ * @port: Its PPE port.
++ * @port_l3_if: Its own L3 interface, whose MY_MAC entry is @port_l3_if - 1.
++ * @vid: The VLAN of @lower_ifindex, 0 for none.
++ * @mtu: The PPP device's MTU.
++ *
++ * Compared whole (memcmp()), so always built zeroed.
++ */
++struct ppe_offload_pppoe_info {
++	u16 sid;
++	u8 ac_mac[ETH_ALEN];
++	u8 local_mac[ETH_ALEN];
++	int ppp_ifindex;
++	int lower_ifindex;
++	int port_ifindex;
++	u32 port;
++	u32 port_l3_if;
++	u16 vid;
++	unsigned int mtu;
++};
++
++/**
++ * struct ppe_offload_pppoe - One PPPoE session programmed in hardware.
++ * @info: The session.
++ * @refs: Flows using it; it is torn down when the last one goes.
++ * @live: Its hardware session entry is valid. Cleared, with the entry,
++ * when the kernel's session changes under it (ppe_offload_netdev_event()),
++ * and its flows are dropped then; a flow whose entry could not be deleted
++ * keeps the slot and L3 interface reserved.
++ * @since: When it went into hardware.
++ * @owner: The offload state it belongs to, for @strip_pt.
++ * @strip_pt: Watch for IPv4 and IPv6 frames from the access concentrator
++ * received on the session's lower device while it is live, see
++ * ppe_offload_strip_rcv().
++ * @strip_dev: That device, held while hooked.
++ * @strip_tracker: Its reference tracker.
++ * @stripped: Such a frame was seen.
++ * @broken: Its hardware session entry could not be cleared: the slot is
++ * never used again (until a reboot).
++ *
++ * Slot n of priv->pppoe uses hardware session entry n and L3 interface
++ * PPE_OFFLOAD_PPPOE_L3_IF_BASE + n. Under priv->lock, but @stripped.
++ */
++struct ppe_offload_pppoe {
++	struct ppe_offload_pppoe_info info;
++	unsigned int refs;
++	bool live;
++	unsigned long since;
++	struct ppe_offload_priv *owner;
++	struct packet_type strip_pt[2];
++	struct net_device *strip_dev;
++	netdevice_tracker strip_tracker;
++	bool stripped;
++	bool broken;
++};
++
+ /* Static registers enabling changes, saved before and restored after:
+  * at most PPE_OFFLOAD_SNAP_WORDS consecutive words each, a table entry
+  * being restored whole and in its own word order (some latch on their
+@@ -445,7 +531,25 @@ struct ppe_offload_counters {
+  * 0 for none (ppe_offload_egress_apply()). Written under @lock.
+  * @egress_failed: Applying profile E failed; conduits stay declined until
+  * offload is disabled. Written under @lock.
+- * @netdev_nb: Drops port-addressed flows when a switch port's uppers change.
++ * @pppoe_exceptions_ok: Whether the PPPoE header exceptions were programmed
++ * and read back at enable; PPPoE flows are declined otherwise.
++ * @pppoe: The PPPoE sessions in hardware; under @lock.
++ * @netdev_nb: Drops a switch port's port-addressed flows when its uppers
++ * change, and takes a PPPoE session out of hardware when its devices change.
++ * @pppoe_gen: Bumped by every such device change; a PPPoE flow is added
++ * only if it did not move since its session was resolved.
++ * @pppoe_blocked: PPPoE flows are declined until offload is enabled
++ * again: sessions kept dying soon after going into hardware, or
++ * decapsulated session frames were seen (ppe_offload_strip_work()).
++ * Under @lock.
++ * @pppoe_short: Sessions in a row that died within
++ * PPE_OFFLOAD_PPPOE_FLAP_WINDOW of going into hardware; under @lock.
++ * @strip_work: Takes the sessions out of hardware after
++ * ppe_offload_strip_rcv() saw a frame.
++ * @pin_slot: The session slot the bench pinned into hardware without a
++ * flow (ppe_offload_pin_write()), -1 for none; under @lock.
++ * @pin_work: Unpins it after the time it was asked for.
++ * @pin_dentry: Its debugfs control.
+  * @flows_dentry: The debugfs listing of what is tracked.
+  * @flows_hw_dentry: The debugfs listing of the tracked flows' entries as
+  * hardware has them.
+@@ -491,7 +595,16 @@ struct ppe_offload_priv {
+ 	unsigned int flows_lost;
+ 	u32 egress_port;
+ 	bool egress_failed;
++	bool pppoe_exceptions_ok;
++	struct ppe_offload_pppoe pppoe[PPE_OFFLOAD_PPPOE_MAX];
+ 	struct notifier_block netdev_nb;
++	atomic_t pppoe_gen;
++	bool pppoe_blocked;
++	unsigned int pppoe_short;
++	struct work_struct strip_work;
++	int pin_slot;
++	struct delayed_work pin_work;
++	struct dentry *pin_dentry;
+ 	struct dentry *flows_dentry;
+ 	struct dentry *flows_hw_dentry;
+ 	struct list_head binds;
+@@ -502,14 +615,31 @@ struct ppe_offload_priv {
+ 	struct work_struct trip_work;
+ };
+ 
++/* qcom_ppe.pppoe_offload, see ppe_offload_pppoe_param_set(). */
++static bool ppe_offload_pppoe_param;
++
+ static int ppe_offload_snap_save(struct ppe_offload_priv *priv, u32 addr,
+ 				 unsigned int words);
++static void ppe_offload_pppoe_put(struct ppe_offload_priv *priv, unsigned int slot);
+ static int ppe_offload_flow_drop(struct ppe_offload_priv *priv,
+ 				 struct ppe_offload_flow_entry *entry);
+ static void ppe_offload_flow_stuck(struct ppe_offload_priv *priv,
+ 				   struct ppe_offload_flow_entry *entry, int err);
+ static void ppe_offload_trip_work(struct work_struct *work);
++static void ppe_offload_strip_work(struct work_struct *work);
++static void ppe_offload_pin_timeout(struct work_struct *work);
+ 
++/* Let go of the table entries a flow points at. Under priv->lock. */
++static void ppe_offload_flow_release(struct ppe_offload_priv *priv,
++				     struct ppe_offload_flow_entry *entry)
++{
++	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
++	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
++	if (entry->pub_ip_valid)
++		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
++	if (entry->pppoe)
++		ppe_offload_pppoe_put(priv, entry->pppoe_slot);
++}
+ static int ppe_offload_flow_hw_del(struct ppe_offload_priv *priv,
+ 				   struct ppe_offload_flow_entry *entry);
+ static int ppe_offload_index_del(struct ppe_offload_priv *priv, u32 index);
+@@ -1300,10 +1430,7 @@ static void ppe_offload_flow_forget(struct ppe_offload_priv *priv,
+ 		spin_unlock_bh(&priv->dsa_fixed_lock);
+ 	}
+ 	ppe_offload_flow_disown(priv, entry);
+-	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
+-	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
+-	if (entry->pub_ip_valid)
+-		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
++	ppe_offload_flow_release(priv, entry);
+ 	kfree(entry);
+ }
+ 
+@@ -1331,7 +1458,7 @@ static const char * const ppe_offload_stale_why[] = {
+  * packets of this flow. That is normal while the other direction of the
+  * connection is declined, and says nothing about this direction. The
+  * entry itself does: an exception armed to de-accelerate (a TCP control
+- * flag) sets its DE_ACCE bit, after which
++ * flag, a PPPoE header exception) sets its DE_ACCE bit, after which
+  * hardware sends every packet of the flow to the CPU (vendor in_flow_tbl
+  * de_acce, set by hardware as the vendor's tunnel decap code notes for its
+  * own tables). Kamil Bienkiewicz measured such a zombie on a GL-BE9300
+@@ -1387,8 +1514,8 @@ static enum ppe_offload_stale ppe_offload_flow_stale(struct ppe_offload_priv *pr
+  * driver lets hardware drop an entry on its own, so hundreds in seconds
+  * mean that it is not doing what it is told, and re-arming would only
+  * churn the tables under load. A de-accelerated entry is hardware doing
+- * what it was told (a FIN or RST fired its exception), and a superseded
+- * one is the hash table at work: neither counts.
++ * what it was told (a FIN, RST or PPPoE header exception fired), and a
++ * superseded one is the hash table at work: neither counts.
+  */
+ #define PPE_OFFLOAD_REARM_WINDOW	(10 * HZ)
+ #define PPE_OFFLOAD_REARM_MAX		256
+@@ -1432,7 +1559,651 @@ static bool ppe_offload_rearm_trip(struct ppe_offload_priv *priv)
+ 				 BIT_ULL(FLOW_DISSECTOR_KEY_TCP) |		\
+ 				 BIT_ULL(FLOW_DISSECTOR_KEY_PORTS) |		\
+ 				 BIT_ULL(FLOW_DISSECTOR_KEY_VLAN) |		\
+-				 BIT_ULL(FLOW_DISSECTOR_KEY_CVLAN))
++				 BIT_ULL(FLOW_DISSECTOR_KEY_CVLAN) |		\
++				 BIT_ULL(FLOW_DISSECTOR_KEY_PPPOE))
++
++/* Find the PPPoE session a flow is received in, as the kernel has it.
++ * @addr is the address the flow is translated from, which must be the
++ * PPP device's own; that device's forward path, as the flowtable resolved
++ * the flow from it (dev_fill_forward_path()), must be exactly the rule's:
++ * PPPoE session @sid on @lower (with VLAN @vid on @port_dev, or @port_dev
++ * itself when @vid is 0). The session's own MAC address must be the
++ * port's, which is the MY_MAC entry its L3 interface can point at.
++ * Under RCU.
++ *
++ * Return: true with @info filled in, false if any of it does not hold.
++ */
++static bool ppe_offload_pppoe_resolve(struct net *net, __be32 addr,
++				      struct net_device *port_dev, struct net_device *lower,
++				      u16 vid, u16 sid, struct ppe_offload_pppoe_info *info)
++{
++	static const u8 zero_mac[ETH_ALEN];
++	struct net_device_path_stack stack;
++	const struct net_device_path *path;
++	struct edma_port_priv *port_priv;
++	int paths = vid ? 3 : 2;
++	struct net_device *ppp;
++
++	/* Its private data is read below as an EDMA port's. */
++	if (!edma_port_is_edma_netdev(port_dev))
++		return false;
++
++	ppp = __ip_dev_find(net, addr, false);
++	if (!ppp || ppp->type != ARPHRD_PPP || !netif_running(ppp))
++		return false;
++
++	if (dev_fill_forward_path(ppp, zero_mac, &stack) < 0 || stack.num_paths != paths)
++		return false;
++
++	path = &stack.path[0];
++	if (path->type != DEV_PATH_PPPOE || path->dev != ppp ||
++	    path->encap.proto != htons(ETH_P_PPP_SES) || path->encap.id != sid ||
++	    !is_valid_ether_addr(path->encap.h_dest))
++		return false;
++
++	if (vid) {
++		path = &stack.path[1];
++		if (path->type != DEV_PATH_VLAN || path->dev != lower ||
++		    path->encap.proto != htons(ETH_P_8021Q) || path->encap.id != vid)
++			return false;
++	} else if (lower != port_dev) {
++		return false;
++	}
++
++	path = &stack.path[paths - 1];
++	if (path->type != DEV_PATH_ETHERNET || path->dev != port_dev)
++		return false;
++
++	if (!ether_addr_equal(lower->dev_addr, port_dev->dev_addr))
++		return false;
++
++	/* Nor while its link is down: the next offer would otherwise undo
++	 * the no-carrier teardown (ppe_offload_netdev_event()).
++	 */
++	if (!netif_carrier_ok(port_dev) || !netif_carrier_ok(lower))
++		return false;
++
++	port_priv = netdev_priv(port_dev);
++	memset(info, 0, sizeof(*info));
++	info->sid = sid;
++	ether_addr_copy(info->ac_mac, stack.path[0].encap.h_dest);
++	ether_addr_copy(info->local_mac, lower->dev_addr);
++	info->ppp_ifindex = ppp->ifindex;
++	info->lower_ifindex = lower->ifindex;
++	info->port_ifindex = port_dev->ifindex;
++	info->port = port_priv->ppe_port->port_id;
++	info->port_l3_if = port_priv->l3_if_index;
++	info->vid = vid;
++	info->mtu = READ_ONCE(ppp->mtu);
++
++	return true;
++}
++
++/* Take hardware session entry @slot out of use: its valid bits first, so
++ * that no frame matches a half-cleared entry, then the rest of it and the
++ * L3 interface. Under priv->lock.
++ */
++static int ppe_offload_pppoe_clear(struct ppe_offload_priv *priv, unsigned int slot)
++{
++	struct regmap *regmap = priv->ppe_dev->regmap;
++	struct ppe_l3_if_eg_entry eg = {};
++	struct ppe_l3_if_in_entry in = {};
++	u32 ext_addr = PPE_PPPOE_SESSION_EXT_ADDR + slot * PPE_PPPOE_SESSION_EXT_INC;
++	u32 l3_if = PPE_OFFLOAD_PPPOE_L3_IF_BASE + slot;
++	u32 ext = ~0;
++	int ret;
++
++	ret = regmap_write(regmap, ext_addr, 0);
++	if (!ret)
++		ret = regmap_read(regmap, ext_addr, &ext);
++	if (ret || ext) {
++		/* Still terminating the session: leave the rest as it is,
++		 * for the caller to keep the slot out of use.
++		 */
++		pr_err("ppe_offload: PPPoE session entry %u not cleared (%d, %#x); new flows declined, disable and reboot\n",
++		       slot, ret, ext);
++		priv->degraded = true;
++		return ret ?: -EIO;
++	}
++
++	regmap_write(regmap, PPE_PPPOE_SESSION_EXT2_ADDR + slot * PPE_PPPOE_SESSION_EXT2_INC, 0);
++	regmap_write(regmap, PPE_PPPOE_SESSION_EXT1_ADDR + slot * PPE_PPPOE_SESSION_EXT1_INC, 0);
++	regmap_write(regmap, PPE_PPPOE_SESSION_ADDR + slot * PPE_PPPOE_SESSION_INC, 0);
++	ppe_l3_if_in_entry_set(priv->ppe_dev, l3_if, &in);
++	ppe_l3_if_eg_entry_set(priv->ppe_dev, l3_if, &eg);
++
++	return 0;
++}
++
++/* Program session @info in slot @slot: the L3 interface a frame of the
++ * session is given (ingress: PPPoE terminated, IPv4 routed, the port's
++ * MY_MAC, the PPP device's MTU as MRU and MTU; egress: the session ID and
++ * PPPoE encapsulation, the port's MAC), then the session entry, its valid
++ * word last, matching the session ID on the port only and the access
++ * concentrator's MAC as source. Everything is read back. Under priv->lock.
++ *
++ * Return: 0 on success, a negative error code with the slot cleared (or,
++ * when even that fails, marked broken).
++ */
++static int ppe_offload_pppoe_program(struct ppe_offload_priv *priv, unsigned int slot,
++				     const struct ppe_offload_pppoe_info *info)
++{
++	struct regmap *regmap = priv->ppe_dev->regmap;
++	u32 l3_if = PPE_OFFLOAD_PPPOE_L3_IF_BASE + slot;
++	struct ppe_l3_if_eg_entry eg = {}, eg_back;
++	struct ppe_l3_if_in_entry in = {}, in_back;
++	const u8 *mac = info->ac_mac;
++	u32 want[4], got[4];
++	unsigned int i, mtu;
++	int ret;
++
++	mtu = min_t(u32, info->mtu, FIELD_MAX(PPE_IN_L3_IF_TBL_MTU));
++	in.mru = mtu;
++	in.mtu = mtu;
++	in.mru_ipv6 = mtu;
++	in.mtu_ipv6 = mtu;
++	in.ipv4_uc_route_en = true;
++	/* As on the ports' own (edma_port_l3_if_program()). */
++	in.ttl_exceed_cmd = PPE_L3_IF_ACTION_REDIRECT_TO_CPU;
++	in.ttl_exceed_de_acce = false;
++	in.mac_bitmap = BIT(info->port_l3_if - 1);
++	in.pppoe_en = true;
++
++	ether_addr_copy(eg.mac_addr, info->local_mac);
++	eg.session_id = info->sid;
++	eg.pppoe_en = true;
++
++	want[0] = FIELD_PREP(PPE_PPPOE_SESSION_SESSION_ID, info->sid) |
++		  FIELD_PREP(PPE_PPPOE_SESSION_PORT_BITMAP, BIT(info->port)) |
++		  FIELD_PREP(PPE_PPPOE_SESSION_TYPE, PPE_PPPOE_SESSION_TYPE_PORT_BITMAP);
++	want[1] = (u32)mac[0] << 24 | (u32)mac[1] << 16 | (u32)mac[2] << 8 | mac[3];
++	want[2] = FIELD_PREP(PPE_PPPOE_SESSION_EXT2_L3_IF_INDEX, l3_if) |
++		  PPE_PPPOE_SESSION_EXT2_L3_IF_VALID;
++	want[3] = PPE_PPPOE_SESSION_EXT_UC_VALID | PPE_PPPOE_SESSION_EXT_SMAC_VALID |
++		  FIELD_PREP(PPE_PPPOE_SESSION_EXT_SMAC, (u32)mac[4] << 8 | mac[5]);
++
++	ret = ppe_l3_if_in_entry_set(priv->ppe_dev, l3_if, &in);
++	if (!ret)
++		ret = ppe_l3_if_eg_entry_set(priv->ppe_dev, l3_if, &eg);
++	if (!ret)
++		ret = ppe_l3_if_in_entry_get(priv->ppe_dev, l3_if, &in_back);
++	if (!ret)
++		ret = ppe_l3_if_eg_entry_get(priv->ppe_dev, l3_if, &eg_back);
++	if (!ret && (in_back.mru != in.mru || in_back.mtu != in.mtu ||
++		     in_back.mac_bitmap != in.mac_bitmap || !in_back.pppoe_en ||
++		     !in_back.ipv4_uc_route_en || in_back.ipv6_uc_route_en ||
++		     in_back.ttl_exceed_cmd != in.ttl_exceed_cmd ||
++		     in_back.ttl_exceed_de_acce != in.ttl_exceed_de_acce ||
++		     !ether_addr_equal(eg_back.mac_addr, eg.mac_addr) ||
++		     eg_back.session_id != eg.session_id || !eg_back.pppoe_en))
++		ret = -EIO;
++	if (ret)
++		goto fail;
++
++	ret = regmap_write(regmap, PPE_PPPOE_SESSION_ADDR + slot * PPE_PPPOE_SESSION_INC, want[0]);
++	if (!ret)
++		ret = regmap_write(regmap, PPE_PPPOE_SESSION_EXT1_ADDR +
++				   slot * PPE_PPPOE_SESSION_EXT1_INC, want[1]);
++	if (!ret)
++		ret = regmap_write(regmap, PPE_PPPOE_SESSION_EXT2_ADDR +
++				   slot * PPE_PPPOE_SESSION_EXT2_INC, want[2]);
++	if (!ret)
++		ret = regmap_write(regmap, PPE_PPPOE_SESSION_EXT_ADDR +
++				   slot * PPE_PPPOE_SESSION_EXT_INC, want[3]);
++	if (!ret)
++		ret = regmap_read(regmap, PPE_PPPOE_SESSION_ADDR + slot * PPE_PPPOE_SESSION_INC,
++				  &got[0]);
++	if (!ret)
++		ret = regmap_read(regmap, PPE_PPPOE_SESSION_EXT1_ADDR +
++				  slot * PPE_PPPOE_SESSION_EXT1_INC, &got[1]);
++	if (!ret)
++		ret = regmap_read(regmap, PPE_PPPOE_SESSION_EXT2_ADDR +
++				  slot * PPE_PPPOE_SESSION_EXT2_INC, &got[2]);
++	if (!ret)
++		ret = regmap_read(regmap, PPE_PPPOE_SESSION_EXT_ADDR +
++				  slot * PPE_PPPOE_SESSION_EXT_INC, &got[3]);
++	if (ret)
++		goto fail;
++
++	for (i = 0; i < ARRAY_SIZE(want); i++) {
++		if (got[i] != want[i]) {
++			pr_err("ppe_offload: PPPoE session entry %u word %u read back %#x, wrote %#x\n",
++			       slot, i, got[i], want[i]);
++			ret = -EIO;
++			goto fail;
++		}
++	}
++
++	return 0;
++
++fail:
++	if (ppe_offload_pppoe_clear(priv, slot))
++		priv->pppoe[slot].broken = true;
++	return ret ?: -EIO;
++}
++
++/* What a session entry in hardware does to its frames is not known for
++ * those that miss every flow: LCP, the router's own traffic, the first
++ * packets of every connection not yet offloaded. If hardware strips their
++ * PPPoE header before handing them to the CPU, they arrive on the
++ * session's lower device as plain IPv4 or IPv6 from the access
++ * concentrator, which software drops, while LCP may keep the session up.
++ * The bench checks this before a session goes into hardware on a live
++ * line; this watch is the backstop: one such frame takes the session out
++ * of hardware and keeps PPPoE in software until offload is enabled again.
++ * Only a frame from the concentrator addressed to this host counts, as a
++ * session frame would be: the concentrator's own multicast (router
++ * solicitations, MLD, mDNS) and anyone else's frames pass, as do the
++ * frames the core also hands over for an upper of the device (a VLAN or
++ * macvlan on an untagged session's port), which are on that upper by
++ * then. Runs in softirq.
++ */
++static int ppe_offload_strip_rcv(struct sk_buff *skb, struct net_device *dev,
++				 struct packet_type *pt, struct net_device *orig_dev)
++{
++	struct ppe_offload_pppoe *p = pt->af_packet_priv;
++
++	if (dev == pt->dev && skb->pkt_type == PACKET_HOST && skb_mac_header_was_set(skb) &&
++	    ether_addr_equal(eth_hdr(skb)->h_source, p->info.ac_mac) &&
++	    !READ_ONCE(p->stripped)) {
++		WRITE_ONCE(p->stripped, true);
++		schedule_work(&p->owner->strip_work);
++	}
++
++	consume_skb(skb);
++
++	return NET_RX_SUCCESS;
++}
++
++/* Hook ppe_offload_strip_rcv() on the session's lower device; a session
++ * is not used without it. Under priv->lock.
++ */
++static int ppe_offload_strip_hook(struct ppe_offload_priv *priv, struct net *net,
++				  struct ppe_offload_pppoe *p)
++{
++	static const __be16 types[] = { htons(ETH_P_IP), htons(ETH_P_IPV6) };
++	unsigned int i;
++
++	/* Gone already: the session is about to go too. */
++	p->strip_dev = netdev_get_by_index(net, p->info.lower_ifindex, &p->strip_tracker,
++					   GFP_KERNEL);
++	if (!p->strip_dev)
++		return -ENODEV;
++
++	p->owner = priv;
++	WRITE_ONCE(p->stripped, false);
++	for (i = 0; i < ARRAY_SIZE(p->strip_pt); i++) {
++		p->strip_pt[i].type = types[i];
++		p->strip_pt[i].dev = p->strip_dev;
++		p->strip_pt[i].func = ppe_offload_strip_rcv;
++		p->strip_pt[i].af_packet_priv = p;
++		dev_add_pack(&p->strip_pt[i]);
++	}
++
++	return 0;
++}
++
++/* Remove the hook again; dev_remove_pack() waits for its readers. */
++static void ppe_offload_strip_unhook(struct ppe_offload_pppoe *p)
++{
++	unsigned int i;
++
++	if (!p->strip_dev)
++		return;
++
++	for (i = 0; i < ARRAY_SIZE(p->strip_pt); i++)
++		dev_remove_pack(&p->strip_pt[i]);
++	netdev_put(p->strip_dev, &p->strip_tracker);
++	p->strip_dev = NULL;
++}
++
++/* Get the hardware session for @info, programming it on first use. Under
++ * priv->lock.
++ *
++ * Return: 0 with @slot set and a reference taken, a negative error code
++ * otherwise.
++ */
++static int ppe_offload_pppoe_get(struct ppe_offload_priv *priv, struct net *net,
++				 const struct ppe_offload_pppoe_info *info, unsigned int *slot)
++{
++	struct ppe_offload_pppoe *p;
++	int i, free = -1;
++	int ret;
++
++	for (i = 0; i < PPE_OFFLOAD_PPPOE_MAX; i++) {
++		p = &priv->pppoe[i];
++		if (p->broken)
++			continue;
++		if (!p->refs) {
++			if (free < 0)
++				free = i;
++			continue;
++		}
++		if (p->live && !memcmp(&p->info, info, sizeof(*info))) {
++			p->refs++;
++			*slot = i;
++			return 0;
++		}
++		/* The session entry matches on the session ID, port and
++		 * source MAC only, not on the VLAN: a second session that
++		 * differs in nothing else could not be told apart.
++		 */
++		if (p->live && p->info.sid == info->sid && p->info.port == info->port &&
++		    ether_addr_equal(p->info.ac_mac, info->ac_mac)) {
++			pr_info_once("ppe_offload: PPPoE session %u from %pM already in hardware on another device, declined\n",
++				     info->sid, info->ac_mac);
++			return -EBUSY;
++		}
++	}
++
++	if (free < 0)
++		return -ENOSPC;
++
++	ret = ppe_offload_pppoe_program(priv, free, info);
++	if (ret)
++		return ret;
++
++	p = &priv->pppoe[free];
++	p->info = *info;
++	ret = ppe_offload_strip_hook(priv, net, p);
++	if (ret) {
++		if (ppe_offload_pppoe_clear(priv, free))
++			p->broken = true;
++		else
++			memset(p, 0, sizeof(*p));
++		return ret;
++	}
++	p->refs = 1;
++	p->live = true;
++	p->since = jiffies;
++	*slot = free;
++
++	pr_info("ppe_offload: PPPoE session %u from %pM (port %u, VLAN %u, MTU %u) in hardware: session entry %d, L3 interface %u\n",
++		info->sid, info->ac_mac, info->port, info->vid, info->mtu, free,
++		PPE_OFFLOAD_PPPOE_L3_IF_BASE + free);
++
++	return 0;
++}
++
++/* A session that dies within this long of going into hardware, twice in a
++ * row, keeps PPPoE in software until offload is enabled again: the kernel's
++ * session going down so soon is what a hardware session entry that breaks
++ * the session's slow path (LCP, new connections) would look like. Only the
++ * PPP device going down or away counts: a carrier blip, an address or MTU
++ * change or the parameter being cleared also take the session out of
++ * hardware, but say nothing about it. A session that is out of hardware
++ * when its PPP device dies is not counted; one programmed again after such
++ * a change, once its link is back, counts if it then dies: the breaker
++ * errs towards keeping PPPoE in software.
++ */
++#define PPE_OFFLOAD_PPPOE_FLAP_WINDOW	(60 * HZ)
++#define PPE_OFFLOAD_PPPOE_FLAP_MAX	2
++
++/* A session in hardware since @since died: its PPP device went down or
++ * away. Count it towards the breaker when it was that young. Under
++ * priv->lock.
++ */
++static void ppe_offload_pppoe_died(struct ppe_offload_priv *priv, unsigned long since)
++{
++	if (time_before(jiffies, since + PPE_OFFLOAD_PPPOE_FLAP_WINDOW))
++		priv->pppoe_short++;
++	else
++		priv->pppoe_short = 0;
++	if (priv->pppoe_short >= PPE_OFFLOAD_PPPOE_FLAP_MAX && !priv->pppoe_blocked) {
++		priv->pppoe_blocked = true;
++		pr_err("ppe_offload: %u PPPoE sessions in a row died within %us of going into hardware; PPPoE stays in software until offload is enabled again\n",
++		       priv->pppoe_short, (unsigned int)(PPE_OFFLOAD_PPPOE_FLAP_WINDOW / HZ));
++	}
++}
++
++static void ppe_offload_pin_release(struct ppe_offload_priv *priv);
++
++/* Take a session out of hardware and drop its flows, and the bench pin
++ * if it holds the session. A flow whose entry cannot be deleted keeps the
++ * slot and L3 interface reserved until it is. Under priv->lock.
++ */
++static void ppe_offload_pppoe_kill(struct ppe_offload_priv *priv, unsigned int slot,
++				   const char *why)
++{
++	struct ppe_offload_pppoe *p = &priv->pppoe[slot];
++	struct ppe_offload_flow_entry *entry, *tmp;
++	unsigned int dropped = 0, stuck = 0;
++	u16 sid = p->info.sid;
++
++	if (!p->live)
++		return;
++
++	/* The session entry first: from then on no frame is given the
++	 * session's L3 interface, so its flows cannot hit; the slot stays
++	 * reserved until they are deleted. If it cannot be cleared, the
++	 * slot is never used again.
++	 */
++	if (ppe_offload_pppoe_clear(priv, slot))
++		p->broken = true;
++	ppe_offload_strip_unhook(p);
++	p->live = false;
++
++	/* The last put frees the slot (p is cleared then). */
++	list_for_each_entry_safe(entry, tmp, &priv->flows, list) {
++		if (!entry->pppoe || entry->pppoe_slot != slot)
++			continue;
++		if (ppe_offload_flow_drop(priv, entry))
++			stuck++;
++		else
++			dropped++;
++	}
++
++	pr_info("ppe_offload: PPPoE session %u out of hardware (%s): %u flow(s) back to software, %u stuck\n",
++		sid, why, dropped, stuck);
++
++	/* Not _sync: ppe_offload_pin_timeout() takes priv->lock, and finds
++	 * no pin if it runs now.
++	 */
++	if (priv->pin_slot == (int)slot) {
++		cancel_delayed_work(&priv->pin_work);
++		ppe_offload_pin_release(priv);
++	}
++}
++
++static void ppe_offload_pppoe_put(struct ppe_offload_priv *priv, unsigned int slot)
++{
++	struct ppe_offload_pppoe *p = &priv->pppoe[slot];
++
++	if (WARN_ON_ONCE(slot >= PPE_OFFLOAD_PPPOE_MAX || !p->refs))
++		return;
++
++	if (--p->refs)
++		return;
++
++	if (p->live) {
++		if (ppe_offload_pppoe_clear(priv, slot))
++			p->broken = true;
++		ppe_offload_strip_unhook(p);
++		p->live = false;
++		pr_info("ppe_offload: PPPoE session %u out of hardware (no flows left)\n",
++			p->info.sid);
++	}
++	if (!p->broken)
++		memset(p, 0, sizeof(*p));
++}
++
++/* ppe_offload_strip_rcv() saw a decapsulated frame: that session goes out
++ * of hardware and PPPoE stays in software until offload is enabled again.
++ */
++static void ppe_offload_strip_work(struct work_struct *work)
++{
++	struct ppe_offload_priv *priv = container_of(work, struct ppe_offload_priv, strip_work);
++	unsigned int i;
++
++	mutex_lock(&priv->lock);
++	for (i = 0; i < PPE_OFFLOAD_PPPOE_MAX; i++) {
++		struct ppe_offload_pppoe *p = &priv->pppoe[i];
++
++		if (!p->live || !READ_ONCE(p->stripped))
++			continue;
++		if (!priv->pppoe_blocked)
++			pr_err("ppe_offload: IP frame from %pM on the lower device of PPPoE session %u: hardware hands session frames to the CPU decapsulated; PPPoE stays in software until offload is enabled again\n",
++			       p->info.ac_mac, p->info.sid);
++		priv->pppoe_blocked = true;
++		ppe_offload_pppoe_kill(priv, i, "decapsulated frames");
++	}
++	mutex_unlock(&priv->lock);
++}
++
++/* Take every session out of hardware. Under priv->lock. */
++static void ppe_offload_pppoe_kill_all(struct ppe_offload_priv *priv, const char *why)
++{
++	unsigned int i;
++
++	for (i = 0; i < PPE_OFFLOAD_PPPOE_MAX; i++)
++		ppe_offload_pppoe_kill(priv, i, why);
++}
++
++/* Let go of the bench pin, if any. Under priv->lock. */
++static void ppe_offload_pin_release(struct ppe_offload_priv *priv)
++{
++	if (priv->pin_slot < 0)
++		return;
++
++	ppe_offload_pppoe_put(priv, priv->pin_slot);
++	priv->pin_slot = -1;
++	pr_info("ppe_offload: PPPoE session pin released\n");
++}
++
++static void ppe_offload_pin_timeout(struct work_struct *work)
++{
++	struct ppe_offload_priv *priv = container_of(to_delayed_work(work),
++						     struct ppe_offload_priv, pin_work);
++
++	mutex_lock(&priv->lock);
++	ppe_offload_pin_release(priv);
++	mutex_unlock(&priv->lock);
++}
++
++/* The session of PPP device @name as ppe_offload_pppoe_resolve() checks a
++ * flow's, its own address standing in for the flow's. Under RCU.
++ */
++static bool ppe_offload_pppoe_from_dev(struct net *net, const char *name,
++				       struct ppe_offload_pppoe_info *info)
++{
++	static const u8 zero_mac[ETH_ALEN];
++	struct net_device_path_stack stack;
++	struct net_device *ppp, *lower, *port_dev;
++	const struct in_ifaddr *ifa;
++	struct in_device *in_dev;
++	u16 vid = 0;
++
++	ppp = dev_get_by_name_rcu(net, name);
++	if (!ppp || ppp->type != ARPHRD_PPP)
++		return false;
++	in_dev = __in_dev_get_rcu(ppp);
++	ifa = in_dev ? rcu_dereference(in_dev->ifa_list) : NULL;
++	if (!ifa)
++		return false;
++
++	if (dev_fill_forward_path(ppp, zero_mac, &stack) < 0 || stack.num_paths < 2 ||
++	    stack.num_paths > 3 || stack.path[0].type != DEV_PATH_PPPOE)
++		return false;
++	port_dev = (struct net_device *)stack.path[stack.num_paths - 1].dev;
++	lower = port_dev;
++	if (stack.num_paths == 3) {
++		lower = (struct net_device *)stack.path[1].dev;
++		vid = stack.path[1].encap.id;
++	}
++	if (!edma_port_is_edma_netdev(port_dev))
++		return false;
++
++	return ppe_offload_pppoe_resolve(net, ifa->ifa_local, port_dev, lower, vid,
++					 stack.path[0].encap.id, info);
++}
++
++/* Bench only: "<ppp device> <seconds>" programs that device's session into
++ * hardware with no flow for at most PPE_OFFLOAD_PIN_SECONDS_MAX, to check
++ * what a session entry alone does to the session's frames; "-" lets go of
++ * it. Needs offload and PPPoE offload on.
++ */
++#define PPE_OFFLOAD_PIN_SECONDS_MAX	600
++
++static ssize_t ppe_offload_pin_write(struct file *file, const char __user *ubuf,
++				     size_t count, loff_t *ppos)
++{
++	struct ppe_offload_priv *priv = file->private_data;
++	struct ppe_offload_pppoe_info info;
++	char buf[IFNAMSIZ + 16] = {};
++	char name[IFNAMSIZ] = {};
++	unsigned int seconds, slot;
++	bool ok;
++	int ret = 0;
++	int gen;
++
++	if (count >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, count))
++		return -EFAULT;
++
++	if (buf[0] == '-') {
++		cancel_delayed_work(&priv->pin_work);
++		mutex_lock(&priv->lock);
++		ppe_offload_pin_release(priv);
++		mutex_unlock(&priv->lock);
++		return count;
++	}
++
++	if (sscanf(buf, "%15s %u", name, &seconds) != 2 || !seconds ||
++	    seconds > PPE_OFFLOAD_PIN_SECONDS_MAX)
++		return -EINVAL;
++
++	/* As for an offer: a device change after the resolve is noticed. */
++	gen = atomic_read(&priv->pppoe_gen);
++	rcu_read_lock();
++	ok = ppe_offload_pppoe_from_dev(&init_net, name, &info);
++	rcu_read_unlock();
++	if (!ok)
++		return -ENODEV;
++
++	mutex_lock(&priv->lock);
++	if (!priv->enabled || priv->degraded || !priv->pppoe_exceptions_ok ||
++	    priv->pppoe_blocked || !READ_ONCE(ppe_offload_pppoe_param))
++		ret = -EPERM;
++	else if (priv->pin_slot >= 0)
++		ret = -EBUSY;
++	else if (atomic_read(&priv->pppoe_gen) != gen)
++		ret = -EAGAIN;
++	else
++		ret = ppe_offload_pppoe_get(priv, &init_net, &info, &slot);
++	if (!ret) {
++		priv->pin_slot = slot;
++		mod_delayed_work(system_wq, &priv->pin_work, seconds * HZ);
++		pr_info("ppe_offload: PPPoE session %u pinned in hardware for %us\n", info.sid,
++			seconds);
++	}
++	mutex_unlock(&priv->lock);
++
++	return ret ?: count;
++}
++
++static ssize_t ppe_offload_pin_read(struct file *file, char __user *ubuf, size_t count,
++				    loff_t *ppos)
++{
++	struct ppe_offload_priv *priv = file->private_data;
++	char buf[32];
++	int len;
++
++	mutex_lock(&priv->lock);
++	len = priv->pin_slot < 0 ? scnprintf(buf, sizeof(buf), "-\n") :
++	      scnprintf(buf, sizeof(buf), "%u\n", priv->pppoe[priv->pin_slot].info.sid);
++	mutex_unlock(&priv->lock);
++
++	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
++}
++
++static const struct file_operations ppe_offload_pin_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = ppe_offload_pin_read,
++	.write = ppe_offload_pin_write,
++	.llseek = default_llseek,
++};
+ 
+ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 				     struct ppe_offload_priv *priv,
+@@ -1464,6 +2235,12 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	bool dst_on_ingress = false;
+ 	bool flow_full = false;
+ 	bool ingress_unparsed = false;
++	struct ppe_offload_pppoe_info pppoe_info;
++	bool pppoe_in = false, pppoe_ok = false;
++	unsigned int pppoe_slot = 0;
++	bool pppoe_ref = false;
++	u32 flow_l3_if;
++	u16 pppoe_sid = 0;
+ 	bool pub_ip = false;
+ 	unsigned int vlan_pops = 0;
+ 	u16 ingress_vlan_vid = 0;
+@@ -1473,6 +2250,7 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	u8 ip_proto;
+ 	int action;
+ 	int dsa_gen = atomic_read(&priv->dsa_gen);
++	int pppoe_gen = atomic_read(&priv->pppoe_gen);
+ 	const char *stage = NULL;
+ 	int ret;
+ 
+@@ -1635,6 +2413,27 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		ingress_vlan_vid = vlan.key->vlan_id;
+ 	}
+ 
++	/* PPPoE ingress: an exact session, IPv4 inside, as the flowtable
++	 * fills the key. The session hardware is told about decides which
++	 * frames reach the flow entry; the checks below make it the
++	 * kernel's.
++	 */
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PPPOE)) {
++		struct flow_match_pppoe pppoe;
++
++		flow_rule_match_pppoe(rule, &pppoe);
++		if (pppoe.mask->session_id != htons(0xffff) ||
++		    pppoe.mask->type != htons(0xffff) || pppoe.key->type != htons(ETH_P_PPP_SES) ||
++		    pppoe.mask->ppp_proto != htons(0xffff) || pppoe.key->ppp_proto != htons(PPP_IP))
++			return ppe_offload_decline("pppoe match not an exact ipv4 session");
++		if (!READ_ONCE(ppe_offload_pppoe_param))
++			return ppe_offload_decline("pppoe offload is off (qcom_ppe.pppoe_offload=0)");
++		if (!priv->pppoe_exceptions_ok)
++			return ppe_offload_decline("pppoe offload disabled: header exceptions unavailable");
++		pppoe_in = true;
++		pppoe_sid = ntohs(pppoe.key->session_id);
++	}
++
+ 	/* The device is only used to resolve the index it maps to, so
+ 	 * take it under RCU rather than holding a reference.
+ 	 */
+@@ -1663,13 +2462,16 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		/* Whether the destination the packets are addressed to is
+ 		 * this router's own address on the interface they arrive
+ 		 * through. Used below to accept only such DNAT flows. A
+-		 * rule received through PPPoE is declined by the key check
+-		 * already (FLOW_DISSECTOR_KEY_PPPOE); one that came without
+-		 * the key fails here, its address being the PPP device's,
+-		 * and is not translated and delivered where software would
+-		 * drop it.
++		 * rule with FLOW_DISSECTOR_KEY_PPPOE is resolved against the
++		 * session the kernel has instead; one that came without the
++		 * key fails here, its address being the PPP device's, and is
++		 * not translated and delivered where software would drop it.
+ 		 */
+-		if (l3dev)
++		if (l3dev && pppoe_in)
++			pppoe_ok = ppe_offload_pppoe_resolve(dev_net(netdev), match_dst, idev,
++							     l3dev, ingress_vlan_vid, pppoe_sid,
++							     &pppoe_info);
++		else if (l3dev)
+ 			dst_on_ingress = __ip_dev_find(dev_net(netdev), match_dst, false) == l3dev;
+ 	}
+ 	if (idev)
+@@ -1703,6 +2505,10 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		return ppe_offload_decline("ingress ifindex %d not on an edma netdev",
+ 					    meta.key->ingress_ifindex);
+ 
++	if (pppoe_in && !pppoe_ok)
++		return ppe_offload_decline("pppoe session %u on ingress %d: not this router's session for %pI4",
++					    pppoe_sid, meta.key->ingress_ifindex, &match_dst);
++
+ 	if (ingress_l3_if > FIELD_MAX(PPE_FLOW_TBL_SRC_L3_IF))
+ 		return ppe_offload_decline("ingress l3_if %u out of range", ingress_l3_if);
+ 
+@@ -1882,9 +2688,12 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	 * -- see the file comment.
+ 	 */
+ 	if (new_src != match_src && new_dst == match_dst && l4.dest == match_dport) {
++		/* A PPPoE flow is accepted for the session's own address only. */
++		if (pppoe_in)
++			return ppe_offload_decline("snat of pppoe ingress to %pI4", &match_dst);
+ 		snat = true;
+ 	} else if (new_dst != match_dst && new_src == match_src && l4.source == match_sport) {
+-		if (!dst_on_ingress)
++		if (!dst_on_ingress && !pppoe_ok)
+ 			return ppe_offload_decline("dnat of %pI4, not an address of ingress %d",
+ 						    &match_dst, meta.key->ingress_ifindex);
+ 		snat = false;
+@@ -1927,12 +2736,24 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	 * and on again meanwhile.
+ 	 */
+ 	if (!priv->enabled || priv->degraded || priv->tripped || !priv->hdr_exceptions_ok ||
+-	    (ip_proto == PPE_FLOW_PROTO_TCP && !priv->tcp_exceptions_ok)) {
++	    (ip_proto == PPE_FLOW_PROTO_TCP && !priv->tcp_exceptions_ok) ||
++	    (pppoe_in && (!priv->pppoe_exceptions_ok || priv->pppoe_blocked ||
++			  !READ_ONCE(ppe_offload_pppoe_param)))) {
+ 		ret = -EOPNOTSUPP;
+ 		stage = "disabled";
+ 		goto unlock;
+ 	}
+ 
++	/* A device of the session changed since it was resolved: the
++	 * session may already be out of hardware, and must not come back
++	 * from a stale resolution. Re-offered within a second.
++	 */
++	if (pppoe_in && atomic_read(&priv->pppoe_gen) != pppoe_gen) {
++		ret = -EAGAIN;
++		stage = "pppoe change";
++		goto unlock;
++	}
++
+ 	entry = rhashtable_lookup_fast(&priv->flow_table, &cls->cookie,
+ 				       ppe_offload_flow_ht_params);
+ 	if (entry) {
+@@ -1978,6 +2799,17 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		}
+ 	}
+ 
++	flow_l3_if = ingress_l3_if;
++	if (pppoe_in) {
++		ret = ppe_offload_pppoe_get(priv, dev_net(netdev), &pppoe_info, &pppoe_slot);
++		if (ret) {
++			stage = "pppoe";
++			goto unlock;
++		}
++		pppoe_ref = true;
++		flow_l3_if = PPE_OFFLOAD_PPPOE_L3_IF_BASE + pppoe_slot;
++	}
++
+ 	/* Public IP entry for the translated (post-SNAT) source address.
+ 	 * DNAT carries its new destination in the nexthop entry instead.
+ 	 */
+@@ -1986,7 +2818,7 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 						  new_src, &pub_ip_index);
+ 		if (ret) {
+ 			stage = "pub_ip";
+-			goto unlock;
++			goto deref_pppoe;
+ 		}
+ 		pub_ip = true;
+ 	}
+@@ -2062,7 +2894,7 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	flow_ipv4.match_sport = be16_to_cpu(match_sport);
+ 	flow_ipv4.match_dport = be16_to_cpu(match_dport);
+ 	flow_ipv4.src_l3_if_valid = true;
+-	flow_ipv4.src_l3_if = ingress_l3_if;
++	flow_ipv4.src_l3_if = flow_l3_if;
+ 	flow_ipv4.pmtu = pmtu;
+ 	flow_ipv4.pmtu_check_l3 = true;
+ 	ppe_flow_ipv4_nat_entry_encode(&flow_ipv4, flow_words);
+@@ -2080,6 +2912,8 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	entry->nexthop_index = nexthop_index;
+ 	entry->pub_ip_index = pub_ip_index;
+ 	entry->pub_ip_valid = pub_ip;
++	entry->pppoe = pppoe_ref;
++	entry->pppoe_slot = pppoe_slot;
+ 	entry->block = block;
+ 
+ 	flow_index = 0;
+@@ -2186,6 +3020,9 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ deref_pub_ip:
+ 	if (pub_ip)
+ 		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, pub_ip_index);
++deref_pppoe:
++	if (pppoe_ref)
++		ppe_offload_pppoe_put(priv, pppoe_slot);
+ unlock:
+ 	mutex_unlock(&priv->lock);
+ 
+@@ -3432,6 +4269,43 @@ static const u8 ppe_offload_hdr_exception_codes[] = {
+ 	PPE_L3_EXCEPTION_UDP_LITE_HDR_INCOMPLETE,
+ };
+ 
++/* Exception codes the parser raises for a PPPoE session frame it cannot
++ * classify (vendor fal_sec.h FAL_SEC_EXP_PPPOE_*): wrong version/type,
++ * a code other than session data, a PPP protocol other than IP. Programmed
++ * as the vendor's PPPoE support does (nss-ppe ppe_drv_exception.c): to the
++ * CPU and de-accelerated, on a flow hit.
++ */
++static const u8 ppe_offload_pppoe_exception_codes[] = {
++	PPE_L3_EXCEPTION_PPPOE_WRONG_VER_TYPE,
++	PPE_L3_EXCEPTION_PPPOE_WRONG_CODE,
++	PPE_L3_EXCEPTION_PPPOE_UNSUPPORTED_PPP_PROT,
++};
++
++static bool ppe_offload_pppoe_exception_init(struct ppe_device *ppe_dev)
++{
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < ARRAY_SIZE(ppe_offload_pppoe_exception_codes); i++) {
++		ret = ppe_offload_l3_exception_action(ppe_dev, ppe_offload_pppoe_exception_codes[i],
++						      true);
++		if (ret) {
++			dev_err(ppe_dev->dev, "failed to program PPPoE exception %u: %d\n",
++				ppe_offload_pppoe_exception_codes[i], ret);
++			return false;
++		}
++	}
++
++	for (i = 0; i < ARRAY_SIZE(ppe_offload_pppoe_exception_codes); i++) {
++		ret = ppe_offload_l3_exception_verify(ppe_dev, ppe_offload_pppoe_exception_codes[i],
++						      true, "PPPoE");
++		if (ret)
++			return false;
++	}
++
++	return true;
++}
++
+ /**
+  * ppe_offload_hdr_exception_init() - Program the header exceptions.
+  * @ppe_dev: PPE device.
+@@ -3470,23 +4344,88 @@ static bool ppe_offload_hdr_exception_init(struct ppe_device *ppe_dev)
+ 	return true;
+ }
+ 
+-/* A switch port joining or leaving a bridge, or gaining or losing a VLAN
+- * upper (which the switch driver refuses on a port of the offloaded
+- * bridge; a port that has one when it joins is bridged in software): its
+- * port-addressed flows go, as for a bridge VLAN change, before the link
+- * and after it. Under RTNL, as netdevice notifiers are.
++/* A PPPoE session in hardware goes out of it as soon as the kernel's
++ * session may no longer be the same: its PPP device, the VLAN device under
++ * it or the EDMA port going down or away, losing carrier, changing address,
++ * MTU or upper. Its flows are dropped with it and go back to software; a
++ * later flow on the same devices programs the session afresh. Under RTNL,
++ * as netdevice notifiers are.
+  */
+ static int ppe_offload_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
+ {
+-#if IS_ENABLED(CONFIG_NET_DSA) && IS_ENABLED(CONFIG_NET_SWITCHDEV)
+ 	struct ppe_offload_priv *priv = container_of(nb, struct ppe_offload_priv, netdev_nb);
+ 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++	const char *why;
++	unsigned int i;
+ 
++#if IS_ENABLED(CONFIG_NET_DSA) && IS_ENABLED(CONFIG_NET_SWITCHDEV)
++	/* A switch port joining or leaving a bridge, or gaining or losing a
++	 * VLAN upper (which the switch driver refuses on a port of the
++	 * offloaded bridge; a port that has one when it joins is bridged in
++	 * software): its port-addressed flows go, as for a bridge VLAN
++	 * change, before the link and after it.
++	 */
+ 	if ((event == NETDEV_PRECHANGEUPPER || event == NETDEV_CHANGEUPPER) &&
+ 	    dsa_user_dev_check(dev))
+ 		ppe_offload_dsa_change(priv, dev);
+ #endif
+ 
++	switch (event) {
++	case NETDEV_DOWN:
++		why = "device down";
++		break;
++	case NETDEV_UNREGISTER:
++		why = "device gone";
++		break;
++	case NETDEV_CHANGEADDR:
++		why = "address change";
++		break;
++	case NETDEV_CHANGEMTU:
++		why = "MTU change";
++		break;
++	case NETDEV_CHANGEUPPER:
++		why = "upper change";
++		break;
++	case NETDEV_CHANGE:
++		if (netif_carrier_ok(dev))
++			return NOTIFY_DONE;
++		why = "no carrier";
++		break;
++	default:
++		return NOTIFY_DONE;
++	}
++
++	/* Only the devices a session can be on: a PPP device, an EDMA port
++	 * or a VLAN on one. A carrier flap anywhere else must not make PPPoE
++	 * offers race.
++	 */
++	if (dev->type != ARPHRD_PPP && !edma_port_is_edma_netdev(dev) &&
++	    !(is_vlan_dev(dev) && edma_port_is_edma_netdev(vlan_dev_real_dev(dev))))
++		return NOTIFY_DONE;
++
++	/* Before the sessions are looked at: a flow resolved against the
++	 * devices as they were must not program its session afterwards.
++	 */
++	atomic_inc(&priv->pppoe_gen);
++
++	mutex_lock(&priv->lock);
++	for (i = 0; i < PPE_OFFLOAD_PPPOE_MAX; i++) {
++		const struct ppe_offload_pppoe_info *info = &priv->pppoe[i].info;
++		unsigned long since = priv->pppoe[i].since;
++		bool died;
++
++		if (!priv->pppoe[i].live ||
++		    (dev->ifindex != info->ppp_ifindex && dev->ifindex != info->lower_ifindex &&
++		     dev->ifindex != info->port_ifindex))
++			continue;
++		died = dev->ifindex == info->ppp_ifindex &&
++		       (event == NETDEV_DOWN || event == NETDEV_UNREGISTER);
++		ppe_offload_pppoe_kill(priv, i, why);
++		if (died)
++			ppe_offload_pppoe_died(priv, since);
++	}
++	mutex_unlock(&priv->lock);
++
+ 	return NOTIFY_DONE;
+ }
+ 
+@@ -3509,6 +4448,9 @@ int ppe_offload_init(struct ppe_device *ppe_dev)
+ 	INIT_LIST_HEAD(&priv->flows);
+ 	INIT_LIST_HEAD(&priv->binds);
+ 	INIT_WORK(&priv->trip_work, ppe_offload_trip_work);
++	INIT_WORK(&priv->strip_work, ppe_offload_strip_work);
++	INIT_DELAYED_WORK(&priv->pin_work, ppe_offload_pin_timeout);
++	priv->pin_slot = -1;
+ 	ppe_host_pool_init(&priv->host_pool);
+ 	ppe_nexthop_pool_init(&priv->nexthop_pool);
+ 	ppe_pub_ip_pool_init(&priv->pub_ip_pool);
+@@ -3677,6 +4619,61 @@ static int ppe_offload_snap_exceptions(struct ppe_offload_priv *priv)
+ 			return ret;
+ 	}
+ 
++	for (i = 0; i < ARRAY_SIZE(ppe_offload_pppoe_exception_codes); i++) {
++		ret = ppe_offload_snap_exception(priv, ppe_offload_pppoe_exception_codes[i]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/* Save the PPPoE session entries and L3 interfaces this code may use, after
++ * checking that nothing else has a session there: a valid entry would be
++ * some other user's, so offload stays off rather than overwrite it.
++ */
++static int ppe_offload_snap_pppoe(struct ppe_offload_priv *priv)
++{
++	struct regmap *regmap = priv->ppe_dev->regmap;
++	unsigned int slot;
++	u32 l3_if, ext;
++	int ret;
++
++	for (slot = 0; slot < PPE_OFFLOAD_PPPOE_MAX; slot++) {
++		l3_if = PPE_OFFLOAD_PPPOE_L3_IF_BASE + slot;
++
++		ret = regmap_read(regmap, PPE_PPPOE_SESSION_EXT_ADDR +
++				  slot * PPE_PPPOE_SESSION_EXT_INC, &ext);
++		if (ret)
++			return ret;
++		if (ext & (PPE_PPPOE_SESSION_EXT_UC_VALID | PPE_PPPOE_SESSION_EXT_MC_VALID)) {
++			pr_err("ppe_offload: PPPoE session entry %u already valid (%#x)\n", slot, ext);
++			return -EBUSY;
++		}
++
++		ret = ppe_offload_snap_save(priv, PPE_PPPOE_SESSION_ADDR +
++					    slot * PPE_PPPOE_SESSION_INC, 1);
++		if (!ret)
++			ret = ppe_offload_snap_save(priv, PPE_PPPOE_SESSION_EXT1_ADDR +
++						    slot * PPE_PPPOE_SESSION_EXT1_INC, 1);
++		if (!ret)
++			ret = ppe_offload_snap_save(priv, PPE_PPPOE_SESSION_EXT2_ADDR +
++						    slot * PPE_PPPOE_SESSION_EXT2_INC, 1);
++		if (!ret)
++			ret = ppe_offload_snap_save(priv, PPE_PPPOE_SESSION_EXT_ADDR +
++						    slot * PPE_PPPOE_SESSION_EXT_INC, 1);
++		if (!ret)
++			ret = ppe_offload_snap_save(priv, PPE_IN_L3_IF_TBL_ADDR +
++						    l3_if * PPE_IN_L3_IF_TBL_INC,
++						    PPE_IN_L3_IF_TBL_WORDS);
++		if (!ret)
++			ret = ppe_offload_snap_save(priv, PPE_EG_L3_IF_TBL_ADDR +
++						    l3_if * PPE_EG_L3_IF_TBL_INC,
++						    PPE_EG_L3_IF_TBL_WORDS);
++		if (ret)
++			return ret;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -3873,7 +4870,8 @@ static unsigned int ppe_offload_flush(struct ppe_offload_priv *priv, unsigned in
+ 
+ /* Whether the L3 routing failures flow offload relies on reach the CPU:
+  * a flow's source interface not matching (SRC_L3_IF), an MRU or MTU
+- * failure on an L3 interface, and a flow's PMTU failure. They are left as
++ * failure on an L3 interface, a flow's PMTU failure, and a PPPoE
++ * multicast frame on a session's L3 interface. They are left as
+  * the PPE resets them (redirect); were any set otherwise, hardware would
+  * forward or drop what software has to see, so offload stays off.
+  */
+@@ -3890,6 +4888,7 @@ static bool ppe_offload_route_ctrl_ok(struct ppe_device *ppe_dev)
+ 	    FIELD_GET(PPE_L3_ROUTE_CTRL_IP_MTU_FAIL, ctrl) != cpu ||
+ 	    FIELD_GET(PPE_L3_ROUTE_CTRL_IP_MTU_DF_FAIL, ctrl) != cpu ||
+ 	    FIELD_GET(PPE_L3_ROUTE_CTRL_FLOW_SRC_IF_CHECK_CMD, ctrl) != cpu ||
++	    FIELD_GET(PPE_L3_ROUTE_CTRL_PPPOE_MULTICAST_CMD, ctrl) != cpu ||
+ 	    FIELD_GET(PPE_L3_ROUTE_CTRL_EXT_FLOW_PMTU_FAIL, ext) != cpu ||
+ 	    FIELD_GET(PPE_L3_ROUTE_CTRL_EXT_FLOW_PMTU_DF_FAIL, ext) != cpu) {
+ 		pr_err("ppe_offload: L3 route control %#x/%#x does not send routing failures to the CPU\n",
+@@ -3930,15 +4929,20 @@ static int ppe_offload_enable(struct ppe_offload_priv *priv)
+ 	}
+ 
+ 	/* Every entry enabling may save: the TCP flag parser words, four
+-	 * words per exception code, profile E's two, and five per port.
++	 * words per exception code, the PPPoE session slots (six entries
++	 * each), profile E's two, and five per port.
+ 	 */
+ 	BUILD_BUG_ON(DIV_ROUND_UP(ARRAY_SIZE(ppe_offload_tcp_exception_flags), 2) +
+ 		     4 * (ARRAY_SIZE(ppe_offload_tcp_exception_flags) +
+-			  ARRAY_SIZE(ppe_offload_hdr_exception_codes)) + 2 +
++			  ARRAY_SIZE(ppe_offload_hdr_exception_codes) +
++			  ARRAY_SIZE(ppe_offload_pppoe_exception_codes)) +
++		     6 * PPE_OFFLOAD_PPPOE_MAX + 2 +
+ 		     5 * PPE_OFFLOAD_PORTS_MAX > PPE_OFFLOAD_SNAP_MAX);
+ 
+ 	priv->snap_num = 0;
+ 	ret = ppe_offload_snap_exceptions(priv);
++	if (!ret)
++		ret = ppe_offload_snap_pppoe(priv);
+ 	if (!ret)
+ 		ret = edma_port_for_each_netdev(ppe_offload_snap_port, priv);
+ 	if (ret) {
+@@ -3951,12 +4955,14 @@ static int ppe_offload_enable(struct ppe_offload_priv *priv)
+ 
+ 	priv->tcp_exceptions_ok = ppe_offload_tcp_exception_init(ppe_dev);
+ 	priv->hdr_exceptions_ok = ppe_offload_hdr_exception_init(ppe_dev);
++	priv->pppoe_exceptions_ok = ppe_offload_pppoe_exception_init(ppe_dev);
+ 
+ 	ret = edma_port_for_each_netdev(ppe_offload_program_port, NULL);
+ 	if (ret) {
+ 		ppe_offload_snap_restore(priv, 0);
+ 		priv->tcp_exceptions_ok = false;
+ 		priv->hdr_exceptions_ok = false;
++		priv->pppoe_exceptions_ok = false;
+ 		pr_err("ppe_offload: not enabled: programming the port L3 interfaces failed: %d\n",
+ 		       ret);
+ 		goto unlock;
+@@ -3975,10 +4981,13 @@ static int ppe_offload_enable(struct ppe_offload_priv *priv)
+ 
+ 	priv->tripped = false;
+ 	priv->rearm_count = 0;
++	priv->pppoe_blocked = false;
++	priv->pppoe_short = 0;
+ 	WRITE_ONCE(priv->enabled, true);
+-	pr_info("ppe_offload: enabled: TCP exceptions %s, header exceptions %s, profile E %s (port %u)\n",
++	pr_info("ppe_offload: enabled: TCP exceptions %s, header exceptions %s, PPPoE exceptions %s, profile E %s (port %u)\n",
+ 		priv->tcp_exceptions_ok ? "ok" : "FAILED (TCP declined)",
+ 		priv->hdr_exceptions_ok ? "ok" : "FAILED (all flows declined)",
++		priv->pppoe_exceptions_ok ? "ok" : "FAILED (PPPoE declined)",
+ 		priv->egress_failed ? "FAILED (switch declined)" :
+ 		priv->egress_port ? "ok" : "not yet (no rtl8_4 conduit)", priv->egress_port);
+ 
+@@ -4006,6 +5015,7 @@ static void ppe_offload_disable(struct ppe_offload_priv *priv)
+ 
+ 	WRITE_ONCE(priv->enabled, false);
+ 	stuck = ppe_offload_flush(priv, &flows);
++	ppe_offload_pin_release(priv);
+ 	if (stuck) {
+ 		/* Those entries may still forward: keep everything they
+ 		 * rely on (exceptions, port L3 interfaces) as programmed.
+@@ -4019,6 +5029,7 @@ static void ppe_offload_disable(struct ppe_offload_priv *priv)
+ 	ppe_offload_snap_restore(priv, 0);
+ 	priv->tcp_exceptions_ok = false;
+ 	priv->hdr_exceptions_ok = false;
++	priv->pppoe_exceptions_ok = false;
+ 	WRITE_ONCE(priv->egress_port, 0);
+ 	WRITE_ONCE(priv->egress_failed, false);
+ 
+@@ -4035,13 +5046,16 @@ static int ppe_offload_flows_show(struct seq_file *m, void *v)
+ {
+ 	struct ppe_offload_priv *priv = m->private;
+ 	struct ppe_offload_flow_entry *entry;
+-	unsigned int n = 0;
++	unsigned int i, n = 0;
+ 
+ 	mutex_lock(&priv->lock);
+ 
+ 	seq_printf(m, "enabled %d degraded %d tripped %d egress_port %u egress_failed %d\n",
+ 		   priv->enabled, priv->degraded, priv->tripped, priv->egress_port,
+ 		   priv->egress_failed);
++	seq_printf(m, "pppoe_offload %d pppoe_blocked %d pppoe_short %u pin %d\n",
++		   READ_ONCE(ppe_offload_pppoe_param), priv->pppoe_blocked, priv->pppoe_short,
++		   priv->pin_slot);
+ 	seq_printf(m, "accepted %ld declined %ld rearmed_superseded %ld rearmed_invalid %ld rearmed_deacce %ld withdrawn %ld unbound %ld stuck %ld\n",
+ 		   atomic_long_read(&priv->counters.accepted),
+ 		   atomic_long_read(&priv->counters.declined),
+@@ -4052,10 +5066,23 @@ static int ppe_offload_flows_show(struct seq_file *m, void *v)
+ 		   atomic_long_read(&priv->counters.unbound),
+ 		   atomic_long_read(&priv->counters.stuck));
+ 
++	for (i = 0; i < PPE_OFFLOAD_PPPOE_MAX; i++) {
++		const struct ppe_offload_pppoe *p = &priv->pppoe[i];
++
++		if (p->refs)
++			seq_printf(m, "pppoe %u: live %d refs %u sid %u ac %pM port %u vid %u mtu %u l3_if %u watched %d age %us%s\n",
++				   i, p->live, p->refs, p->info.sid, p->info.ac_mac, p->info.port,
++				   p->info.vid, p->info.mtu, PPE_OFFLOAD_PPPOE_L3_IF_BASE + i,
++				   !!p->strip_dev, jiffies_to_msecs(jiffies - p->since) / 1000,
++				   p->broken ? " BROKEN" : "");
++		else if (p->broken)
++			seq_printf(m, "pppoe %u: BROKEN (entry not cleared)\n", i);
++	}
++
+ 	list_for_each_entry(entry, &priv->flows, list) {
+-		seq_printf(m, "flow %u: valid %d nexthop %u host %u dsa_port %u%s packets %llu bytes %llu idle %ums\n",
++		seq_printf(m, "flow %u: valid %d nexthop %u host %u pppoe %d dsa_port %u%s packets %llu bytes %llu idle %ums\n",
+ 			   entry->flow_index, entry->flow_valid, entry->nexthop_index,
+-			   entry->host_index,
++			   entry->host_index, entry->pppoe ? entry->pppoe_slot : -1,
+ 			   entry->dsa_fixed ? entry->dsa_index : 0,
+ 			   entry->dsa_vlan_aware ? (entry->dsa_vlan_tagged ? " vlan1-tagged" :
+ 						    " vlan1-untagged") : "",
+@@ -4177,6 +5204,50 @@ static void ppe_offload_trip_work(struct work_struct *work)
+ MODULE_PARM_DESC(flow_offload,
+ 		 "Offload nftables flowtable flows to the PPE (default N; writable at runtime)");
+ 
++/* PPPoE downloads need this as well as flow_offload: the session table
++ * matches no VLAN, so the session's ID from its concentrator's MAC on
++ * another VLAN of the WAN port, or untagged, also reaches its flows, which
++ * software would not forward (DESIGN.md). Setting it is accepting that.
++ * Clearing it takes every session out of hardware.
++ */
++static int ppe_offload_pppoe_param_set(const char *val, const struct kernel_param *kp)
++{
++	struct ppe_offload_priv *priv;
++	bool on;
++	int ret;
++
++	ret = kstrtobool(val, &on);
++	if (ret)
++		return ret;
++
++	mutex_lock(&ppe_offload_param_lock);
++	WRITE_ONCE(ppe_offload_pppoe_param, on);
++	priv = ppe_offload_instance;
++	if (!on && priv) {
++		mutex_lock(&priv->lock);
++		ppe_offload_pin_release(priv);
++		ppe_offload_pppoe_kill_all(priv, "pppoe_offload=0");
++		mutex_unlock(&priv->lock);
++	}
++	mutex_unlock(&ppe_offload_param_lock);
++
++	return 0;
++}
++
++static int ppe_offload_pppoe_param_get(char *buffer, const struct kernel_param *kp)
++{
++	return sysfs_emit(buffer, "%c\n", READ_ONCE(ppe_offload_pppoe_param) ? 'Y' : 'N');
++}
++
++static const struct kernel_param_ops ppe_offload_pppoe_param_ops = {
++	.set = ppe_offload_pppoe_param_set,
++	.get = ppe_offload_pppoe_param_get,
++};
++
++module_param_cb(pppoe_offload, &ppe_offload_pppoe_param_ops, NULL, 0644);
++MODULE_PARM_DESC(pppoe_offload,
++		 "Also offload PPPoE downloads; accepts that the session match has no VLAN (default N)");
++
+ /**
+  * ppe_offload_enabled() - Whether flow offload is on.
+  * @ppe_dev: PPE device.
+@@ -4211,6 +5282,9 @@ void ppe_offload_start(struct ppe_device *ppe_dev)
+ 		priv->flows_hw_dentry = debugfs_create_file("offload_flows_hw", 0400,
+ 							    ppe_dev->debugfs_root, priv,
+ 							    &ppe_offload_flows_hw_fops);
++		priv->pin_dentry = debugfs_create_file("offload_pppoe_pin", 0600,
++						       ppe_dev->debugfs_root, priv,
++						       &ppe_offload_pin_fops);
+ 	}
+ 
+ 	mutex_lock(&ppe_offload_param_lock);
+@@ -4235,10 +5309,13 @@ void ppe_offload_stop(struct ppe_device *ppe_dev)
+ 	if (!priv)
+ 		return;
+ 
++	/* No more debugfs writes; then the works and the timer. */
+ 	debugfs_remove(priv->flows_dentry);
+ 	priv->flows_dentry = NULL;
+ 	debugfs_remove(priv->flows_hw_dentry);
+ 	priv->flows_hw_dentry = NULL;
++	debugfs_remove(priv->pin_dentry);
++	priv->pin_dentry = NULL;
+ 
+ 	mutex_lock(&ppe_offload_param_lock);
+ 	rtnl_lock();
+@@ -4249,10 +5326,17 @@ void ppe_offload_stop(struct ppe_device *ppe_dev)
+ 	mutex_unlock(&ppe_offload_param_lock);
+ 
+ 	/* Disabled and no longer the instance: no flow is offered, so the
+-	 * trip cannot be queued again (and finds no instance if it was).
+-	 * Only then is it waited for, outside the locks it takes.
++	 * trip cannot be queued again (and finds no instance if it was), and
++	 * with every session out of hardware and unwatched (a stuck flow may
++	 * have kept one) no decapsulated frame is looked for either. Only
++	 * then are the works waited for, outside the locks they take.
+ 	 */
++	mutex_lock(&priv->lock);
++	ppe_offload_pppoe_kill_all(priv, "unload");
++	mutex_unlock(&priv->lock);
+ 	cancel_work_sync(&priv->trip_work);
++	cancel_work_sync(&priv->strip_work);
++	cancel_delayed_work_sync(&priv->pin_work);
+ }
+ 
+ /* Free every tracked flow during teardown, those kept in no hash table
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -1534,9 +1534,49 @@
+ #define PPE_L3_ROUTE_CTRL_IP_MTU_FAIL		GENMASK(4, 3)
+ #define PPE_L3_ROUTE_CTRL_IP_MTU_DF_FAIL	GENMASK(7, 6)
+ #define PPE_L3_ROUTE_CTRL_FLOW_SRC_IF_CHECK_CMD	GENMASK(13, 12)
++#define PPE_L3_ROUTE_CTRL_PPPOE_MULTICAST_CMD	GENMASK(27, 26)
+ 
+ #define PPE_L3_ROUTE_CTRL_EXT_ADDR		0x200494
+ #define PPE_L3_ROUTE_CTRL_EXT_FLOW_PMTU_FAIL	GENMASK(9, 8)
+ #define PPE_L3_ROUTE_CTRL_EXT_FLOW_PMTU_DF_FAIL	GENMASK(12, 11)
+ 
++/* PPPoE session tables (vendor APPE PPPOE_SESSION, _EXT, _EXT1, _EXT2 in the
++ * tunnel lookup block, TUNNEL_LOOKUP_BASE_ADDR 0x300000 + 0x6800 / 0x6a00 /
++ * 0x6c00 / 0x6e00; 64 entries sharing one index). A PPPoE frame matching an
++ * entry's session ID, ingress port and (with SMAC_VALID) source MAC is
++ * terminated and given the entry's L3 interface. An entry is valid while
++ * EXT has UC_VALID or MC_VALID set. The HPPE tables of the same names (IPE
++ * L3 0x200c20, 16 entries) are a different layout and not used here.
++ */
++#define PPE_PPPOE_SESSION_ENTRIES		64
++#define PPE_PPPOE_SESSION_ADDR			0x306800
++#define PPE_PPPOE_SESSION_INC			0x8
++#define PPE_PPPOE_SESSION_SESSION_ID		GENMASK(15, 0)
++#define PPE_PPPOE_SESSION_PORT_BITMAP		GENMASK(23, 16)
++#define PPE_PPPOE_SESSION_TYPE			GENMASK(25, 24)
++/* TYPE: PORT_BITMAP holds physical ports (vendor adpt_port_type_convert()). */
++#define PPE_PPPOE_SESSION_TYPE_PORT_BITMAP	0
++
++#define PPE_PPPOE_SESSION_EXT_ADDR		0x306a00
++#define PPE_PPPOE_SESSION_EXT_INC		0x4
++#define PPE_PPPOE_SESSION_EXT_MC_VALID		BIT(0)
++#define PPE_PPPOE_SESSION_EXT_UC_VALID		BIT(1)
++#define PPE_PPPOE_SESSION_EXT_SMAC_VALID	BIT(2)
++/* Source MAC bytes 4..5 (mac[4] << 8 | mac[5]). */
++#define PPE_PPPOE_SESSION_EXT_SMAC		GENMASK(31, 16)
++
++/* Source MAC bytes 0..3, mac[0] in the top byte. */
++#define PPE_PPPOE_SESSION_EXT1_ADDR		0x306c00
++#define PPE_PPPOE_SESSION_EXT1_INC		0x4
++
++#define PPE_PPPOE_SESSION_EXT2_ADDR		0x306e00
++#define PPE_PPPOE_SESSION_EXT2_INC		0x4
++#define PPE_PPPOE_SESSION_EXT2_L3_IF_INDEX	GENMASK(15, 8)
++#define PPE_PPPOE_SESSION_EXT2_L3_IF_VALID	BIT(16)
++
++/* PPPoE exception codes (vendor fal_sec.h FAL_SEC_EXP_PPPOE_*). */
++#define PPE_L3_EXCEPTION_PPPOE_WRONG_VER_TYPE		1
++#define PPE_L3_EXCEPTION_PPPOE_WRONG_CODE		2
++#define PPE_L3_EXCEPTION_PPPOE_UNSUPPORTED_PPP_PROT	3
++
+ #endif
