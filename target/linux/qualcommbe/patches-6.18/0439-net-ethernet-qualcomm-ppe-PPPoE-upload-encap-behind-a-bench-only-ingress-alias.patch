@@ -1,0 +1,1078 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: PPPoE upload encap behind a 
+ bench-only ingress alias
+
+Uploads come from the switch, whose head tag the parser cannot walk past
+with the reset TPIDs, so they are not offloaded in service. Kamil
+Bienkiewicz's ingress alias for rtl8_4 (his 0445) makes them parse, at
+the cost of the tagged WAN's downloads (measured by him: they never hit).
+
+Add it as bench profile A, on top of profile E: the ingress and tunnel
+parser TPIDs set to S 0x8899 / C 0x0000, the CPU port made an S-VLAN
+egress port re-emitting both tags unmodified (without it the flood path
+to the CPU rebuilds a lone 0x8100 tag and the LAN dies, his
+measurement), and the conduit's parser role core, last; saved, read back
+and restored in reverse. It is applied only by writing "A <seconds>" (at
+most 600) to /sys/kernel/debug/ppe/offload_profile with offload on, and
+reverted by "E", the timer, disable and unload; every flow is deleted
+when it comes and goes, and it comes or goes only when all of them were
+(an entry stuck in hardware keeps the profile it was programmed under).
+Tagged ingress is declined while it holds, and an offer checks under the
+lock that the profile did not change since its parsing was judged.
+
+With it, accept the upload of a PPPoE flow, from the conduit under A
+only, whatever the board's ports (its encapsulation is a bench
+hypothesis): FLOW_ACTION_PPPOE_PUSH plus the VLAN push towards the WAN
+port, translated to the PPP interface's address, addressed to the
+session's concentrator; the nexthop points at the session's egress L3
+interface, which carries the session ID and PPPoE encapsulation, with
+the PMTU at most the PPP MTU. As uploads keep hitting on the conduit's
+L3 interface, a session that goes out of hardware has its L3 interface
+cleared, and read back, only after its flows are deleted; a stuck upload
+then meets an MTU of 0 and is redirected to the CPU, and its slot is
+retired. Under A an upload is accepted only when its client addresses
+the conduit's MAC (its bridge's or its port's): the conduit's L3
+interface routes only frames to its own MY_MAC entry.
+
+Profile A exists to check on this gateway what the tagged WAN does under
+the alias and to exercise the upload encapsulation. While A has the
+parser's TPIDs (and if it is kept after a failed revert) no 802.1Q tag
+is followed either, so edma_port_feature_check() turns checksum and
+segmentation offload off for tagged frames until they are back;
+synchronize_net() lets transmits already past the check finish queueing
+before the TPIDs change; frames already in a Tx ring, or requeued after
+a full ring, may still leave with a bad checksum in that switch-over. A
+is refused while degraded, as a failed restore may have left its values
+in place. The pppoe_offload description and the comments that called
+uploads impossible say so.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/net/ethernet/qualcomm/ppe/edma_port.c |  16 +-
+ .../net/ethernet/qualcomm/ppe/ppe_offload.c   | 579 ++++++++++++++++--
+ .../net/ethernet/qualcomm/ppe/ppe_offload.h   |   1 +
+ drivers/net/ethernet/qualcomm/ppe/ppe_regs.h  |  23 +
+ 4 files changed, 559 insertions(+), 60 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
+@@ -236,11 +236,13 @@ static netdev_features_t edma_port_feature_check(struct sk_buff *skb,
+ 	l3_off = skb_network_offset(skb);
+ 
+ 	/* Only an 802.1Q tag is assumed to be one the parser follows. The
+-	 * parser's TPIDs are never programmed (flow offload changes the
+-	 * egress S-TPID only, which tag inserts use), so whether it also
+-	 * recognises 802.1ad is unknown, and assuming it does would keep
+-	 * offload on a frame whose L3 the parser never reaches; assuming it
+-	 * does not merely costs offload.
++	 * parser's TPIDs are never programmed in service (flow offload
++	 * changes the egress S-TPID only, which tag inserts use), so whether
++	 * it also recognises 802.1ad is unknown, and assuming it does would
++	 * keep offload on a frame whose L3 the parser never reaches; assuming
++	 * it does not merely costs offload. Its bench profile A sets the
++	 * C-TPID to 0x0000, after which no 802.1Q tag is followed either
++	 * (ppe_offload_tpids_moved(), below).
+ 	 *
+ 	 * With a head-inserted tag in front these two bytes lie inside that
+ 	 * tag rather than being an ethertype, so the test can match on
+@@ -280,6 +282,10 @@ static netdev_features_t edma_port_feature_check(struct sk_buff *skb,
+ 			vlan_parseable = false;
+ 	}
+ 
++	/* None at all while bench profile A has the parser's TPIDs. */
++	if (nvlan && ppe_offload_tpids_moved(edma_ctx->ppe_dev))
++		vlan_parseable = false;
++
+ 	/* The parser accounts for one VLAN tag, no more. */
+ 	if (nvlan)
+ 		expected += VLAN_HLEN;
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -78,6 +78,12 @@
+  *   from its access concentrator reach the flow entry, see
+  *   ppe_offload_pppoe_get(). Without the key the reply of a PPPoE flow is
+  *   declined, as it always was.
++ * - PPPoE egress (the upload of a connection routed out through a PPPoE
++ *   interface, FLOW_ACTION_PPPOE_PUSH) is accepted only from the conduit
++ *   under bench profile A, SNAT to the PPP interface's own address on
++ *   the session the kernel has, addressed to its concentrator; the
++ *   nexthop leaves through the session's L3 interface, and the PMTU is at
++ *   most the PPP MTU.
+  * - Tagged ingress (the reply direction on a tagged WAN) arrives as a
+  *   FLOW_DISSECTOR_KEY_VLAN match on the real device plus a
+  *   FLOW_ACTION_VLAN_POP. The flow key cannot carry the VLAN, only the
+@@ -133,10 +139,13 @@
+  * Bienkiewicz). Flows entering on an rtl8_4 conduit cannot: with the
+  * reset TPIDs the parser stops at the 0x8899 head tag, so they are
+  * declined (ppe_offload_flow_replace()) and uploads stay in software.
++ * Bench profile A (ppe_offload_profile_a_apply()) changes the TPIDs for
++ * a bounded time so that they parse.
+  *
+  * Ported from Kamil Bienkiewicz's flow-offload series for the GL-BE9300
+- * (perceival/openwrt-flint3); IPv6 routing, the tag_8021q encapsulation
+- * and the ingress parser alias for rtl8_4 are not carried here.
++ * (perceival/openwrt-flint3); IPv6 routing and the tag_8021q
++ * encapsulation are not carried here, and the ingress parser alias for
++ * rtl8_4 only as bench profile A (ppe_offload_profile_a_apply()).
+  *
+  * OFF BY DEFAULT. The flowtable block binds either way, so that a flowtable
+  * with "flags offload" always loads, but every flow is declined and no offload
+@@ -354,7 +363,7 @@ struct ppe_offload_pppoe_info {
+  * @live: Its hardware session entry is valid. Cleared, with the entry,
+  * when the kernel's session changes under it (ppe_offload_netdev_event()),
+  * and its flows are dropped then; a flow whose entry could not be deleted
+- * keeps the slot and L3 interface reserved.
++ * retires the slot (@broken).
+  * @since: When it went into hardware.
+  * @owner: The offload state it belongs to, for @strip_pt.
+  * @strip_pt: Watch for IPv4 and IPv6 frames from the access concentrator
+@@ -363,8 +372,9 @@ struct ppe_offload_pppoe_info {
+  * @strip_dev: That device, held while hooked.
+  * @strip_tracker: Its reference tracker.
+  * @stripped: Such a frame was seen.
+- * @broken: Its hardware session entry could not be cleared: the slot is
+- * never used again (until a reboot).
++ * @broken: Its hardware session entry could not be cleared, or one of its
++ * flows stayed stuck when it went out of hardware: the slot is never used
++ * again (until a reboot; enabling does not give it back).
+  *
+  * Slot n of priv->pppoe uses hardware session entry n and L3 interface
+  * PPE_OFFLOAD_PPPOE_L3_IF_BASE + n. Under priv->lock, but @stripped.
+@@ -395,6 +405,7 @@ struct ppe_offload_pppoe {
+  * physical ports, six at most (IPQ9574).
+  */
+ #define PPE_OFFLOAD_PORTS_MAX	6
++#define PPE_OFFLOAD_A_SNAP_MAX	8
+ 
+ /* @mask: For an entry saved with ppe_offload_snap_save_masked(), the bits of
+  * each word that are written back; the others are left as they are then
+@@ -520,9 +531,9 @@ struct ppe_offload_counters {
+  * @snap_num: Entries used in @snap.
+  * @degraded: A flow entry could not be deleted (it may still forward, and
+  * what it relies on is kept), or a saved register did not read back as
+- * saved when written back. New flows are declined, and enabling is
+- * refused until a reboot, so that the next enable cannot save a changed
+- * value as the one to go back to. Under @lock.
++ * saved when written back. New flows are declined, and enabling and bench
++ * profile A are refused until a reboot, so that no snapshot can save a
++ * changed value as the one to go back to. Under @lock.
+  * @flows_lost: Flow entries that may be in hardware at an index nobody
+  * knows (a hash-mode add whose result never came, ppe_flow_entry_add()).
+  * No delete reaches them, so disabling never writes back what they rely
+@@ -550,6 +561,18 @@ struct ppe_offload_counters {
+  * flow (ppe_offload_pin_write()), -1 for none; under @lock.
+  * @pin_work: Unpins it after the time it was asked for.
+  * @pin_dentry: Its debugfs control.
++ * @profile_a: Bench profile A is applied (ppe_offload_profile_a_apply());
++ * written under @lock.
++ * @tpids_moved: The parser TPIDs are not at reset (profile A being applied,
++ * applied, or kept after a failed revert): no 802.1Q tag is followed.
++ * Written under @lock, read locklessly by ppe_offload_tpids_moved().
++ * @a_snap: The registers profile A changed, with their values from before;
++ * kept apart from @snap because A comes and goes on its own.
++ * @a_snap_num: Entries used in @a_snap.
++ * @a_gen: Bumped, under @lock, whenever profile A comes or goes; a flow is
++ * added only if it did not move since its parsing was judged.
++ * @a_revert: Puts profile A back after the time it was asked for.
++ * @a_dentry: Its debugfs control.
+  * @flows_dentry: The debugfs listing of what is tracked.
+  * @flows_hw_dentry: The debugfs listing of the tracked flows' entries as
+  * hardware has them.
+@@ -605,6 +628,13 @@ struct ppe_offload_priv {
+ 	int pin_slot;
+ 	struct delayed_work pin_work;
+ 	struct dentry *pin_dentry;
++	bool profile_a;
++	bool tpids_moved;
++	struct ppe_offload_snap a_snap[PPE_OFFLOAD_A_SNAP_MAX];
++	unsigned int a_snap_num;
++	atomic_t a_gen;
++	struct delayed_work a_revert;
++	struct dentry *a_dentry;
+ 	struct dentry *flows_dentry;
+ 	struct dentry *flows_hw_dentry;
+ 	struct list_head binds;
+@@ -625,6 +655,7 @@ static int ppe_offload_flow_drop(struct ppe_offload_priv *priv,
+ 				 struct ppe_offload_flow_entry *entry);
+ static void ppe_offload_flow_stuck(struct ppe_offload_priv *priv,
+ 				   struct ppe_offload_flow_entry *entry, int err);
++static void ppe_offload_profile_a_timeout(struct work_struct *work);
+ static void ppe_offload_trip_work(struct work_struct *work);
+ static void ppe_offload_strip_work(struct work_struct *work);
+ static void ppe_offload_pin_timeout(struct work_struct *work);
+@@ -937,7 +968,8 @@ static int ppe_offload_egress_apply(struct ppe_offload_priv *priv, u32 port)
+  * measured by him on a GL-BE9300) and every port keeps today's RSS and
+  * receive checksum. The flows this enables are downloads towards the
+  * switch; uploads from it stay in software, as the parser cannot see past
+- * the head tag on ingress.
++ * the head tag on ingress (bench profile A, below, adds the ingress half
++ * for a bounded time to test exactly that).
+  *
+  * The egress C-TPID is left at 0x8100: it is the third word of the
+  * emulated tag and the TPID of every C-tag insert, such as a tagged WAN's.
+@@ -1562,9 +1594,10 @@ static bool ppe_offload_rearm_trip(struct ppe_offload_priv *priv)
+ 				 BIT_ULL(FLOW_DISSECTOR_KEY_CVLAN) |		\
+ 				 BIT_ULL(FLOW_DISSECTOR_KEY_PPPOE))
+ 
+-/* Find the PPPoE session a flow is received in, as the kernel has it.
+- * @addr is the address the flow is translated from, which must be the
+- * PPP device's own; that device's forward path, as the flowtable resolved
++/* Find the PPPoE session a flow is received in or sent out through, as
++ * the kernel has it. @addr must be the PPP device's own address: the
++ * destination a download is translated from, or the source an upload is
++ * translated to; that device's forward path, as the flowtable resolved
+  * the flow from it (dev_fill_forward_path()), must be exactly the rule's:
+  * PPPoE session @sid on @lower (with VLAN @vid on @port_dev, or @port_dev
+  * itself when @vid is 0). The session's own MAC address must be the
+@@ -1639,17 +1672,39 @@ static bool ppe_offload_pppoe_resolve(struct net *net, __be32 addr,
+ 	return true;
+ }
+ 
++/* Write session slot @slot's L3 interface empty and read it back: MTU 0,
++ * no routing, no PPPoE encapsulation. An entry that does not read back
++ * latches priv->degraded. Under priv->lock.
++ */
++static void ppe_offload_pppoe_l3_if_clear(struct ppe_offload_priv *priv, unsigned int slot)
++{
++	const struct ppe_l3_if_eg_entry eg = {};
++	const struct ppe_l3_if_in_entry in = {};
++	u32 l3_if = PPE_OFFLOAD_PPPOE_L3_IF_BASE + slot;
++	struct ppe_l3_if_eg_entry eg_back;
++	struct ppe_l3_if_in_entry in_back;
++
++	if (!ppe_l3_if_in_entry_set(priv->ppe_dev, l3_if, &in) &&
++	    !ppe_l3_if_eg_entry_set(priv->ppe_dev, l3_if, &eg) &&
++	    !ppe_l3_if_in_entry_get(priv->ppe_dev, l3_if, &in_back) &&
++	    !ppe_l3_if_eg_entry_get(priv->ppe_dev, l3_if, &eg_back) &&
++	    !in_back.mru && !in_back.mtu && !in_back.ipv4_uc_route_en && !in_back.pppoe_en &&
++	    !eg_back.pppoe_en && is_zero_ether_addr(eg_back.mac_addr))
++		return;
++
++	priv->degraded = true;
++	pr_err("ppe_offload: PPPoE L3 interface %u not cleared; new flows declined, disable and reboot\n",
++	       l3_if);
++}
++
+ /* Take hardware session entry @slot out of use: its valid bits first, so
+- * that no frame matches a half-cleared entry, then the rest of it and the
+- * L3 interface. Under priv->lock.
++ * that no frame matches a half-cleared entry, then the rest of it. Under
++ * priv->lock.
+  */
+-static int ppe_offload_pppoe_clear(struct ppe_offload_priv *priv, unsigned int slot)
++static int ppe_offload_pppoe_session_clear(struct ppe_offload_priv *priv, unsigned int slot)
+ {
+ 	struct regmap *regmap = priv->ppe_dev->regmap;
+-	struct ppe_l3_if_eg_entry eg = {};
+-	struct ppe_l3_if_in_entry in = {};
+ 	u32 ext_addr = PPE_PPPOE_SESSION_EXT_ADDR + slot * PPE_PPPOE_SESSION_EXT_INC;
+-	u32 l3_if = PPE_OFFLOAD_PPPOE_L3_IF_BASE + slot;
+ 	u32 ext = ~0;
+ 	int ret;
+ 
+@@ -1669,12 +1724,23 @@ static int ppe_offload_pppoe_clear(struct ppe_offload_priv *priv, unsigned int s
+ 	regmap_write(regmap, PPE_PPPOE_SESSION_EXT2_ADDR + slot * PPE_PPPOE_SESSION_EXT2_INC, 0);
+ 	regmap_write(regmap, PPE_PPPOE_SESSION_EXT1_ADDR + slot * PPE_PPPOE_SESSION_EXT1_INC, 0);
+ 	regmap_write(regmap, PPE_PPPOE_SESSION_ADDR + slot * PPE_PPPOE_SESSION_INC, 0);
+-	ppe_l3_if_in_entry_set(priv->ppe_dev, l3_if, &in);
+-	ppe_l3_if_eg_entry_set(priv->ppe_dev, l3_if, &eg);
+ 
+ 	return 0;
+ }
+ 
++/* Take session slot @slot out of use, its session entry and then its L3
++ * interface. Under priv->lock.
++ */
++static int ppe_offload_pppoe_clear(struct ppe_offload_priv *priv, unsigned int slot)
++{
++	int ret = ppe_offload_pppoe_session_clear(priv, slot);
++
++	if (!ret)
++		ppe_offload_pppoe_l3_if_clear(priv, slot);
++
++	return ret;
++}
++
+ /* Program session @info in slot @slot: the L3 interface a frame of the
+  * session is given (ingress: PPPoE terminated, IPv4 routed, the port's
+  * MY_MAC, the PPP device's MTU as MRU and MTU; egress: the session ID and
+@@ -1959,8 +2025,9 @@ static void ppe_offload_pppoe_died(struct ppe_offload_priv *priv, unsigned long
+ static void ppe_offload_pin_release(struct ppe_offload_priv *priv);
+ 
+ /* Take a session out of hardware and drop its flows, and the bench pin
+- * if it holds the session. A flow whose entry cannot be deleted keeps the
+- * slot and L3 interface reserved until it is. Under priv->lock.
++ * if it holds the session. A flow whose entry cannot be deleted retires
++ * the slot until a reboot, its L3 interface cleared to MTU 0 under it.
++ * Under priv->lock.
+  */
+ static void ppe_offload_pppoe_kill(struct ppe_offload_priv *priv, unsigned int slot,
+ 				   const char *why)
+@@ -1969,16 +2036,24 @@ static void ppe_offload_pppoe_kill(struct ppe_offload_priv *priv, unsigned int s
+ 	struct ppe_offload_flow_entry *entry, *tmp;
+ 	unsigned int dropped = 0, stuck = 0;
+ 	u16 sid = p->info.sid;
++	bool broken;
+ 
+ 	if (!p->live)
+ 		return;
+ 
+ 	/* The session entry first: from then on no frame is given the
+-	 * session's L3 interface, so its flows cannot hit; the slot stays
+-	 * reserved until they are deleted. If it cannot be cleared, the
+-	 * slot is never used again.
++	 * session's L3 interface, so its downloads cannot hit. Its uploads,
++	 * keyed on the conduit's interface, still leave through that L3
++	 * interface until they are deleted below, so it is cleared only
++	 * after them, read back. One that stays stuck then meets an MTU of 0
++	 * there, which fails every frame of it, and an L3 MTU failure is
++	 * redirected to the CPU (ppe_offload_route_ctrl_ok()). Any flow of
++	 * the slot left stuck, download or upload, retires the slot, so that
++	 * no other session gets that interface while it may forward, as when
++	 * the entry cannot be cleared. Otherwise the last put frees the slot.
+ 	 */
+-	if (ppe_offload_pppoe_clear(priv, slot))
++	broken = ppe_offload_pppoe_session_clear(priv, slot);
++	if (broken)
+ 		p->broken = true;
+ 	ppe_offload_strip_unhook(p);
+ 	p->live = false;
+@@ -1993,6 +2068,12 @@ static void ppe_offload_pppoe_kill(struct ppe_offload_priv *priv, unsigned int s
+ 			dropped++;
+ 	}
+ 
++	if (!broken)
++		ppe_offload_pppoe_l3_if_clear(priv, slot);
++	/* A stuck flow holds a reference: p is still the slot. */
++	if (stuck)
++		p->broken = true;
++
+ 	pr_info("ppe_offload: PPPoE session %u out of hardware (%s): %u flow(s) back to software, %u stuck\n",
+ 		sid, why, dropped, stuck);
+ 
+@@ -2235,10 +2316,15 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	bool dst_on_ingress = false;
+ 	bool flow_full = false;
+ 	bool ingress_unparsed = false;
++	bool ingress_via_a = false;
++	struct net_device *in_port;
++	u8 ingress_seen_mac[ETH_ALEN] = {};
++	bool ingress_mac_bad = false;
+ 	struct ppe_offload_pppoe_info pppoe_info;
+ 	bool pppoe_in = false, pppoe_ok = false;
+ 	unsigned int pppoe_slot = 0;
+ 	bool pppoe_ref = false;
++	bool pppoe_out = false;
+ 	u32 flow_l3_if;
+ 	u16 pppoe_sid = 0;
+ 	bool pub_ip = false;
+@@ -2251,6 +2337,7 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	int action;
+ 	int dsa_gen = atomic_read(&priv->dsa_gen);
+ 	int pppoe_gen = atomic_read(&priv->pppoe_gen);
++	int a_gen = atomic_read(&priv->a_gen);
+ 	const char *stage = NULL;
+ 	int ret;
+ 
+@@ -2474,8 +2561,9 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		else if (l3dev)
+ 			dst_on_ingress = __ip_dev_find(dev_net(netdev), match_dst, false) == l3dev;
+ 	}
+-	if (idev)
+-		idev = ppe_offload_ingress_edma_dev(idev);
++	in_port = idev;
++	if (in_port)
++		idev = ppe_offload_ingress_edma_dev(in_port);
+ 	if (idev) {
+ 		ingress_l3_if = ((struct edma_port_priv *)netdev_priv(idev))->l3_if_index;
+ #if IS_ENABLED(CONFIG_NET_DSA)
+@@ -2486,8 +2574,32 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		 */
+ 		if (netdev_uses_dsa(idev)) {
+ 			const struct dsa_device_ops *ops = idev->dsa_ptr->tag_ops;
++			u32 port = ((struct edma_port_priv *)netdev_priv(idev))->ppe_port->port_id;
+ 
+-			ingress_unparsed = !ops || ops->proto == DSA_TAG_PROTO_RTL8_4;
++			/* ... except under bench profile A, which walks the
++			 * parser over the tag on this very conduit.
++			 */
++			ingress_unparsed = !ops || ops->proto != DSA_TAG_PROTO_RTL8_4 ||
++					   !READ_ONCE(priv->profile_a) ||
++					   READ_ONCE(priv->egress_port) != port;
++			ingress_via_a = !ingress_unparsed;
++
++			/* The clients address the MAC of the device they see
++			 * the router as, the port's bridge or the port; the
++			 * conduit's L3 interface only routes frames to the
++			 * conduit's own MY_MAC entry.
++			 */
++			if (!ingress_unparsed && in_port != idev) {
++				const struct net_device *seen =
++					netdev_master_upper_dev_get_rcu(in_port);
++
++				if (!seen || !netif_is_bridge_master(seen))
++					seen = in_port;
++				if (!ether_addr_equal(seen->dev_addr, idev->dev_addr)) {
++					ether_addr_copy(ingress_seen_mac, seen->dev_addr);
++					ingress_mac_bad = true;
++				}
++			}
+ 		}
+ #endif
+ 	}
+@@ -2497,6 +2609,18 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		return ppe_offload_decline("ingress ifindex %d: the parser cannot see past the rtl8_4 tag",
+ 					    meta.key->ingress_ifindex);
+ 
++	if (ingress_mac_bad)
++		return ppe_offload_decline("profile A: clients address %pM, which no MY_MAC entry holds",
++					    ingress_seen_mac);
++
++	/* Profile A sets the ingress C-TPID to 0x0000 for the whole chip:
++	 * an 802.1Q tag is no longer parsed (measured by Kamil Bienkiewicz:
++	 * such flows never hit), so the entry would be dead.
++	 */
++	if (ingress_vlan_vid && READ_ONCE(priv->profile_a))
++		return ppe_offload_decline("tagged ingress ifindex %d unparsed under profile A",
++					    meta.key->ingress_ifindex);
++
+ 	if (ingress_vlan_bad)
+ 		return ppe_offload_decline("ingress ifindex %d has no vlan %u upper",
+ 					    meta.key->ingress_ifindex, ingress_vlan_vid);
+@@ -2580,6 +2704,19 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 			 */
+ 			vlan_pops++;
+ 			break;
++		case FLOW_ACTION_PPPOE_PUSH:
++			/* Encapsulated by the egress L3 interface of the
++			 * session, checked against the kernel's below.
++			 */
++			if (pppoe_out)
++				return ppe_offload_decline("second pppoe push");
++			if (!READ_ONCE(ppe_offload_pppoe_param))
++				return ppe_offload_decline("pppoe offload is off (qcom_ppe.pppoe_offload=0)");
++			if (!priv->pppoe_exceptions_ok)
++				return ppe_offload_decline("pppoe offload disabled: header exceptions unavailable");
++			pppoe_out = true;
++			pppoe_sid = act->pppoe.sid;
++			break;
+ 		default:
+ 			return ppe_offload_decline("action id=%d unsupported", act->id);
+ 		}
+@@ -2588,6 +2725,9 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	if (!odev || !eth.seen)
+ 		return ppe_offload_decline("odev=%d eth.seen=%d", !!odev, eth.seen);
+ 
++	if (pppoe_in && pppoe_out)
++		return ppe_offload_decline("pppoe in and out");
++
+ 	if (vlan_pops != !!ingress_vlan_vid)
+ 		return ppe_offload_decline("%u vlan pops for %s ingress tag", vlan_pops,
+ 					    ingress_vlan_vid ? "one" : "no");
+@@ -2692,6 +2832,8 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		if (pppoe_in)
+ 			return ppe_offload_decline("snat of pppoe ingress to %pI4", &match_dst);
+ 		snat = true;
++	} else if (pppoe_out) {
++		return ppe_offload_decline("pppoe egress without snat to the session's address");
+ 	} else if (new_dst != match_dst && new_src == match_src && l4.source == match_sport) {
+ 		if (!dst_on_ingress && !pppoe_ok)
+ 			return ppe_offload_decline("dnat of %pI4, not an address of ingress %d",
+@@ -2717,6 +2859,41 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 					    eth.bytes + ETH_ALEN, netdev_name(egress.dev),
+ 					    egress.dev->dev_addr);
+ 
++	/* PPPoE upload: the session must be the kernel's for the address
++	 * the flow is translated to, on the device and VLAN it leaves
++	 * through, and the frames must be addressed to its concentrator.
++	 * Its encapsulation is a bench hypothesis (HP2): accepted only from
++	 * the conduit under bench profile A, whatever the board's ports;
++	 * the a_gen check below covers A going away meanwhile.
++	 */
++	if (pppoe_out) {
++		struct net_device *lower = egress.dev;
++		bool ok = false;
++
++		if (!ingress_via_a)
++			return ppe_offload_decline("pppoe upload outside bench profile A");
++		if (egress.dsa)
++			return ppe_offload_decline("pppoe egress through a dsa port");
++
++		rcu_read_lock();
++		if (egress.ctag)
++			lower = __vlan_find_dev_deep_rcu(egress.dev, htons(ETH_P_8021Q),
++							 egress.cvid);
++		if (lower)
++			ok = ppe_offload_pppoe_resolve(dev_net(netdev), new_src, egress.dev, lower,
++						       egress.ctag ? egress.cvid : 0, pppoe_sid,
++						       &pppoe_info);
++		rcu_read_unlock();
++
++		if (!ok)
++			return ppe_offload_decline("pppoe session %u on odev=%s: not this router's session for %pI4",
++						    pppoe_sid, netdev_name(egress.dev), &new_src);
++		if (!ether_addr_equal(eth.bytes, pppoe_info.ac_mac))
++			return ppe_offload_decline("pppoe eth dst %pM != concentrator %pM",
++						    eth.bytes, pppoe_info.ac_mac);
++		pmtu = min(pmtu, pppoe_info.mtu);
++	}
++
+ 	port_priv = netdev_priv(egress.dev);
+ 
+ 	/* The flow key only knows the ingress port's L3 interface, not the
+@@ -2737,8 +2914,8 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	 */
+ 	if (!priv->enabled || priv->degraded || priv->tripped || !priv->hdr_exceptions_ok ||
+ 	    (ip_proto == PPE_FLOW_PROTO_TCP && !priv->tcp_exceptions_ok) ||
+-	    (pppoe_in && (!priv->pppoe_exceptions_ok || priv->pppoe_blocked ||
+-			  !READ_ONCE(ppe_offload_pppoe_param)))) {
++	    ((pppoe_in || pppoe_out) && (!priv->pppoe_exceptions_ok || priv->pppoe_blocked ||
++					 !READ_ONCE(ppe_offload_pppoe_param)))) {
+ 		ret = -EOPNOTSUPP;
+ 		stage = "disabled";
+ 		goto unlock;
+@@ -2748,12 +2925,21 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	 * session may already be out of hardware, and must not come back
+ 	 * from a stale resolution. Re-offered within a second.
+ 	 */
+-	if (pppoe_in && atomic_read(&priv->pppoe_gen) != pppoe_gen) {
++	if ((pppoe_in || pppoe_out) && atomic_read(&priv->pppoe_gen) != pppoe_gen) {
+ 		ret = -EAGAIN;
+ 		stage = "pppoe change";
+ 		goto unlock;
+ 	}
+ 
++	/* Profile A came or went since the parsing was judged above (and
++	 * flushed every flow when it did).
++	 */
++	if (atomic_read(&priv->a_gen) != a_gen) {
++		ret = -EAGAIN;
++		stage = "profile change";
++		goto unlock;
++	}
++
+ 	entry = rhashtable_lookup_fast(&priv->flow_table, &cls->cookie,
+ 				       ppe_offload_flow_ht_params);
+ 	if (entry) {
+@@ -2800,14 +2986,15 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	}
+ 
+ 	flow_l3_if = ingress_l3_if;
+-	if (pppoe_in) {
++	if (pppoe_in || pppoe_out) {
+ 		ret = ppe_offload_pppoe_get(priv, dev_net(netdev), &pppoe_info, &pppoe_slot);
+ 		if (ret) {
+ 			stage = "pppoe";
+ 			goto unlock;
+ 		}
+ 		pppoe_ref = true;
+-		flow_l3_if = PPE_OFFLOAD_PPPOE_L3_IF_BASE + pppoe_slot;
++		if (pppoe_in)
++			flow_l3_if = PPE_OFFLOAD_PPPOE_L3_IF_BASE + pppoe_slot;
+ 	}
+ 
+ 	/* Public IP entry for the translated (post-SNAT) source address.
+@@ -2836,7 +3023,11 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	 * hardware-test-time verification.
+ 	 */
+ 	nexthop.port = port_priv->ppe_port->port_id;
+-	nexthop.post_l3_if = port_priv->l3_if_index;
++	/* A PPPoE upload leaves through the session's L3 interface, which
++	 * adds the PPPoE header with the session ID and the port's MAC.
++	 */
++	nexthop.post_l3_if = pppoe_out ? PPE_OFFLOAD_PPPOE_L3_IF_BASE + pppoe_slot :
++					 port_priv->l3_if_index;
+ 	memcpy(nexthop.dmac, eth.bytes, ETH_ALEN);
+ 	if (snat)
+ 		nexthop.pub_addr_index = pub_ip_index;
+@@ -4447,6 +4638,7 @@ int ppe_offload_init(struct ppe_device *ppe_dev)
+ 	priv->ppe_dev = ppe_dev;
+ 	INIT_LIST_HEAD(&priv->flows);
+ 	INIT_LIST_HEAD(&priv->binds);
++	INIT_DELAYED_WORK(&priv->a_revert, ppe_offload_profile_a_timeout);
+ 	INIT_WORK(&priv->trip_work, ppe_offload_trip_work);
+ 	INIT_WORK(&priv->strip_work, ppe_offload_strip_work);
+ 	INIT_DELAYED_WORK(&priv->pin_work, ppe_offload_pin_timeout);
+@@ -4488,20 +4680,21 @@ int ppe_offload_init(struct ppe_device *ppe_dev)
+ 	return 0;
+ }
+ 
+-/* Save @words consecutive registers from @addr as one snapshot entry, to be
+- * written back by ppe_offload_snap_restore(). Under priv->lock.
++/* Save @words consecutive registers from @addr as one entry of the snapshot
++ * @snaps (@num used of @max), to be written back by
++ * ppe_offload_snaps_restore(). Under priv->lock.
+  */
+-static int ppe_offload_snap_save(struct ppe_offload_priv *priv, u32 addr,
+-				 unsigned int words)
++static int ppe_offload_snaps_save(struct ppe_offload_priv *priv, struct ppe_offload_snap *snaps,
++				  unsigned int *num, unsigned int max, u32 addr,
++				  unsigned int words)
+ {
+ 	struct ppe_offload_snap *snap;
+ 	int ret;
+ 
+-	if (WARN_ON_ONCE(!words || words > PPE_OFFLOAD_SNAP_WORDS ||
+-			 priv->snap_num >= PPE_OFFLOAD_SNAP_MAX))
++	if (WARN_ON_ONCE(!words || words > PPE_OFFLOAD_SNAP_WORDS || *num >= max))
+ 		return -ENOSPC;
+ 
+-	snap = &priv->snap[priv->snap_num];
++	snap = &snaps[*num];
+ 	ret = regmap_bulk_read(priv->ppe_dev->regmap, addr, snap->val, words);
+ 	if (ret)
+ 		return ret;
+@@ -4509,7 +4702,7 @@ static int ppe_offload_snap_save(struct ppe_offload_priv *priv, u32 addr,
+ 	snap->addr = addr;
+ 	snap->words = words;
+ 	memset(snap->mask, 0xff, sizeof(snap->mask));
+-	priv->snap_num++;
++	(*num)++;
+ 
+ 	return 0;
+ }
+@@ -4535,18 +4728,30 @@ static int ppe_offload_snap_save_masked(struct ppe_offload_priv *priv, u32 addr,
+ 	return 0;
+ }
+ 
+-/* Write the registers saved since @mark back, the last saved first, each
+- * entry's words in their own order, and read them back. A register that
+- * does not read back as saved latches priv->degraded. Under priv->lock.
++static int ppe_offload_snap_save(struct ppe_offload_priv *priv, u32 addr,
++				 unsigned int words)
++{
++	return ppe_offload_snaps_save(priv, priv->snap, &priv->snap_num, PPE_OFFLOAD_SNAP_MAX,
++				      addr, words);
++}
++
++/* Write the registers of @snaps saved since @mark back, the last saved
++ * first, each entry's words in their own order, and read them back. A
++ * register that does not read back as saved latches priv->degraded. Under
++ * priv->lock.
++ *
++ * Return: the number of entries that did not read back as saved.
+  */
+-static void ppe_offload_snap_restore(struct ppe_offload_priv *priv, unsigned int mark)
++static unsigned int ppe_offload_snaps_restore(struct ppe_offload_priv *priv,
++					      struct ppe_offload_snap *snaps, unsigned int *num,
++					      unsigned int mark)
+ {
+ 	struct regmap *regmap = priv->ppe_dev->regmap;
+ 	u32 back[PPE_OFFLOAD_SNAP_WORDS];
+ 	unsigned int bad = 0;
+ 
+-	while (priv->snap_num > mark) {
+-		struct ppe_offload_snap *snap = &priv->snap[--priv->snap_num];
++	while (*num > mark) {
++		struct ppe_offload_snap *snap = &snaps[--(*num)];
+ 		u32 want[PPE_OFFLOAD_SNAP_WORDS];
+ 		unsigned int i;
+ 		bool ok;
+@@ -4570,6 +4775,13 @@ static void ppe_offload_snap_restore(struct ppe_offload_priv *priv, unsigned int
+ 		pr_err("ppe_offload: %u register restore(s) failed, offload stays off; reboot to get the reset state back\n",
+ 		       bad);
+ 	}
++
++	return bad;
++}
++
++static void ppe_offload_snap_restore(struct ppe_offload_priv *priv, unsigned int mark)
++{
++	ppe_offload_snaps_restore(priv, priv->snap, &priv->snap_num, mark);
+ }
+ 
+ /* The exception registers ppe_offload_tcp_exception_init() and
+@@ -5016,6 +5228,13 @@ static void ppe_offload_disable(struct ppe_offload_priv *priv)
+ 	WRITE_ONCE(priv->enabled, false);
+ 	stuck = ppe_offload_flush(priv, &flows);
+ 	ppe_offload_pin_release(priv);
++	if (!stuck && priv->profile_a) {
++		if (!ppe_offload_snaps_restore(priv, priv->a_snap, &priv->a_snap_num, 0))
++			WRITE_ONCE(priv->tpids_moved, false);
++		WRITE_ONCE(priv->profile_a, false);
++		atomic_inc(&priv->a_gen);
++		pr_info("ppe_offload: profile A off (disable)\n");
++	}
+ 	if (stuck) {
+ 		/* Those entries may still forward: keep everything they
+ 		 * rely on (exceptions, port L3 interfaces) as programmed.
+@@ -5038,6 +5257,227 @@ static void ppe_offload_disable(struct ppe_offload_priv *priv)
+ 	pr_info("ppe_offload: disabled: %u flow(s) back to the software path\n", flows);
+ }
+ 
++/* Bench profile A: Kamil Bienkiewicz's ingress parser alias for rtl8_4 (his
++ * 0445), on top of profile E. The chip-wide ingress S-TPID becomes the head
++ * tag's EtherType and the C-TPID 0x0000, the head tag's second word, and
++ * the conduit's parser role core, so the parser walks over the tag as over
++ * a QinQ pair and flows from the switch can hit (measured by him: upload
++ * at 98.1% CPU idle instead of 74.6%). The CPU port becomes an S-VLAN
++ * egress port re-emitting both tags unmodified, so that frames the PPE
++ * floods to the CPU keep a head tag the tagger accepts (also his, measured:
++ * with the CPU port left as it is, the LAN is dead).
++ *
++ * Not for service: with the ingress C-TPID at 0x0000 the WAN's 802.1Q tag
++ * is not parsed (his measurement: tagged-WAN flows never hit), so the
++ * WAN's downloads go back to software and lose RSS and receive checksum.
++ * It exists to confirm that on this WAN (H0) and to exercise the PPPoE
++ * upload encapsulation. It is applied for a number of seconds through
++ * debugfs, never by itself; every flow is dropped when it comes and goes,
++ * as the entries that hit change; disabling offload or unloading puts it
++ * back, as does the timer.
++ */
++#define PPE_OFFLOAD_A_SECONDS_MAX	600
++/* The PPE port EDMA hands the CPU's frames to and takes them from. */
++#define PPE_OFFLOAD_CPU_PORT		0
++
++/* Drop every tracked flow (back to software; the flowtable re-offers
++ * them). Under priv->lock.
++ *
++ * Return: the number of flows whose entry could not be deleted.
++ */
++static unsigned int ppe_offload_flush_all(struct ppe_offload_priv *priv, const char *why)
++{
++	unsigned int dropped, stuck;
++
++	stuck = ppe_offload_flush(priv, &dropped);
++	if (stuck)
++		pr_err("ppe_offload: %s: %u flow entr%s could not be deleted\n", why, stuck,
++		       stuck == 1 ? "y" : "ies");
++	pr_info("ppe_offload: %s: %u flow(s) back to software\n", why, dropped);
++
++	return stuck;
++}
++
++static void ppe_offload_profile_a_revert(struct ppe_offload_priv *priv, const char *why)
++{
++	lockdep_assert_held(&priv->lock);
++
++	if (!priv->profile_a)
++		return;
++
++	/* An entry left in hardware was programmed for A's parsing: A
++	 * stays, with priv->degraded latched, until a reboot.
++	 */
++	if (ppe_offload_flush_all(priv, why)) {
++		pr_err("ppe_offload: profile A kept (%s): flow entries stuck in hardware, reboot to recover\n",
++		       why);
++		return;
++	}
++	if (!ppe_offload_snaps_restore(priv, priv->a_snap, &priv->a_snap_num, 0))
++		WRITE_ONCE(priv->tpids_moved, false);
++	WRITE_ONCE(priv->profile_a, false);
++	atomic_inc(&priv->a_gen);
++	pr_info("ppe_offload: profile A off (%s)\n", why);
++}
++
++static int ppe_offload_profile_a_apply(struct ppe_offload_priv *priv)
++{
++	struct regmap *regmap = priv->ppe_dev->regmap;
++	u32 port = priv->egress_port, cpu_mask, cpu_want;
++	u32 in_tpid, got[4], want[4], addr[4];
++	unsigned int i;
++	int ret;
++
++	lockdep_assert_held(&priv->lock);
++
++	/* A failed restore may have left A's values in place: a new
++	 * snapshot would take them as the ones to go back to.
++	 */
++	if (priv->degraded || READ_ONCE(priv->tpids_moved))
++		return -EIO;
++
++	/* E carries the egress half; it is applied with the first flow
++	 * towards the switch.
++	 */
++	if (!port || port >= PPE_PORT_PARSING_ENTRIES)
++		return -ENODEV;
++
++	in_tpid = FIELD_PREP(PPE_VLAN_TPID_STAG, ETH_P_REALTEK) | FIELD_PREP(PPE_VLAN_TPID_CTAG, 0);
++	cpu_mask = PPE_PORT_EG_VLAN_TBL_VLAN_TYPE | PPE_PORT_EG_VLAN_TBL_CTAG_MODE |
++		   PPE_PORT_EG_VLAN_TBL_STAG_MODE | PPE_PORT_EG_VLAN_TBL_VSI_TAG_MODE_EN;
++	cpu_want = PPE_PORT_EG_VLAN_TBL_VLAN_TYPE |
++		   FIELD_PREP(PPE_PORT_EG_VLAN_TBL_CTAG_MODE, PPE_EG_VLAN_TAG_MODE_UNMODIFIED) |
++		   FIELD_PREP(PPE_PORT_EG_VLAN_TBL_STAG_MODE, PPE_EG_VLAN_TAG_MODE_UNMODIFIED);
++
++	/* Written in this order, the role last; restored the other way. */
++	addr[0] = PPE_IPR_VLAN_TPID_ADDR;
++	addr[1] = PPE_TPR_VLAN_TPID_ADDR;
++	addr[2] = PPE_PORT_EG_VLAN_TBL_ADDR + PPE_PORT_EG_VLAN_TBL_INC * PPE_OFFLOAD_CPU_PORT;
++	addr[3] = PPE_PORT_PARSING_ADDR + PPE_PORT_PARSING_INC * port;
++
++	priv->a_snap_num = 0;
++	for (i = 0; i < ARRAY_SIZE(addr); i++) {
++		ret = ppe_offload_snaps_save(priv, priv->a_snap, &priv->a_snap_num,
++					     PPE_OFFLOAD_A_SNAP_MAX, addr[i], 1);
++		if (ret)
++			goto fail;
++	}
++
++	want[0] = in_tpid;
++	want[1] = in_tpid;
++	want[2] = (priv->a_snap[2].val[0] & ~cpu_mask) | cpu_want;
++	want[3] = priv->a_snap[3].val[0] | PPE_PORT_PARSING_PORT_ROLE;
++
++	/* Nothing programmed for E's parsing may live on under A's. */
++	if (ppe_offload_flush_all(priv, "profile A on")) {
++		ret = -EBUSY;
++		goto fail;
++	}
++
++	/* The transmit path stops counting on the parser to follow an
++	 * 802.1Q tag (edma_port_feature_check()) before it stops doing so;
++	 * transmits that passed the check already finish queueing first.
++	 * Frames already in an EDMA Tx ring, or held back by the qdisc after
++	 * a full ring (not checked again), may still be parsed under A's
++	 * TPIDs and leave with a bad checksum or unsegmented: a window of
++	 * the bench profile's switch-over, which TCP recovers from.
++	 */
++	WRITE_ONCE(priv->tpids_moved, true);
++	synchronize_net();
++
++	for (i = 0; i < ARRAY_SIZE(addr); i++) {
++		ret = regmap_write(regmap, addr[i], want[i]);
++		if (ret)
++			goto fail;
++	}
++	for (i = 0; i < ARRAY_SIZE(addr); i++) {
++		ret = regmap_read(regmap, addr[i], &got[i]);
++		if (!ret && got[i] != want[i])
++			ret = -EIO;
++		if (ret) {
++			pr_err("ppe_offload: profile A register %#x read back %#x, wrote %#x\n",
++			       addr[i], got[i], want[i]);
++			goto fail;
++		}
++	}
++
++	WRITE_ONCE(priv->profile_a, true);
++	atomic_inc(&priv->a_gen);
++	pr_info("ppe_offload: profile A on for PPE port %u: ingress TPIDs %#x, CPU port egress VLAN %#x, port parsing %#x\n",
++		port, got[0], got[2], got[3]);
++
++	return 0;
++
++fail:
++	if (!ppe_offload_snaps_restore(priv, priv->a_snap, &priv->a_snap_num, 0))
++		WRITE_ONCE(priv->tpids_moved, false);
++	return ret ?: -EIO;
++}
++
++static void ppe_offload_profile_a_timeout(struct work_struct *work)
++{
++	struct ppe_offload_priv *priv = container_of(to_delayed_work(work),
++						     struct ppe_offload_priv, a_revert);
++
++	mutex_lock(&priv->lock);
++	ppe_offload_profile_a_revert(priv, "timer");
++	mutex_unlock(&priv->lock);
++}
++
++static ssize_t ppe_offload_profile_read(struct file *file, char __user *ubuf, size_t count,
++					loff_t *ppos)
++{
++	struct ppe_offload_priv *priv = file->private_data;
++	char buf[96];
++	int len;
++
++	mutex_lock(&priv->lock);
++	len = scnprintf(buf, sizeof(buf), "%s egress_port=%u%s\n",
++			!priv->enabled ? "off" : priv->profile_a ? "A" :
++			priv->egress_port ? "E" : "plain",
++			priv->egress_port, priv->egress_failed ? " egress_failed" : "");
++	mutex_unlock(&priv->lock);
++
++	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
++}
++
++/* "A <seconds>" applies profile A for that long, "E" puts it back now. */
++static ssize_t ppe_offload_profile_write(struct file *file, const char __user *ubuf,
++					 size_t count, loff_t *ppos)
++{
++	struct ppe_offload_priv *priv = file->private_data;
++	unsigned int seconds;
++	char buf[32] = {};
++	int ret = 0;
++
++	if (count >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, count))
++		return -EFAULT;
++	buf[count] = '\0';
++
++	mutex_lock(&priv->lock);
++	if (sscanf(buf, "A %u", &seconds) == 1) {
++		if (!priv->enabled) {
++			ret = -ENODEV;
++		} else if (!seconds || seconds > PPE_OFFLOAD_A_SECONDS_MAX) {
++			ret = -ERANGE;
++		} else {
++			if (!priv->profile_a)
++				ret = ppe_offload_profile_a_apply(priv);
++			if (!ret)
++				mod_delayed_work(system_wq, &priv->a_revert, seconds * HZ);
++		}
++	} else if (buf[0] == 'E') {
++		ppe_offload_profile_a_revert(priv, "debugfs");
++	} else {
++		ret = -EINVAL;
++	}
++	mutex_unlock(&priv->lock);
++
++	return ret ?: count;
++}
++
+ /* What the driver tracks, from its own memory only: no register is read,
+  * so this is safe to look at under load. The packet and byte counts are
+  * those of the last statistics request from the flowtable.
+@@ -5050,9 +5490,9 @@ static int ppe_offload_flows_show(struct seq_file *m, void *v)
+ 
+ 	mutex_lock(&priv->lock);
+ 
+-	seq_printf(m, "enabled %d degraded %d tripped %d egress_port %u egress_failed %d\n",
++	seq_printf(m, "enabled %d degraded %d tripped %d egress_port %u egress_failed %d profile_a %d\n",
+ 		   priv->enabled, priv->degraded, priv->tripped, priv->egress_port,
+-		   priv->egress_failed);
++		   priv->egress_failed, priv->profile_a);
+ 	seq_printf(m, "pppoe_offload %d pppoe_blocked %d pppoe_short %u pin %d\n",
+ 		   READ_ONCE(ppe_offload_pppoe_param), priv->pppoe_blocked, priv->pppoe_short,
+ 		   priv->pin_slot);
+@@ -5076,7 +5516,7 @@ static int ppe_offload_flows_show(struct seq_file *m, void *v)
+ 				   !!p->strip_dev, jiffies_to_msecs(jiffies - p->since) / 1000,
+ 				   p->broken ? " BROKEN" : "");
+ 		else if (p->broken)
+-			seq_printf(m, "pppoe %u: BROKEN (entry not cleared)\n", i);
++			seq_printf(m, "pppoe %u: RETIRED (entry not cleared, or a flow stuck)\n", i);
+ 	}
+ 
+ 	list_for_each_entry(entry, &priv->flows, list) {
+@@ -5130,6 +5570,14 @@ static int ppe_offload_flows_hw_show(struct seq_file *m, void *v)
+ }
+ DEFINE_SHOW_ATTRIBUTE(ppe_offload_flows_hw);
+ 
++static const struct file_operations ppe_offload_profile_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = ppe_offload_profile_read,
++	.write = ppe_offload_profile_write,
++	.llseek = default_llseek,
++};
++
+ /* The PPE whose offload the parameter switches: one per SoC. Set by
+  * ppe_offload_start() and cleared by ppe_offload_stop(), under
+  * ppe_offload_param_lock, which also orders parameter writes.
+@@ -5204,7 +5652,8 @@ static void ppe_offload_trip_work(struct work_struct *work)
+ MODULE_PARM_DESC(flow_offload,
+ 		 "Offload nftables flowtable flows to the PPE (default N; writable at runtime)");
+ 
+-/* PPPoE downloads need this as well as flow_offload: the session table
++/* PPPoE flows (downloads, and uploads under bench profile A) need this
++ * as well as flow_offload: the session table
+  * matches no VLAN, so the session's ID from its concentrator's MAC on
+  * another VLAN of the WAN port, or untagged, also reaches its flows, which
+  * software would not forward (DESIGN.md). Setting it is accepting that.
+@@ -5246,7 +5695,7 @@ static const struct kernel_param_ops ppe_offload_pppoe_param_ops = {
+ 
+ module_param_cb(pppoe_offload, &ppe_offload_pppoe_param_ops, NULL, 0644);
+ MODULE_PARM_DESC(pppoe_offload,
+-		 "Also offload PPPoE downloads; accepts that the session match has no VLAN (default N)");
++		 "Also offload PPPoE downloads (uploads only under bench profile A); accepts that the session match has no VLAN (default N)");
+ 
+ /**
+  * ppe_offload_enabled() - Whether flow offload is on.
+@@ -5262,6 +5711,21 @@ bool ppe_offload_enabled(const struct ppe_device *ppe_dev)
+ 	return ppe_dev->offload && READ_ONCE(ppe_dev->offload->enabled);
+ }
+ 
++/**
++ * ppe_offload_tpids_moved() - Whether the parser may not follow 802.1Q.
++ * @ppe_dev: PPE device.
++ *
++ * Bench profile A sets the chip-wide ingress C-TPID to 0x0000 while it is
++ * applied (or kept after a failed revert), so that no 802.1Q tag is
++ * followed then. Lockless; for the EDMA transmit feature check.
++ *
++ * Return: true while an 802.1Q tag may not be parsed.
++ */
++bool ppe_offload_tpids_moved(const struct ppe_device *ppe_dev)
++{
++	return ppe_dev->offload && READ_ONCE(ppe_dev->offload->tpids_moved);
++}
++
+ /**
+  * ppe_offload_start() - Make offload switchable, and switch it on if asked.
+  * @ppe_dev: PPE device.
+@@ -5276,6 +5740,8 @@ void ppe_offload_start(struct ppe_device *ppe_dev)
+ 		return;
+ 
+ 	if (ppe_dev->debugfs_root) {
++		priv->a_dentry = debugfs_create_file("offload_profile", 0600, ppe_dev->debugfs_root,
++						     priv, &ppe_offload_profile_fops);
+ 		priv->flows_dentry = debugfs_create_file("offload_flows", 0400,
+ 							 ppe_dev->debugfs_root, priv,
+ 							 &ppe_offload_flows_fops);
+@@ -5309,7 +5775,9 @@ void ppe_offload_stop(struct ppe_device *ppe_dev)
+ 	if (!priv)
+ 		return;
+ 
+-	/* No more debugfs writes; then the works and the timer. */
++	/* No more profile changes from debugfs; then the timer. */
++	debugfs_remove(priv->a_dentry);
++	priv->a_dentry = NULL;
+ 	debugfs_remove(priv->flows_dentry);
+ 	priv->flows_dentry = NULL;
+ 	debugfs_remove(priv->flows_hw_dentry);
+@@ -5336,6 +5804,7 @@ void ppe_offload_stop(struct ppe_device *ppe_dev)
+ 	mutex_unlock(&priv->lock);
+ 	cancel_work_sync(&priv->trip_work);
+ 	cancel_work_sync(&priv->strip_work);
++	cancel_delayed_work_sync(&priv->a_revert);
+ 	cancel_delayed_work_sync(&priv->pin_work);
+ }
+ 
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.h
+@@ -16,6 +16,7 @@ void ppe_offload_start(struct ppe_device *ppe_dev);
+ void ppe_offload_stop(struct ppe_device *ppe_dev);
+ void ppe_offload_destroy(struct ppe_device *ppe_dev);
+ bool ppe_offload_enabled(const struct ppe_device *ppe_dev);
++bool ppe_offload_tpids_moved(const struct ppe_device *ppe_dev);
+ 
+ int ppe_offload_setup_tc(struct net_device *netdev, enum tc_setup_type type,
+ 			  void *type_data);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -142,6 +142,14 @@
+ #define PPE_EG_VLAN_TPID_STPID			GENMASK(15, 0)
+ #define PPE_EG_VLAN_TPID_CTPID			GENMASK(31, 16)
+ 
++/* CTAG_MODE / STAG_MODE register encoding (the vendor SDK converts its
++ * fal_pt_1q_egmode_t, numbered differently, in adpt_portvlan_egmode_convert()).
++ */
++#define PPE_EG_VLAN_TAG_MODE_UNTAGGED		0
++#define PPE_EG_VLAN_TAG_MODE_TAGGED		1
++#define PPE_EG_VLAN_TAG_MODE_UNMODIFIED		2
++#define PPE_EG_VLAN_TAG_MODE_UNTOUCHED		3
++
+ /* PPE queue counters enable/disable control. */
+ #define PPE_EG_BRIDGE_CONFIG_ADDR		0x20044
+ #define PPE_EG_BRIDGE_CONFIG_QUEUE_CNT_EN	BIT(2)
+@@ -1579,4 +1587,19 @@
+ #define PPE_L3_EXCEPTION_PPPOE_WRONG_CODE		2
+ #define PPE_L3_EXCEPTION_PPPOE_UNSUPPORTED_PPP_PROT	3
+ 
++/* Ingress parser: per-port QinQ role (edge 0, core 1) and the TPIDs it
++ * recognises, one pair for the whole chip in the ingress parser (IPR) and a
++ * copy in the tunnel parser (TPR); reset C-TPID 0x8100, S-TPID 0x88a8
++ * (vendor PORT_PARSING_REG, VLAN_TPID_REG, TPR_VLAN_TPID; IPR_CSR_BASE_ADDR
++ * 0x1e0000 and TUNNEL_PARSER_BASE_ADDR 0x1d0000 on APPE).
++ */
++#define PPE_PORT_PARSING_ADDR			0x1e0000
++#define PPE_PORT_PARSING_ENTRIES		8
++#define PPE_PORT_PARSING_INC			4
++#define PPE_PORT_PARSING_PORT_ROLE		BIT(0)
++#define PPE_IPR_VLAN_TPID_ADDR			0x1e0020
++#define PPE_TPR_VLAN_TPID_ADDR			0x1d0020
++#define PPE_VLAN_TPID_CTAG			GENMASK(15, 0)
++#define PPE_VLAN_TPID_STAG			GENMASK(31, 16)
++
+ #endif
