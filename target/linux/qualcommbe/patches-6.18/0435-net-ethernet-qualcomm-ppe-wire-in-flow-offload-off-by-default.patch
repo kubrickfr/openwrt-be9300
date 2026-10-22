@@ -1,0 +1,2821 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: wire in flow offload, off by 
+ default
+
+Bind the flowtable block, set NETIF_F_HW_TC, and program the ports' L3
+interfaces, but accept no flow until the module parameter flow_offload
+is set (/sys/module/qcom_ppe/parameters/flow_offload, or "options
+qcom_ppe flow_offload=1"). Until then the block is bound, so a ruleset
+with "flags offload" loads, every flow is declined, and no offload
+register is written.
+
+Enabling, under RTNL and then the driver lock, checks that L3_ROUTE_CTRL
+sends routing failures to the CPU, saves every register it is about to
+change, programs the exceptions and each EDMA port's L3 interface,
+MY_MAC and L3_VP_PORT entries, and reads everything back. A port entry
+that does not read back restores the saved values and leaves offload
+off; an exception group that does not read back leaves it on with the
+flows that rely on the group declined (every flow for the header
+exceptions, TCP flows for the TCP flag ones), as the enable line says.
+Disabling declines from then on, deletes every flow entry (each delete
+read back) and the entries they point at, and only then writes the saved
+registers back, the bits another user owns (a port's MTU) as they are
+then. A flow entry that cannot be deleted, on any path, may still
+forward: what it relies on is kept, every new flow is declined, and
+enabling is refused until a reboot; so it is when a saved register does
+not read back as saved.
+
+On top of the engine:
+- a rule with a dissector key the driver does not interpret is declined;
+- the header exceptions punt to the CPU, on a flow hit and without
+  de-accelerating the flow, what the software fast path would not
+  forward itself: unknown L2, IPv4 options, short IHL, truncated or
+  inconsistent headers, a bad header checksum, fragments, an expiring
+  TTL, unpullable TCP and UDP headers; IPv4 is declined unless all read
+  back. A TCP SYN is redirected without de-accelerating too, as the
+  software fast path forwards it on a live flow; FIN and RST still
+  de-accelerate. The L3 interfaces' TTL-exceeded action no longer de-accelerates
+  either: a remote peer must not be able to take a flow out of hardware
+  with one packet;
+- while offload is on, a frame too big for its egress port goes to the
+  CPU instead of being dropped (MRU_MTU_CTRL's MTU command; the MTU bits
+  stay the port's): what the PPE inserts itself can take a full-size
+  frame past the port's MTU at zero margin, after the flow hit;
+- a flow already in hardware that the flowtable re-offers is stale when
+  its entry no longer reads VALID or has DE_ACCE set, and is programmed
+  afresh; hit counters are not used. More than 256 entries found no
+  longer VALID within 10 s turn offload off, unless it was disabled and
+  enabled again meanwhile; de-accelerated and superseded entries are
+  re-armed without counting, so nothing a peer sends can turn it off;
+- a re-offer that is now declined takes the flow's entry out of
+  hardware;
+- deleting a flowtable unbinds its block callbacks before it destroys
+  its flows, so each flow records the block it came through and the
+  driver's last callback on a block takes that block's flows out of
+  hardware when it is released;
+- a flow's references are let go of only once its entry is confirmed
+  deleted. The tracking entry is allocated before the flow entry is
+  programmed, and ppe_flow_entry_add() now reports an add that failed but
+  may have landed (-EUCLEAN: its counter clear failed and taking it back
+  out did not read back invalid, or its result never came), so an entry
+  that may be in hardware after a failed add or insert stays tracked for
+  disable to retry; one at an index hardware never returned keeps disable
+  from writing anything back. An entry that cannot be deleted is counted
+  and logged once each time it becomes stuck, and a re-offer no longer
+  retries it (DESTROY, unbind, disable and a re-point do). Unload deletes every tracked flow, read back, and
+  leaves the tables they point at as they are while one stays;
+- edma_port_l3_if_update() becomes edma_port_l3_if_program(), which
+  returns an error, and is called on MAC address and MTU changes only
+  while offload is on; NETIF_F_HW_TC and the .ndo_setup_tc hook (Kamil
+  Bienkiewicz's 0420 and 0423) are set here;
+- the engine's indirect block binding for bridges and VLAN devices is
+  dropped: an nft flowtable reaches it with TC_SETUP_FT, which it never
+  handled, every flowtable flow is offered to the ports' own callbacks
+  anyway (fw4 resolves bridges and VLANs to their ports), and it kept a
+  callback list shared with the direct path, which tc and nft modify
+  under different locks; the direct callbacks are on no list;
+- /sys/kernel/debug/ppe/offload_flows lists the driver's own state and
+  counters without reading a register; offload_flows_hw reads each
+  tracked flow's VALID and DE_ACCE, for the bench at idle.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/net/ethernet/qualcomm/ppe/edma_port.c |  112 +-
+ drivers/net/ethernet/qualcomm/ppe/edma_port.h |    8 +-
+ drivers/net/ethernet/qualcomm/ppe/ppe.c       |   25 +-
+ drivers/net/ethernet/qualcomm/ppe/ppe.h       |    2 +-
+ drivers/net/ethernet/qualcomm/ppe/ppe_flow.c  |   56 +-
+ drivers/net/ethernet/qualcomm/ppe/ppe_flow.h  |    6 +
+ .../net/ethernet/qualcomm/ppe/ppe_offload.c   | 1728 +++++++++++++----
+ .../net/ethernet/qualcomm/ppe/ppe_offload.h   |    4 +-
+ drivers/net/ethernet/qualcomm/ppe/ppe_regs.h  |   40 +-
+ 9 files changed, 1582 insertions(+), 399 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
+@@ -12,6 +12,7 @@
+ #include <linux/of_net.h>
+ #include <linux/phylink.h>
+ #include <linux/printk.h>
++#include <linux/rtnetlink.h>
+ 
+ #include "edma.h"
+ #include "edma_cfg_rx.h"
+@@ -19,6 +20,7 @@
+ #include "edma_port.h"
+ #include "ppe.h"
+ #include "ppe_l3_if.h"
++#include "ppe_offload.h"
+ #include "ppe_regs.h"
+ 
+ /* Number of netdev queues. */
+@@ -172,13 +174,25 @@ static int edma_port_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd
+ static int edma_port_change_mtu(struct net_device *netdev, int mtu)
+ {
+ 	struct edma_port_priv *port_priv = (struct edma_port_priv *)netdev_priv(netdev);
++	int ret;
+ 
+ 	if (!port_priv)
+ 		return -EINVAL;
+ 
+ 	netdev->mtu = mtu;
+ 
+-	return ppe_port_set_maxframe(port_priv->ppe_port, mtu);
++	ret = ppe_port_set_maxframe(port_priv->ppe_port, mtu);
++	if (ret)
++		return ret;
++
++	/* Hardware checks arriving frames against the ingress L3
++	 * interface entry's MRU/MTU, so it has to follow the netdevice
++	 * while flow offload has it programmed.
++	 */
++	if (ppe_offload_enabled(edma_ctx->ppe_dev))
++		edma_port_l3_if_program(netdev);
++
++	return 0;
+ }
+ 
+ static netdev_features_t edma_port_feature_check(struct sk_buff *skb,
+@@ -401,28 +415,35 @@ static void edma_port_get_stats64(struct net_device *netdev,
+  * (and so L3 interface indices) start at 1, so the 8-entry table holds
+  * one per port.
+  *
+- * Failure is logged, not propagated, so that no caller (port bring-up, a
+- * MAC-address or MTU change) ever fails because of it. On a lookup miss or a
+- * failed MTU/MRU check hardware redirects to the CPU rather than
+- * dropping (L3_ROUTE_CTRL/_EXT are left at their RDT_TO_CPU defaults),
+- * so traffic falls back to the software path.
++ * Only flow offload programs this, when it is enabled, and gives the
++ * entries back when it is disabled (ppe_offload.c); with offload off
++ * none of these tables is written. Failure is logged and returned: the
++ * enable path then turns offload back off, while an MTU or MAC change on
++ * an enabled port must not fail for it. On a lookup miss or a failed
++ * MTU/MRU check hardware redirects to the CPU rather than dropping
++ * (L3_ROUTE_CTRL/_EXT are left at their RDT_TO_CPU defaults), so traffic
++ * falls back to the software path. Each entry written is read back.
++ *
++ * Return: 0 on success, a negative error code otherwise.
+  */
+-void edma_port_l3_if_update(struct net_device *netdev)
++int edma_port_l3_if_program(struct net_device *netdev)
+ {
+ 	struct edma_port_priv *port_priv = netdev_priv(netdev);
+-	struct ppe_l3_if_eg_entry entry = {};
+-	struct ppe_l3_if_in_entry in = {};
++	struct ppe_l3_if_eg_entry entry = {}, eg_back = {};
++	struct ppe_l3_if_in_entry in = {}, in_back = {};
+ 	u16 l3_if = port_priv->l3_if_index;
+ 	u32 my_mac, mtu;
+ 	int ret;
+ 
++	ASSERT_RTNL();
++
+ 	/* Port ids, and so L3 interface indices, start at 1; the MY_MAC
+ 	 * table has one entry per port starting at 0.
+ 	 */
+ 	my_mac = l3_if - 1;
+ 	if (my_mac >= PPE_MY_MAC_TBL_ENTRIES) {
+ 		netdev_warn(netdev, "no MY_MAC entry for L3 interface %u\n", l3_if);
+-		return;
++		return -ERANGE;
+ 	}
+ 
+ 	memcpy(entry.mac_addr, netdev->dev_addr, ETH_ALEN);
+@@ -431,13 +452,13 @@ void edma_port_l3_if_update(struct net_device *netdev)
+ 	if (ret) {
+ 		netdev_warn(netdev, "failed to update egress L3 interface entry %u: %d\n",
+ 			    l3_if, ret);
+-		return;
++		return ret;
+ 	}
+ 
+ 	ret = ppe_my_mac_entry_set(edma_ctx->ppe_dev, my_mac, netdev->dev_addr, true);
+ 	if (ret) {
+ 		netdev_warn(netdev, "failed to update MY_MAC entry %u: %d\n", my_mac, ret);
+-		return;
++		return ret;
+ 	}
+ 
+ 	/* A larger MTU than hardware can express just means hardware
+@@ -452,23 +473,47 @@ void edma_port_l3_if_update(struct net_device *netdev)
+ 	in.mac_bitmap = BIT(my_mac);
+ 	in.ipv4_uc_route_en = true;
+ 	/* Hardware decrements the TTL, so an expired one must come back
+-	 * to the CPU (which answers it) rather than being forwarded.
++	 * to the CPU (which answers it) rather than being forwarded. The
++	 * flow is not de-accelerated for it: the software fast path punts
++	 * such a packet and goes on forwarding the flow, and a remote peer
++	 * must not be able to take a flow out of hardware with one packet.
+ 	 */
+ 	in.ttl_exceed_cmd = PPE_L3_IF_ACTION_REDIRECT_TO_CPU;
+-	in.ttl_exceed_de_acce = true;
++	in.ttl_exceed_de_acce = false;
+ 
+ 	ret = ppe_l3_if_in_entry_set(edma_ctx->ppe_dev, l3_if, &in);
+ 	if (ret) {
+ 		netdev_warn(netdev, "failed to update ingress L3 interface entry %u: %d\n",
+ 			    l3_if, ret);
+-		return;
++		return ret;
+ 	}
+ 
+ 	ret = ppe_l3_if_port_bind(edma_ctx->ppe_dev, port_priv->ppe_port->port_id,
+ 				   l3_if, true);
+-	if (ret)
++	if (ret) {
+ 		netdev_warn(netdev, "failed to bind port to L3 interface entry %u: %d\n",
+ 			    l3_if, ret);
++		return ret;
++	}
++
++	ret = ppe_l3_if_eg_entry_get(edma_ctx->ppe_dev, l3_if, &eg_back);
++	if (!ret)
++		ret = ppe_l3_if_in_entry_get(edma_ctx->ppe_dev, l3_if, &in_back);
++	if (ret) {
++		netdev_warn(netdev, "L3 interface entry %u readback failed: %d\n", l3_if, ret);
++		return ret;
++	}
++	if (!ether_addr_equal(eg_back.mac_addr, entry.mac_addr) ||
++	    in_back.mru != in.mru || in_back.mtu != in.mtu ||
++	    in_back.mac_bitmap != in.mac_bitmap || !in_back.ipv4_uc_route_en ||
++	    in_back.ttl_exceed_cmd != in.ttl_exceed_cmd ||
++	    in_back.ttl_exceed_de_acce != in.ttl_exceed_de_acce) {
++		netdev_warn(netdev, "L3 interface entry %u read back otherwise than written\n",
++			    l3_if);
++		return -EIO;
++	}
++
++	return 0;
+ }
+ 
+ static int edma_port_set_mac_address(struct net_device *netdev, void *macaddr)
+@@ -495,6 +540,8 @@ static int edma_port_set_mac_address(struct net_device *netdev, void *macaddr)
+ 	}
+ 
+ 	eth_commit_mac_addr_change(netdev, addr);
++	if (ppe_offload_enabled(edma_ctx->ppe_dev))
++		edma_port_l3_if_program(netdev);
+ 
+ 	return 0;
+ }
+@@ -510,6 +557,7 @@ static const struct net_device_ops edma_port_netdev_ops = {
+ 	.ndo_eth_ioctl = edma_port_ioctl,
+ 	.ndo_features_check = edma_port_feature_check,
+ 	.ndo_select_queue = edma_port_select_queue,
++	.ndo_setup_tc = ppe_offload_setup_tc,
+ };
+ 
+ /**
+@@ -530,6 +578,38 @@ bool edma_port_is_edma_netdev(const struct net_device *netdev)
+ 	return netdev->netdev_ops == &edma_port_netdev_ops;
+ }
+ 
++/**
++ * edma_port_for_each_netdev() - Call @fn on every registered EDMA port.
++ * @fn: Callback; a non-zero return stops the walk and is returned.
++ * @arg: Passed to @fn.
++ *
++ * Under RTNL, which ports are registered under.
++ *
++ * Return: 0, or the first non-zero return of @fn.
++ */
++int edma_port_for_each_netdev(int (*fn)(struct net_device *netdev, void *arg), void *arg)
++{
++	unsigned int i;
++	int ret;
++
++	ASSERT_RTNL();
++
++	if (!edma_ctx || !edma_ctx->netdev_arr)
++		return 0;
++
++	for (i = 0; i < edma_ctx->hw_info->max_ports; i++) {
++		struct net_device *netdev = edma_ctx->netdev_arr[i];
++
++		if (!netdev)
++			continue;
++		ret = fn(netdev, arg);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ /**
+  * edma_port_destroy - EDMA port destroy.
+  * @port: PPE port
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.h
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.h
+@@ -14,7 +14,8 @@
+ 					| NETIF_F_RXCSUM \
+ 					| NETIF_F_HW_CSUM \
+ 					| NETIF_F_TSO \
+-					| NETIF_F_TSO6)
++					| NETIF_F_TSO6 \
++					| NETIF_F_HW_TC)
+ 
+ /**
+  * struct edma_port_rx_stats - EDMA Rx per CPU stats for the port.
+@@ -85,7 +86,7 @@ struct edma_port_pcpu_stats {
+  * @flags: Feature flags
+  * @l3_if_index: This port's L3 interface table index, used for both
+  * the egress and the ingress entry (see ppe_l3_if.h). Set once at port
+- * setup;
++ * setup and kept in sync with the netdevice's own MAC address;
+  * referenced by a nexthop entry's post_l3_if when routing/NAT-ing a
+  * packet out through this port, and by a flow entry's src_l3_if when
+  * the packet arrives on it.
+@@ -102,5 +103,6 @@ struct edma_port_priv {
+ void edma_port_destroy(struct ppe_port *port);
+ int edma_port_setup(struct ppe_port *port);
+ bool edma_port_is_edma_netdev(const struct net_device *netdev);
+-void edma_port_l3_if_update(struct net_device *netdev);
++int edma_port_l3_if_program(struct net_device *netdev);
++int edma_port_for_each_netdev(int (*fn)(struct net_device *netdev, void *arg), void *arg);
+ #endif
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c
+@@ -18,6 +18,7 @@
+ #include "ppe.h"
+ #include "ppe_config.h"
+ #include "ppe_debugfs.h"
++#include "ppe_offload.h"
+ #include "ppe_port.h"
+ 
+ #define PPE_PORT_MAX		8
+@@ -241,21 +242,32 @@ static int qcom_ppe_probe(struct platform_device *pdev)
+ 	mutex_init(&ppe_dev->flow_tbl_lock);
+ 	mutex_init(&ppe_dev->host_tbl_lock);
+ 
+-	ret = ppe_clock_init_and_reset(ppe_dev, ppe_icc_data);
++	ret = ppe_offload_init(ppe_dev);
+ 	if (ret)
++		return dev_err_probe(dev, ret, "PPE offload init failed\n");
++
++	ret = ppe_clock_init_and_reset(ppe_dev, ppe_icc_data);
++	if (ret) {
++		ppe_offload_destroy(ppe_dev);
+ 		return dev_err_probe(dev, ret, "PPE clock config failed\n");
++	}
+ 
+ 	ret = ppe_hw_config(ppe_dev);
+-	if (ret)
++	if (ret) {
++		ppe_offload_destroy(ppe_dev);
+ 		return dev_err_probe(dev, ret, "PPE HW config failed\n");
++	}
+ 
+ 	ret = edma_setup(ppe_dev);
+-	if (ret)
++	if (ret) {
++		ppe_offload_destroy(ppe_dev);
+ 		return dev_err_probe(dev, ret, "EDMA setup failed\n");
++	}
+ 
+ 	ret = ppe_port_mac_init(ppe_dev);
+ 	if (ret) {
+ 		edma_destroy(ppe_dev);
++		ppe_offload_destroy(ppe_dev);
+ 		return dev_err_probe(dev, ret,
+ 				     "PPE Port MAC initialization failed\n");
+ 	}
+@@ -263,6 +275,11 @@ static int qcom_ppe_probe(struct platform_device *pdev)
+ 	ppe_debugfs_setup(ppe_dev);
+ 	platform_set_drvdata(pdev, ppe_dev);
+ 
++	/* Last: flow offload needs the PPE clocked and out of reset, and
++	 * the EDMA ports registered.
++	 */
++	ppe_offload_start(ppe_dev);
++
+ 	return 0;
+ }
+ 
+@@ -271,9 +288,11 @@ static void qcom_ppe_remove(struct platform_device *pdev)
+ 	struct ppe_device *ppe_dev;
+ 
+ 	ppe_dev = platform_get_drvdata(pdev);
++	ppe_offload_stop(ppe_dev);
+ 	ppe_port_mac_deinit(ppe_dev);
+ 	ppe_debugfs_teardown(ppe_dev);
+ 	edma_destroy(ppe_dev);
++	ppe_offload_destroy(ppe_dev);
+ }
+ 
+ static const struct of_device_id qcom_ppe_of_match[] = {
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.h
+@@ -36,7 +36,7 @@ struct ppe_offload_priv;
+  * tables use entirely separate registers.
+  * @offload: Hardware flow-offload state (see ppe_offload.c) -- flow
+  * table rhashtable, host/nexthop pools, and the mutex serializing
+- * offload add/remove. Allocated by ppe_offload_init().
++ * offload add/remove. Allocated at probe.
+  * @num_icc_paths: Number of interconnect paths.
+  * @icc_paths: Interconnect path array.
+  *
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+@@ -69,8 +69,11 @@ static int ppe_flow_tbl_op_wait(struct ppe_device *ppe_dev,
+ 					FIELD_GET(PPE_IN_FLOW_TBL_OP_RSLT_VALID_CNT, rslt) &&
+ 					FIELD_GET(PPE_IN_FLOW_TBL_OP_RSLT_CMD_ID, rslt) == cmd_id,
+ 					10, 2000);
++	/* Issued, and its result never came or could not be read: whether it
++	 * took effect is unknown either way.
++	 */
+ 	if (ret)
+-		return ret;
++		return -ETIMEDOUT;
+ 
+ 	/* A hash-mode add is refused when no way of the key's bucket is free:
+ 	 * the only refusal seen on the GL-BE9300, and what callers need to
+@@ -188,6 +191,25 @@ int ppe_flow_counter_clear(struct ppe_device *ppe_dev, u32 index)
+ 	return 0;
+ }
+ 
++/* Take back out the entry an add just programmed at @index, in index mode,
++ * and confirm from its slot's VALID bit that it is gone. Under
++ * flow_tbl_lock.
++ *
++ * Return: true if it is gone.
++ */
++static bool ppe_flow_rollback(struct ppe_device *ppe_dev, u32 index)
++{
++	u32 word0;
++
++	if (ppe_flow_tbl_op_wait(ppe_dev, PPE_FLOW_TBL_OP_DEL, PPE_FLOW_OP_MODE_INDEX, &index))
++		return false;
++	if (regmap_read(ppe_dev->regmap, PPE_IN_FLOW_TBL_ADDR + index * PPE_IN_FLOW_TBL_INC,
++			&word0))
++		return false;
++
++	return !(word0 & PPE_FLOW_TBL_VALID);
++}
++
+ /**
+  * ppe_flow_entry_add() - Add (or overwrite) a PPE flow table entry.
+  * @ppe_dev: PPE device.
+@@ -199,7 +221,12 @@ int ppe_flow_counter_clear(struct ppe_device *ppe_dev, u32 index)
+  * On success, always holds the entry's final hardware index: unchanged
+  * for PPE_FLOW_OP_MODE_INDEX, hardware-assigned for PPE_FLOW_OP_MODE_HASH.
+  *
+- * Return: 0 on success, a negative error code on failure.
++ * Return: 0 on success. -EUCLEAN if the add failed but the entry may be
++ * programmed all the same (its counter clear failed and taking it back out
++ * could not be confirmed, or its result never came): @index then holds
++ * where, or PPE_FLOW_INDEX_UNKNOWN if hardware never said (a hash-mode
++ * add), and the caller must keep what the entry points at. Any other
++ * negative error code: nothing was programmed.
+  */
+ int ppe_flow_entry_add(struct ppe_device *ppe_dev, enum ppe_flow_op_mode mode,
+ 			const u32 *entry, unsigned int num_words, u32 *index)
+@@ -221,6 +248,18 @@ int ppe_flow_entry_add(struct ppe_device *ppe_dev, enum ppe_flow_op_mode mode,
+ 	}
+ 
+ 	ret = ppe_flow_tbl_op_wait(ppe_dev, PPE_FLOW_TBL_OP_ADD, mode, index);
++	if (ret == -ETIMEDOUT) {
++		/* Issued, and its result never came: the entry may still
++		 * land. An index-mode add can be taken back out; where a
++		 * hash-mode add went only its result would have said.
++		 */
++		if (mode == PPE_FLOW_OP_MODE_INDEX && ppe_flow_rollback(ppe_dev, *index))
++			goto out;
++		if (mode != PPE_FLOW_OP_MODE_INDEX)
++			*index = PPE_FLOW_INDEX_UNKNOWN;
++		ret = -EUCLEAN;
++		goto out;
++	}
+ 	if (ret)
+ 		goto out;
+ 
+@@ -232,15 +271,16 @@ int ppe_flow_entry_add(struct ppe_device *ppe_dev, enum ppe_flow_op_mode mode,
+ 	 */
+ 	ret = ppe_flow_counter_clear(ppe_dev, *index);
+ 	if (ret) {
+-		/* The add has landed; callers treat an error as "nothing
+-		 * programmed" and release the entries it points at, so take
+-		 * it back out rather than leave a live entry nobody tracks.
++		/* The add has landed; callers take an error other than
++		 * -EUCLEAN as "nothing programmed" and release the entries it
++		 * points at, so take it back out, or say it may still be there.
+ 		 */
+-		if (ppe_flow_tbl_op_wait(ppe_dev, PPE_FLOW_TBL_OP_DEL,
+-					 PPE_FLOW_OP_MODE_INDEX, index))
++		if (!ppe_flow_rollback(ppe_dev, *index)) {
+ 			dev_warn(ppe_dev->dev,
+-				 "flow entry %u left programmed after a counter clear failure\n",
++				 "flow entry %u may be left programmed after a counter clear failure\n",
+ 				 *index);
++			ret = -EUCLEAN;
++		}
+ 	}
+ out:
+ 	mutex_unlock(&ppe_dev->flow_tbl_lock);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
+@@ -6,6 +6,7 @@
+ #ifndef __PPE_FLOW_H__
+ #define __PPE_FLOW_H__
+ 
++#include <linux/limits.h>
+ #include <linux/types.h>
+ 
+ #include "ppe.h"
+@@ -32,6 +33,11 @@
+ #define PPE_FLOW_TBL_IPV4_ENTRY_SLOTS		1
+ #define PPE_FLOW_TBL_IPV6_ENTRY_SLOTS		2
+ 
++/* The index ppe_flow_entry_add() reports for an entry that may be
++ * programmed at an index hardware never returned.
++ */
++#define PPE_FLOW_INDEX_UNKNOWN			U32_MAX
++
+ /**
+  * enum ppe_flow_op_mode - PPE flow table addressing mode.
+  * @PPE_FLOW_OP_MODE_HASH: Hardware selects the entry slot by hashing the
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -13,9 +13,10 @@
+  * path:
+  *
+  * - IPv4 with NAT only; IPv6 is declined (not ported here).
+- * - TCP, UDP or UDP-Lite only. IPv4 fragments are punted from a flow hit
+- *   by a parser exception programmed at init, see
+- *   ppe_offload_hdr_exception_init(); without it IPv4 is declined.
++ * - TCP, UDP or UDP-Lite only. IPv4 fragments, IPv4 options, an expiring
++ *   TTL and malformed headers are punted from a flow hit by parser
++ *   exceptions programmed at enable, see ppe_offload_hdr_exception_init();
++ *   without them IPv4 is declined.
+  * - IPv4: single-ended NAT only: either the source address (and optionally
+  *   the source port) is rewritten and the destination is not -- SNAT,
+  *   the LAN->WAN direction of a masqueraded connection and the reply
+@@ -28,9 +29,11 @@
+  *   overlays of the flow entry are the only ones implemented. A DNAT
+  *   flow is accepted only when the address it translates is this
+  *   router's own on the interface (or VLAN upper) the packets arrive
+- *   through: the flow entry has no field for a PPPoE session (the
+- *   rule's FLOW_DISSECTOR_KEY_PPPOE, generic patch 714), so a PPPoE
+- *   WAN's reply would otherwise be programmed as a plain-IPv4 entry
++ *   through. A rule received through PPPoE carries
++ *   FLOW_DISSECTOR_KEY_PPPOE (generic patch 714), which the flow entry
++ *   has no field for and the key check declines; should a PPPoE WAN's
++ *   reply come without it, this test fails it (its address is the PPP
++ *   device's, not the port's) rather than program a plain-IPv4 entry
+  *   that a spoofed frame on the WAN segment could hit while software
+  *   drops it.
+  *   The same check keeps a DNAT flow entering through a DSA user port
+@@ -87,8 +90,8 @@
+  *   hardware is still forwarding.
+  *
+  * - TCP is accepted only because the parser's control-flag exceptions
+- *   (FIN/SYN/RST -> redirect to CPU + de-accelerate, armed on an L3
+- *   flow hit) are programmed and read back at init; see
++ *   (FIN/RST -> redirect to CPU + de-accelerate, SYN -> redirect, armed
++ *   on an L3 flow hit) are programmed and read back at init; see
+  *   ppe_offload_tcp_exception_init(). Without them the flowtable's
+  *   FIN|RST mask cannot be honoured and a teardown would be
+  *   accelerated, leaving conntrack holding closed connections at
+@@ -123,10 +126,29 @@
+  * Ported from Kamil Bienkiewicz's flow-offload series for the GL-BE9300
+  * (perceival/openwrt-flint3); IPv6 routing, the tag_8021q encapsulation
+  * and the ingress parser alias for rtl8_4 are not carried here.
++ *
++ * OFF BY DEFAULT. The flowtable block binds either way, so that a flowtable
++ * with "flags offload" always loads, but every flow is declined and no offload
++ * register is written until the flow_offload module parameter is set
++ * (/sys/module/qcom_ppe/parameters/flow_offload, or "options qcom_ppe
++ * flow_offload=1" in /etc/modules.conf). Enabling saves every static register
++ * it is about to change (exception actions and enables, the per-port L3
++ * interface, MY_MAC and L3_VP_PORT entries and MTU command), programs and
++ * reads them back, and only then accepts flows. A port entry that does not
++ * read back restores the saved values and leaves offload off; an exception
++ * group that does not read back leaves it on with the flows that need it
++ * declined (TCP flows for the TCP flag exceptions, every flow for the header
++ * ones), its registers written back on disable. Disabling, at runtime or on
++ * unbind, stops accepting flows, deletes every hardware entry this code owns
++ * and writes the saved values back. The flows the kernel still believes
++ * offloaded are then forwarded by the software flowtable, and declined when it
++ * offers them again.
+  */
+ 
+ #include <linux/atomic.h>
+ #include <linux/bitfield.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
+ #include <linux/errno.h>
+ #include <linux/etherdevice.h>
+ #include <linux/hashtable.h>
+@@ -138,9 +160,11 @@
+ #include <linux/inetdevice.h>
+ #include <linux/jiffies.h>
+ #include <linux/list.h>
++#include <linux/moduleparam.h>
+ #include <linux/mutex.h>
+ #include <linux/netdevice.h>
+ #include <linux/regmap.h>
++#include <linux/rtnetlink.h>
+ #include <net/dsa.h>
+ #include <linux/rhashtable.h>
+ #include <linux/slab.h>
+@@ -153,6 +177,7 @@
+ 
+ #include "edma_port.h"
+ #include "ppe.h"
++#include "ppe_config.h"
+ #include "ppe_flow.h"
+ #include "ppe_flow_ipv4.h"
+ #include "ppe_host.h"
+@@ -186,6 +211,8 @@
+  */
+ struct ppe_offload_flow_entry {
+ 	struct rhash_head node;
++	/* In ppe_offload_priv::flows, under its lock. */
++	struct list_head list;
+ 	unsigned long cookie;
+ 	u32 flow_index;
+ 	/* Slots of the flow table the entry takes from @flow_index on:
+@@ -196,6 +223,10 @@ struct ppe_offload_flow_entry {
+ 	u32 nexthop_index;
+ 	u32 pub_ip_index;
+ 	bool flow_valid;
++	/* Its hardware entry could not be deleted, see
++	 * ppe_offload_flow_stuck().
++	 */
++	bool stuck;
+ 	/* Only an SNAT flow holds a public IP table entry. */
+ 	bool pub_ip_valid;
+ 	/* Set when the nexthop's tag inserts name a DSA user port outright
+@@ -228,11 +259,16 @@ struct ppe_offload_flow_entry {
+ 	u64 stats_packets;
+ 	u64 stats_bytes;
+ 	unsigned long lastused;
+-	/* Packet count at the last refresh the flowtable sent for this
+-	 * cookie, and whether one was seen at all (ppe_offload_flow_stale()).
++	/* When the entry was last read back for a refresh the flowtable
++	 * sent for this cookie, and whether it was at all
++	 * (ppe_offload_flow_stale()).
+ 	 */
+-	u64 refresh_packets;
++	unsigned long refresh_time;
+ 	bool refresh_seen;
++	/* The flow block (flowtable) the flow was offered through; only
++	 * ever compared, see ppe_offload_unbind().
++	 */
++	const struct flow_block *block;
+ 	/* Re-points within the current PPE_OFFLOAD_FDB_FLAP_WINDOW, see
+ 	 * ppe_offload_fdb_move_work().
+ 	 */
+@@ -247,6 +283,71 @@ static const struct rhashtable_params ppe_offload_flow_ht_params = {
+ 	.automatic_shrinking = true,
+ };
+ 
++/* Static registers enabling changes, saved before and restored after:
++ * at most PPE_OFFLOAD_SNAP_WORDS consecutive words each, a table entry
++ * being restored whole and in its own word order (some latch on their
++ * last word).
++ */
++#define PPE_OFFLOAD_SNAP_WORDS	4
++/* Words of a MRU_MTU_CTRL entry, as ppe_port_set_maxframe() moves them. */
++#define PPE_OFFLOAD_MRU_MTU_WORDS	3
++#define PPE_OFFLOAD_SNAP_MAX	160
++/* EDMA ports whose L3 interface entries enabling saves: the PPE's
++ * physical ports, six at most (IPQ9574).
++ */
++#define PPE_OFFLOAD_PORTS_MAX	6
++
++/* @mask: For an entry saved with ppe_offload_snap_save_masked(), the bits of
++ * each word that are written back; the others are left as they are then
++ * (another user may have changed them meanwhile, such as a port's MTU).
++ * All set for a whole entry.
++ */
++struct ppe_offload_snap {
++	u32 addr;
++	unsigned int words;
++	u32 val[PPE_OFFLOAD_SNAP_WORDS];
++	u32 mask[PPE_OFFLOAD_SNAP_WORDS];
++};
++
++/**
++ * struct ppe_offload_bind - One flow block callback of this driver.
++ * @node: In ppe_offload_priv::binds, under its lock.
++ * @block: The flow block it is bound to; only ever compared.
++ *
++ * A flowtable binds one callback per EDMA port it has a device on (the
++ * WAN port and the switch conduit here), all on the flowtable's one flow
++ * block, and offers every flow to each.
++ */
++struct ppe_offload_bind {
++	struct list_head node;
++	const struct flow_block *block;
++};
++
++/**
++ * struct ppe_offload_counters - What happened to offered flows, for
++ * debugfs. Atomic: flows are declined outside the lock.
++ * @accepted: Flows programmed.
++ * @declined: Offers declined (-EOPNOTSUPP).
++ * @rearmed_superseded: Flows found stale on a refresh and programmed
++ * afresh, their slot taken by another flow;
++ * @rearmed_invalid: ... their entry no longer valid;
++ * @rearmed_deacce: ... their entry de-accelerated by an exception.
++ * @withdrawn: Flows in hardware dropped because a re-offer was declined.
++ * @unbound: Flows dropped because their flowtable went away.
++ * @stuck: Hardware entries found undeletable, counted once each time one
++ * becomes stuck.
++ */
++struct ppe_offload_counters {
++	atomic_long_t accepted;
++	atomic_long_t declined;
++	atomic_long_t rearmed_superseded;
++	atomic_long_t rearmed_invalid;
++	atomic_long_t rearmed_deacce;
++	atomic_long_t withdrawn;
++	atomic_long_t unbound;
++	atomic_long_t stuck;
++};
++
+ /**
+  * struct ppe_offload_priv - PPE hardware flow-offload state.
+  * @ppe_dev: PPE device.
+@@ -266,9 +367,9 @@ static const struct rhashtable_params ppe_offload_flow_ht_params = {
+  * were: without them hardware would accelerate a FIN/RST teardown that the
+  * flowtable explicitly asked us not to -- see
+  * ppe_offload_tcp_exception_init().
+- * @hdr_exceptions_ok: Whether the IPv4 fragment exception was programmed
+- * and read back at init, see ppe_offload_hdr_exception_init(). Flows are
+- * only offloaded when it was.
++ * @hdr_exceptions_ok: Whether the header exceptions were programmed and
++ * read back at enable, see ppe_offload_hdr_exception_init(). Flows are
++ * only offloaded when they were.
+  * @flow_full_last: jiffies of the last hash-mode add hardware refused for
+  * want of a free slot, 0 while none has been refused; under @lock. See
+  * ppe_offload_flow_tbl_full().
+@@ -287,6 +388,36 @@ static const struct rhashtable_params ppe_offload_flow_ht_params = {
+  * @fdb_nb: The switchdev notifier that feeds it.
+  * @fdb_moves: Move work items queued and not yet done, see
+  * PPE_OFFLOAD_FDB_MOVES_MAX.
++ * @enabled: Whether flows are accepted: set once enabling has programmed
++ * and read back everything, cleared first thing on disable. Written under
++ * RTNL and @lock, read under either.
++ * @flows: Every tracked flow, for the flush on disable; under @lock.
++ * @snap: The static registers enabling changed, with their values from
++ * before, written back on disable (ppe_offload_snap_save()); under @lock.
++ * @snap_num: Entries used in @snap.
++ * @degraded: A flow entry could not be deleted (it may still forward, and
++ * what it relies on is kept), or a saved register did not read back as
++ * saved when written back. New flows are declined, and enabling is
++ * refused until a reboot, so that the next enable cannot save a changed
++ * value as the one to go back to. Under @lock.
++ * @flows_lost: Flow entries that may be in hardware at an index nobody
++ * knows (a hash-mode add whose result never came, ppe_flow_entry_add()).
++ * No delete reaches them, so disabling never writes back what they rely
++ * on. Under @lock.
++ * @flows_dentry: The debugfs listing of what is tracked.
++ * @flows_hw_dentry: The debugfs listing of the tracked flows' entries as
++ * hardware has them.
++ * @binds: This driver's flow block callbacks, see ppe_offload_unbind();
++ * under @lock.
++ * @counters: See struct ppe_offload_counters.
++ * @rearm_window: Start of the current re-arm counting window, see
++ * PPE_OFFLOAD_REARM_MAX; under @lock.
++ * @rearm_count: Re-arms in that window; under @lock.
++ * @tripped: Too many re-arms: hardware is not forwarding what it was
++ * given. Flows are declined and @trip_work turns offload off. Under
++ * @lock; cleared by enabling.
++ * @trip_work: Turns offload off after a trip, as writing 0 to the
++ * parameter would.
+  */
+ struct ppe_offload_priv {
+ 	struct ppe_device *ppe_dev;
+@@ -304,9 +435,33 @@ struct ppe_offload_priv {
+ 	struct workqueue_struct *fdb_wq;
+ 	struct notifier_block fdb_nb;
+ 	atomic_t fdb_moves;
++	bool enabled;
++	struct list_head flows;
++	struct ppe_offload_snap snap[PPE_OFFLOAD_SNAP_MAX];
++	unsigned int snap_num;
++	bool degraded;
++	unsigned int flows_lost;
++	struct dentry *flows_dentry;
++	struct dentry *flows_hw_dentry;
++	struct list_head binds;
++	struct ppe_offload_counters counters;
++	unsigned long rearm_window;
++	unsigned int rearm_count;
++	bool tripped;
++	struct work_struct trip_work;
+ };
+ 
+-static LIST_HEAD(ppe_offload_block_cb_list);
++static int ppe_offload_snap_save(struct ppe_offload_priv *priv, u32 addr,
++				 unsigned int words);
++static int ppe_offload_flow_drop(struct ppe_offload_priv *priv,
++				 struct ppe_offload_flow_entry *entry);
++static void ppe_offload_flow_stuck(struct ppe_offload_priv *priv,
++				   struct ppe_offload_flow_entry *entry, int err);
++static void ppe_offload_trip_work(struct work_struct *work);
++
++static int ppe_offload_flow_hw_del(struct ppe_offload_priv *priv,
++				   struct ppe_offload_flow_entry *entry);
++static int ppe_offload_index_del(struct ppe_offload_priv *priv, u32 index);
+ 
+ /* Local, zero-seeded accumulator for a FLOW_ACTION_MANGLE targeting
+  * the Ethernet header: the kernel emits up to three 4-byte masked
+@@ -774,53 +929,159 @@ static void ppe_offload_flow_tbl_full(struct ppe_offload_priv *priv)
+ }
+ 
+ static u64 ppe_offload_counter_delta(u64 now, u64 prev, u64 mask);
++
++/* Drop a tracked flow whose hardware entry is already gone: release its
++ * table entries and forget its cookie, so that a later refresh from the
++ * flowtable re-offers it as a new flow. Called under priv->lock.
++ */
+ static void ppe_offload_flow_forget(struct ppe_offload_priv *priv,
+-				    struct ppe_offload_flow_entry *entry);
++				    struct ppe_offload_flow_entry *entry)
++{
++	rhashtable_remove_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
++	list_del(&entry->list);
++	if (entry->dsa_fixed) {
++		spin_lock_bh(&priv->dsa_fixed_lock);
++		hash_del(&entry->dsa_fixed_hnode);
++		spin_unlock_bh(&priv->dsa_fixed_lock);
++	}
++	ppe_offload_flow_disown(priv, entry);
++	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
++	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
++	if (entry->pub_ip_valid)
++		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
++	kfree(entry);
++}
++
++/* Why a tracked flow's hardware entry no longer forwards it, see
++ * ppe_offload_flow_stale().
++ */
++enum ppe_offload_stale {
++	PPE_OFFLOAD_FRESH,
++	PPE_OFFLOAD_SUPERSEDED,
++	PPE_OFFLOAD_INVALID,
++	PPE_OFFLOAD_DE_ACCE,
++};
++
++static const char * const ppe_offload_stale_why[] = {
++	[PPE_OFFLOAD_SUPERSEDED] = "superseded",
++	[PPE_OFFLOAD_INVALID] = "no longer valid",
++	[PPE_OFFLOAD_DE_ACCE] = "de-accelerated",
++};
+ 
+ /* Whether a flow the flowtable re-offers (flow_offload_refresh(), about
+- * once a second for as long as its packets cross the software path) has
+- * stopped matching in hardware. Called under priv->lock.
++ * once a second for as long as its packets cross the software path) is no
++ * longer forwarded by its hardware entry. Called under priv->lock.
+  *
+  * A refresh for a cookie already in hardware means software is forwarding
+  * packets of this flow. That is normal while the other direction of the
+- * connection is declined, and the hardware counters of this direction keep
+- * moving then. When they have not moved since the previous refresh either,
+- * the entry no longer matches (measured on a GL-BE9300: after a burst of
+- * hop-limit-1 segments carrying a live IPv6 download's tuple, the download
+- * stayed in software for the rest of the connection, the entry's counter
+- * frozen, conntrack still marked offloaded). Answering -EEXIST forever
+- * keeps such a zombie; dropping it lets this very refresh program the flow
+- * afresh. An entry superseded in the table (flow_valid clear) is stale by
+- * definition. The first refresh only takes the baseline.
+- */
+-static bool ppe_offload_flow_stale(struct ppe_offload_priv *priv,
+-				   struct ppe_offload_flow_entry *entry)
++ * connection is declined, and says nothing about this direction. The
++ * entry itself does: an exception armed to de-accelerate (a TCP control
++ * flag) sets its DE_ACCE bit, after which
++ * hardware sends every packet of the flow to the CPU (vendor in_flow_tbl
++ * de_acce, set by hardware as the vendor's tunnel decap code notes for its
++ * own tables). Kamil Bienkiewicz measured such a zombie on a GL-BE9300
++ * while an expiring TTL still de-accelerated: after a burst of hop-limit-1
++ * segments carrying a live IPv6 download's tuple, the download stayed in
++ * software for the rest of the connection, conntrack still marked
++ * offloaded. Answering -EEXIST forever would keep it; dropping it lets
++ * this very refresh program the flow afresh. An entry superseded in the
++ * table (flow_valid clear) or no longer valid is stale too.
++ *
++ * The hit counters are not used for this: an idle direction does not
++ * count, and a hit that hardware then redirects to the CPU (a failed MRU
++ * or source interface check) counts as one.
++ *
++ * The flowtable offers each refresh to every block callback bound to it,
++ * one per EDMA port with a device in the flowtable (wan and the lan
++ * conduit here), back to back, and refreshes a flow at most once per
++ * second (flow_offload_refresh()), so the entry is read at most once per
++ * PPE_OFFLOAD_REFRESH_GAP.
++ *
++ * Return: why the entry is stale, PPE_OFFLOAD_FRESH if it is not or cannot
++ * be read.
++ */
++#define PPE_OFFLOAD_REFRESH_GAP	(HZ / 2)
++
++static enum ppe_offload_stale ppe_offload_flow_stale(struct ppe_offload_priv *priv,
++						     struct ppe_offload_flow_entry *entry)
+ {
+-	u64 packets, bytes;
++	u32 words[2];
+ 
+ 	if (!entry->flow_valid)
+-		return true;
++		return PPE_OFFLOAD_SUPERSEDED;
++
++	if (entry->refresh_seen &&
++	    time_before(jiffies, entry->refresh_time + PPE_OFFLOAD_REFRESH_GAP))
++		return PPE_OFFLOAD_FRESH;
++	entry->refresh_seen = true;
++	entry->refresh_time = jiffies;
++
++	if (regmap_bulk_read(priv->ppe_dev->regmap, PPE_IN_FLOW_TBL_ADDR +
++			     entry->flow_index * PPE_IN_FLOW_TBL_INC, words, ARRAY_SIZE(words)))
++		return PPE_OFFLOAD_FRESH;
++	if (!(words[0] & PPE_FLOW_TBL_VALID))
++		return PPE_OFFLOAD_INVALID;
++	if (words[1] & PPE_FLOW_TBL_DE_ACCE)
++		return PPE_OFFLOAD_DE_ACCE;
++
++	return PPE_OFFLOAD_FRESH;
++}
+ 
+-	if (ppe_flow_counter_get(priv->ppe_dev, entry->flow_index, &packets, &bytes))
+-		return false;
++/* Re-arms of entries that hardware itself invalidated, allowed within
++ * PPE_OFFLOAD_REARM_WINDOW before offload is turned off. Nothing in this
++ * driver lets hardware drop an entry on its own, so hundreds in seconds
++ * mean that it is not doing what it is told, and re-arming would only
++ * churn the tables under load. A de-accelerated entry is hardware doing
++ * what it was told (a FIN or RST fired its exception), and a superseded
++ * one is the hash table at work: neither counts.
++ */
++#define PPE_OFFLOAD_REARM_WINDOW	(10 * HZ)
++#define PPE_OFFLOAD_REARM_MAX		256
+ 
+-	if (!entry->refresh_seen) {
+-		entry->refresh_seen = true;
+-		entry->refresh_packets = packets;
+-		return false;
+-	}
++/* Count a re-arm; trip when there were too many. Under priv->lock.
++ *
++ * Return: true if offload has tripped and the flow must be declined.
++ */
++static bool ppe_offload_rearm_trip(struct ppe_offload_priv *priv)
++{
++	if (priv->tripped)
++		return true;
+ 
+-	if (ppe_offload_counter_delta(packets, entry->refresh_packets,
+-				      PPE_IN_FLOW_CNT_TBL_PKT_MAX)) {
+-		entry->refresh_packets = packets;
+-		return false;
++	if (!priv->rearm_count ||
++	    time_after(jiffies, priv->rearm_window + PPE_OFFLOAD_REARM_WINDOW)) {
++		priv->rearm_window = jiffies;
++		priv->rearm_count = 0;
+ 	}
++	if (++priv->rearm_count <= PPE_OFFLOAD_REARM_MAX)
++		return false;
++
++	priv->tripped = true;
++	pr_err("ppe_offload: %u flow entries invalidated by hardware within %us; turning offload off\n",
++	       priv->rearm_count, (unsigned int)(PPE_OFFLOAD_REARM_WINDOW / HZ));
++	schedule_work(&priv->trip_work);
+ 
+ 	return true;
+ }
+ 
++/* Every dissector key the match parsing below interprets. The flowtable
++ * fills the VLAN keys without setting them in used_keys (see
++ * ppe_offload_rule_has_vlan_key()); they are listed for when it does.
++ * A rule with any other key asks for a condition the flow entry would
++ * silently drop, so it is declined.
++ */
++#define PPE_OFFLOAD_KEYS_KNOWN	(BIT_ULL(FLOW_DISSECTOR_KEY_META) |		\
++				 BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |		\
++				 BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) |		\
++				 BIT_ULL(FLOW_DISSECTOR_KEY_IPV4_ADDRS) |	\
++				 BIT_ULL(FLOW_DISSECTOR_KEY_IPV6_ADDRS) |	\
++				 BIT_ULL(FLOW_DISSECTOR_KEY_TCP) |		\
++				 BIT_ULL(FLOW_DISSECTOR_KEY_PORTS) |		\
++				 BIT_ULL(FLOW_DISSECTOR_KEY_VLAN) |		\
++				 BIT_ULL(FLOW_DISSECTOR_KEY_CVLAN))
++
+ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 				     struct ppe_offload_priv *priv,
++				     const struct flow_block *block,
+ 				     struct flow_cls_offload *cls)
+ {
+ 	struct ppe_offload_l4_ports l4 = {};
+@@ -858,6 +1119,14 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	const char *stage = NULL;
+ 	int ret;
+ 
++	if (!READ_ONCE(priv->enabled))
++		return ppe_offload_decline("flow offload is off (qcom_ppe.flow_offload=0)");
++
++	if (rule->match.dissector->used_keys & ~PPE_OFFLOAD_KEYS_KNOWN)
++		return ppe_offload_decline("match keys %#llx not interpreted",
++					    rule->match.dissector->used_keys &
++					    ~PPE_OFFLOAD_KEYS_KNOWN);
++
+ 	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL) ||
+ 	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC) ||
+ 	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS))
+@@ -925,7 +1194,7 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		}
+ 
+ 		if (!priv->hdr_exceptions_ok)
+-			return ppe_offload_decline("offload disabled: no fragment exception");
++			return ppe_offload_decline("offload disabled: header exceptions unavailable");
+ 
+ 		flow_rule_match_ports(rule, &ports);
+ 		match_sport = ports.key->src;
+@@ -943,8 +1212,9 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	 * RST|FIN, precisely so that a teardown is NOT accelerated and conntrack
+ 	 * still observes it. A flow entry matches on the 5-tuple alone, so that
+ 	 * condition is carried by the parser-level TCP-flag exceptions programmed
+-	 * in ppe_offload_tcp_exception_init(): a FIN, SYN or RST segment is
+-	 * redirected to the CPU and de-accelerates the flow.
++	 * in ppe_offload_tcp_exception_init(): a FIN or RST segment is
++	 * redirected to the CPU and de-accelerates the flow, a SYN is
++	 * redirected.
+ 	 *
+ 	 * netfilter expresses the mask in the same bit order hardware uses (the
+ 	 * low byte of the TCP flags word), so the vendor PPE_TCP_FLAG_* values
+@@ -1035,11 +1305,11 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 
+ 		/* Whether the destination the packets are addressed to is
+ 		 * this router's own address on the interface they arrive
+-		 * through. Used below to accept only such DNAT flows: the
+-		 * flow entry has no field for a PPPoE session (the rule's
+-		 * FLOW_DISSECTOR_KEY_PPPOE), and a plain IPv4 frame on the
+-		 * WAN segment addressed to a PPPoE session's address would
+-		 * otherwise be translated and delivered where software would
++		 * through. Used below to accept only such DNAT flows. A
++		 * rule received through PPPoE is declined by the key check
++		 * already (FLOW_DISSECTOR_KEY_PPPOE); one that came without
++		 * the key fails here, its address being the PPP device's,
++		 * and is not translated and delivered where software would
+ 		 * drop it.
+ 		 */
+ 		if (l3dev)
+@@ -1248,7 +1518,7 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	/* eth.bytes is {h_dest[6], h_source[6]}. The new source half
+ 	 * must be this egress port's own MAC -- if it isn't, either
+ 	 * this isn't the flow we think it is or the port's L3_IF entry
+-	 * (edma_port_l3_if_update()) is out of sync, and egressing
++	 * (edma_port_l3_if_program()) is out of sync, and egressing
+ 	 * with the wrong source MAC either way is worse than declining.
+ 	 * Behind a DSA user port that is the conduit's MAC, which its
+ 	 * user ports and (by default) their bridge inherit.
+@@ -1272,27 +1542,45 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 
+ 	mutex_lock(&priv->lock);
+ 
++	/* Disabled since the check above: nothing may be programmed now. The
++	 * exception gates are re-read too: offload may have been turned off
++	 * and on again meanwhile.
++	 */
++	if (!priv->enabled || priv->degraded || priv->tripped || !priv->hdr_exceptions_ok ||
++	    (ip_proto == PPE_FLOW_PROTO_TCP && !priv->tcp_exceptions_ok)) {
++		ret = -EOPNOTSUPP;
++		stage = "disabled";
++		goto unlock;
++	}
++
+ 	entry = rhashtable_lookup_fast(&priv->flow_table, &cls->cookie,
+ 				       ppe_offload_flow_ht_params);
+ 	if (entry) {
+-		if (!ppe_offload_flow_stale(priv, entry)) {
++		enum ppe_offload_stale why = ppe_offload_flow_stale(priv, entry);
++
++		if (why == PPE_OFFLOAD_FRESH) {
+ 			ret = -EEXIST;
+ 			stage = "exists";
+ 			goto unlock;
+ 		}
+-		/* While the table is full, many connections have only one
+-		 * direction in hardware; the other crosses the software path
+-		 * and refreshes the flow, and a direction that saw no packet
+-		 * in between is re-armed here as a matter of course. Only a
+-		 * re-arm outside such an episode is worth a line.
++		pr_debug("ppe_offload: flow entry %u re-armed: %s\n", entry->flow_index,
++			 ppe_offload_stale_why[why]);
++		/* The entry may still be valid in hardware: it goes before
++		 * the table entries it points at are let go of.
+ 		 */
+-		if (ppe_offload_flow_tbl_full_recent(priv))
+-			pr_debug("ppe_offload: flow entry %u re-armed while the table is full\n",
+-				 entry->flow_index);
+-		else
+-			pr_info_ratelimited("ppe_offload: flow entry %u re-armed: no hardware hits across refreshes\n",
+-					    entry->flow_index);
+-		ppe_offload_flow_forget(priv, entry);
++		if (ppe_offload_flow_drop(priv, entry)) {
++			ret = -EIO;
++			stage = "re-arm";
++			goto unlock;
++		}
++		atomic_long_inc(why == PPE_OFFLOAD_SUPERSEDED ? &priv->counters.rearmed_superseded :
++				why == PPE_OFFLOAD_INVALID ? &priv->counters.rearmed_invalid :
++				&priv->counters.rearmed_deacce);
++		if (why == PPE_OFFLOAD_INVALID && ppe_offload_rearm_trip(priv)) {
++			ret = -EOPNOTSUPP;
++			stage = "tripped";
++			goto unlock;
++		}
+ 	}
+ 
+ 	/* Public IP entry for the translated (post-SNAT) source address.
+@@ -1384,43 +1672,52 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	flow_ipv4.pmtu_check_l3 = true;
+ 	ppe_flow_ipv4_nat_entry_encode(&flow_ipv4, flow_words);
+ 
++	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry) {
++		ret = -ENOMEM;
++		stage = "alloc";
++		goto deref_host;
++	}
++
++	entry->cookie = cls->cookie;
++	entry->flow_slots = PPE_FLOW_TBL_IPV4_ENTRY_SLOTS;
++	entry->host_index = host_index;
++	entry->nexthop_index = nexthop_index;
++	entry->pub_ip_index = pub_ip_index;
++	entry->pub_ip_valid = pub_ip;
++	entry->block = block;
++
+ 	flow_index = 0;
+ 	ret = ppe_flow_entry_add(priv->ppe_dev, PPE_FLOW_OP_MODE_HASH, flow_words,
+ 				 PPE_FLOW_TBL_IPV4_ENTRY_WORDS, &flow_index);
++	if (ret == -EUCLEAN) {
++		stage = "flow";
++		if (flow_index == PPE_FLOW_INDEX_UNKNOWN)
++			goto lose_entry;
++		ppe_offload_flow_supersede(priv, flow_index, PPE_FLOW_TBL_IPV4_ENTRY_SLOTS);
++		goto keep_entry;
++	}
+ 	if (ret) {
+ 		if (ret == -ENOSPC) {
+ 			ppe_offload_flow_tbl_full(priv);
+ 			flow_full = true;
+ 		}
+ 		stage = "flow";
+-		goto deref_host;
++		goto free_entry;
+ 	}
+ 
+ 	ppe_offload_flow_supersede(priv, flow_index, PPE_FLOW_TBL_IPV4_ENTRY_SLOTS);
+-
+-	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+-	if (!entry) {
+-		ret = -ENOMEM;
+-		stage = "alloc";
+-		goto del_flow;
+-	}
+-
+-	entry->cookie = cls->cookie;
+ 	entry->flow_index = flow_index;
+-	entry->flow_slots = PPE_FLOW_TBL_IPV4_ENTRY_SLOTS;
+-	entry->host_index = host_index;
+-	entry->nexthop_index = nexthop_index;
+-	entry->pub_ip_index = pub_ip_index;
+-	entry->pub_ip_valid = pub_ip;
+ 	entry->flow_valid = true;
+ 
+ 	ret = rhashtable_insert_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
+ 	if (ret) {
+ 		stage = "insert";
+-		goto free_entry;
++		goto del_flow;
+ 	}
+ 
+ 	entry->lastused = jiffies;
++	list_add(&entry->list, &priv->flows);
+ 	ppe_offload_flow_own(priv, entry);
+ 
+ 	/* An unbridged port has no FDB to move the client with. */
+@@ -1441,6 +1738,7 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 
+ 	mutex_unlock(&priv->lock);
+ 
++	atomic_long_inc(&priv->counters.accepted);
+ 	pr_debug("ppe_offload: accepted %s flow_index=%u host_index=%u nexthop_index=%u src=%pI4->%pI4 dst=%pI4->%pI4 odev=%s egress=%s\n",
+ 			 snat ? "snat" : "dnat", flow_index, host_index, nexthop_index,
+ 			 &match_src, &new_src, &match_dst, &new_dst, netdev_name(odev),
+@@ -1448,10 +1746,39 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 
+ 	return 0;
+ 
++del_flow:
++	if (!ppe_offload_index_del(priv, flow_index))
++		goto free_entry;
++keep_entry:
++	/* Still in hardware, so still tracked: what it points at is not let
++	 * go of for another flow to take, and disabling retries its delete
++	 * and keeps what it relies on until one succeeds (ppe_offload_flush()).
++	 * It is in no hash table, so no destroy or stats request finds it,
++	 * and forgetting it removes nothing from one.
++	 */
++	entry->flow_index = flow_index;
++	entry->flow_valid = true;
++	entry->stuck = true;
++	entry->lastused = jiffies;
++	list_add(&entry->list, &priv->flows);
++	ppe_offload_flow_own(priv, entry);
++	priv->degraded = true;
++	atomic_long_inc(&priv->counters.stuck);
++	pr_err("ppe_offload: flow entry %u could not be deleted on an error path; new flows declined, disable and reboot\n",
++	       flow_index);
++	goto unlock;
++lose_entry:
++	/* Where it went only the add's result would have said: no delete can
++	 * reach it, so what it may point at is never let go of.
++	 */
++	kfree(entry);
++	priv->flows_lost++;
++	priv->degraded = true;
++	atomic_long_inc(&priv->counters.stuck);
++	pr_err("ppe_offload: a flow entry add never completed; the entry could not be deleted, wherever it is; new flows declined, disable and reboot\n");
++	goto unlock;
+ free_entry:
+ 	kfree(entry);
+-del_flow:
+-	ppe_flow_entry_del(priv->ppe_dev, flow_index);
+ deref_host:
+ 	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, host_index);
+ deref_nexthop:
+@@ -1496,6 +1823,7 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ static int ppe_offload_flow_destroy(struct ppe_offload_priv *priv, struct flow_cls_offload *cls)
+ {
+ 	struct ppe_offload_flow_entry *entry;
++	int ret = 0;
+ 
+ 	mutex_lock(&priv->lock);
+ 
+@@ -1505,51 +1833,17 @@ static int ppe_offload_flow_destroy(struct ppe_offload_priv *priv, struct flow_c
+ 		return -ENOENT;
+ 	}
+ 
+-	rhashtable_remove_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
+-	if (entry->dsa_fixed) {
+-		spin_lock_bh(&priv->dsa_fixed_lock);
+-		hash_del(&entry->dsa_fixed_hnode);
+-		spin_unlock_bh(&priv->dsa_fixed_lock);
+-	}
+-
+-	/* See ppe_offload_flow_disown(): a superseded entry (flow_valid
+-	 * false) skips deleting hardware out from under the flow that
+-	 * overwrote its slot.
++	/* A superseded entry (flow_valid false) skips deleting hardware out
++	 * from under the flow that overwrote its slot. One whose entry
++	 * cannot be deleted stays tracked, for the flush on disable to try
++	 * again.
+ 	 */
+-	ppe_offload_flow_disown(priv, entry);
+-	if (entry->flow_valid)
+-		ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
+-	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
+-	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
+-	if (entry->pub_ip_valid)
+-		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
++	if (ppe_offload_flow_drop(priv, entry))
++		ret = -EIO;
+ 
+ 	mutex_unlock(&priv->lock);
+ 
+-	kfree(entry);
+-
+-	return 0;
+-}
+-
+-/* Drop a tracked flow whose hardware entry is already gone: release its
+- * table entries and forget its cookie, so that a later refresh from the
+- * flowtable re-offers it as a new flow. Called under priv->lock.
+- */
+-static void ppe_offload_flow_forget(struct ppe_offload_priv *priv,
+-				    struct ppe_offload_flow_entry *entry)
+-{
+-	rhashtable_remove_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
+-	if (entry->dsa_fixed) {
+-		spin_lock_bh(&priv->dsa_fixed_lock);
+-		hash_del(&entry->dsa_fixed_hnode);
+-		spin_unlock_bh(&priv->dsa_fixed_lock);
+-	}
+-	ppe_offload_flow_disown(priv, entry);
+-	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
+-	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
+-	if (entry->pub_ip_valid)
+-		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
+-	kfree(entry);
++	return ret;
+ }
+ 
+ #if IS_ENABLED(CONFIG_NET_DSA) && IS_ENABLED(CONFIG_NET_SWITCHDEV)
+@@ -1558,9 +1852,13 @@ static void ppe_offload_flow_forget(struct ppe_offload_priv *priv,
+  * A flow towards an rtl8_4 user port carries the port in its emulated head
+  * tag (see ppe_offload_dsa_egress()), so hardware keeps delivering to the
+  * port the flow was resolved for even after the client has moved to another
+- * one. The software flowtable has the same blind spot -- its direct transmit
+- * path is bound to the port it resolved at creation -- and nothing lets a
+- * driver tear a flow down (the cookie is opaque). What the driver can do is
++ * one. The software flowtable has the same blind spot for a client that
++ * moves between two ports that both stay up -- its direct transmit path is
++ * bound to the port it resolved at creation -- and nothing lets a driver
++ * tear a flow down (the cookie is opaque). A move that takes the old
++ * port's link down is not this case: the flowtable tears the flow down on
++ * the carrier loss (pending 709) and offers it afresh. What the driver can
++ * do is
+  * follow the move: the bridge learns the client's new port from the first
+  * frame that reaches the CPU and reports it as SWITCHDEV_FDB_ADD_TO_DEVICE
+  * on the new port device, and every fixed-port flow for that MAC is then
+@@ -1626,7 +1924,9 @@ struct ppe_offload_fdb_move {
+  * Return: 0 on success, a negative error code on failure. If the
+  * hardware entry is gone by then, the tracked flow is dropped altogether
+  * (ppe_offload_flow_forget()) so that the flowtable's next refresh
+- * re-offers it as a new flow instead of getting -EEXIST for a zombie.
++ * re-offers it as a new flow instead of getting -EEXIST for a zombie; if
++ * the new entry may be programmed all the same (-EUCLEAN), the flow stays
++ * tracked as re-pointed.
+  */
+ static int ppe_offload_flow_repoint(struct ppe_offload_priv *priv,
+ 				    struct ppe_offload_flow_entry *entry,
+@@ -1649,13 +1949,20 @@ static int ppe_offload_flow_repoint(struct ppe_offload_priv *priv,
+ 	flow_ipv4.nat_nexthop = nexthop_index;
+ 	ppe_flow_ipv4_nat_entry_encode(&flow_ipv4, flow_words);
+ 
+-	ret = ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
+-	if (ret)
++	/* A failed delete leaves the flow as it was, still tracked and still
++	 * forwarding to the old port.
++	 */
++	ret = ppe_offload_flow_hw_del(priv, entry);
++	if (ret) {
++		ppe_offload_flow_stuck(priv, entry, ret);
+ 		goto deref_new;
++	}
++	/* Deleted after all: what follows starts afresh. */
++	entry->stuck = false;
+ 
+ 	ret = ppe_flow_entry_add(priv->ppe_dev, PPE_FLOW_OP_MODE_INDEX, flow_words,
+ 				 PPE_FLOW_TBL_IPV4_ENTRY_WORDS, &flow_index);
+-	if (ret) {
++	if (ret && ret != -EUCLEAN) {
+ 		/* The old entry is gone. Disown the slots so nothing deletes
+ 		 * whatever lands there next, and forget the flow.
+ 		 */
+@@ -1666,6 +1973,10 @@ static int ppe_offload_flow_repoint(struct ppe_offload_priv *priv,
+ 		return ret;
+ 	}
+ 
++	/* It may forward to @dp: tracked as pointing there. */
++	if (ret)
++		ppe_offload_flow_stuck(priv, entry, ret);
++
+ 	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
+ 	entry->nexthop_index = nexthop_index;
+ 	entry->nexthop = nexthop;
+@@ -1677,7 +1988,7 @@ static int ppe_offload_flow_repoint(struct ppe_offload_priv *priv,
+ 	entry->refresh_seen = false;
+ 	entry->stats_bytes = 0;
+ 
+-	return 0;
++	return ret;
+ 
+ deref_new:
+ 	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, nexthop_index);
+@@ -1730,6 +2041,11 @@ static void ppe_offload_fdb_move_work(struct work_struct *work)
+ 
+ 	mutex_lock(&priv->lock);
+ 
++	/* Disabled meanwhile: the flows are gone. */
++	if (!priv->enabled) {
++		mutex_unlock(&priv->lock);
++		goto out;
++	}
+ 	/* @lock keeps the entries alive; a failed re-point drops its entry. */
+ 	hash_for_each_possible_safe(priv->dsa_fixed_ht, entry, tmp, dsa_fixed_hnode,
+ 				    ether_addr_to_u64(move->addr)) {
+@@ -1755,8 +2071,10 @@ static void ppe_offload_fdb_move_work(struct work_struct *work)
+ 			entry->move_count = 0;
+ 		}
+ 		if (++entry->move_count > PPE_OFFLOAD_FDB_FLAP_MAX) {
+-			ppe_offload_flow_forget(priv, entry);
+-			dropped++;
++			if (ppe_offload_flow_drop(priv, entry))
++				failed++;
++			else
++				dropped++;
+ 			continue;
+ 		}
+ 
+@@ -1976,9 +2294,31 @@ static int ppe_offload_flow_stats(struct ppe_offload_priv *priv,
+ 	return 0;
+ }
+ 
++/* A re-offer of a flow already in hardware that is now declined: whatever
++ * made it acceptable no longer holds, so its entry goes too and the flow
++ * stays in software. Under nothing; takes priv->lock.
++ */
++static void ppe_offload_flow_withdraw(struct ppe_offload_priv *priv, unsigned long cookie)
++{
++	struct ppe_offload_flow_entry *entry;
++
++	mutex_lock(&priv->lock);
++	entry = rhashtable_lookup_fast(&priv->flow_table, &cookie, ppe_offload_flow_ht_params);
++	/* A stuck entry would only fail its delete again, once a second. */
++	if (entry && !entry->stuck) {
++		pr_debug("ppe_offload: flow entry %u withdrawn: re-offer declined\n",
++			 entry->flow_index);
++		if (!ppe_offload_flow_drop(priv, entry))
++			atomic_long_inc(&priv->counters.withdrawn);
++	}
++	mutex_unlock(&priv->lock);
++}
++
+ static int ppe_offload_flow_cmd(struct net_device *netdev, struct ppe_offload_priv *priv,
+-				 struct flow_cls_offload *cls)
++				 const struct flow_block *block, struct flow_cls_offload *cls)
+ {
++	int ret;
++
+ 	/* cls->cookie is a kernel heap address; printing it would defeat the
+ 	 * pointer hashing %p exists for, so it is deliberately not logged.
+ 	 */
+@@ -1987,7 +2327,17 @@ static int ppe_offload_flow_cmd(struct net_device *netdev, struct ppe_offload_pr
+ 
+ 	switch (cls->command) {
+ 	case FLOW_CLS_REPLACE:
+-		return ppe_offload_flow_replace(netdev, priv, cls);
++		/* The decision does not depend on which of the callbacks
++		 * bound to the flowtable is asked (only on the rule and on
++		 * the driver's state), so every callback withdraws alike.
++		 * -EEXIST is the flow already in hardware, healthy.
++		 */
++		ret = ppe_offload_flow_replace(netdev, priv, block, cls);
++		if (ret == -EOPNOTSUPP)
++			atomic_long_inc(&priv->counters.declined);
++		if (ret && ret != -EEXIST)
++			ppe_offload_flow_withdraw(priv, cls->cookie);
++		return ret;
+ 	case FLOW_CLS_DESTROY:
+ 		return ppe_offload_flow_destroy(priv, cls);
+ 	case FLOW_CLS_STATS:
+@@ -1997,24 +2347,78 @@ static int ppe_offload_flow_cmd(struct net_device *netdev, struct ppe_offload_pr
+ 	}
+ }
+ 
+-static int ppe_offload_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
+-					  void *cb_priv)
++/* Let go of one flow block callback. When it was this driver's last on its
++ * flow block, every flow offered through that block goes out of hardware:
++ * deleting a flowtable (nft_unregister_flowtable_net_hooks(), every fw4
++ * reload) unbinds the callbacks before nf_flow_table_free() sends the
++ * flows' FLOW_CLS_DESTROY, to nobody, so without this their entries would
++ * stay in hardware under cookies nothing will ever name again. A device
++ * leaving a flowtable that keeps others is not this case: its flows are
++ * destroyed through the callbacks that remain. Takes priv->lock; called
++ * with the flowtable's flow_block_lock held for writing (as its offers
++ * hold it for reading), never under RTNL-taking locks.
++ */
++static void ppe_offload_unbind(struct ppe_offload_priv *priv, struct ppe_offload_bind *bind)
+ {
+-	struct net_device *netdev = cb_priv;
+-	struct edma_port_priv *port_priv;
++	struct ppe_offload_flow_entry *entry, *tmp;
++	struct ppe_offload_bind *other;
++	unsigned int dropped = 0, stuck = 0;
+ 
+-	if (!tc_can_offload(netdev))
+-		return -EOPNOTSUPP;
++	mutex_lock(&priv->lock);
+ 
+-	if (!edma_port_is_edma_netdev(netdev))
+-		return -EOPNOTSUPP;
++	list_del(&bind->node);
++	list_for_each_entry(other, &priv->binds, node)
++		if (other->block == bind->block)
++			goto unlock;
++
++	list_for_each_entry_safe(entry, tmp, &priv->flows, list) {
++		if (entry->block != bind->block)
++			continue;
++		if (ppe_offload_flow_drop(priv, entry))
++			stuck++;
++		else
++			dropped++;
++	}
++	if (dropped || stuck) {
++		atomic_long_add(dropped, &priv->counters.unbound);
++		pr_info("ppe_offload: flowtable unbound: %u flow(s) out of hardware, %u stuck\n",
++			dropped, stuck);
++	}
++
++unlock:
++	mutex_unlock(&priv->lock);
++}
++
++/* A flow block callback on one of this driver's own EDMA port devices. */
++struct ppe_offload_direct {
++	struct ppe_offload_bind bind;
++	struct net_device *netdev;
++	struct ppe_offload_priv *priv;
++};
+ 
+-	port_priv = netdev_priv(netdev);
++static void ppe_offload_direct_release(void *cb_priv)
++{
++	struct ppe_offload_direct *direct = cb_priv;
++
++	ppe_offload_unbind(direct->priv, &direct->bind);
++	kfree(direct);
++}
++
++static int ppe_offload_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
++					  void *cb_priv)
++{
++	struct ppe_offload_direct *direct = cb_priv;
++	struct flow_cls_offload *cls = type_data;
+ 
+ 	switch (type) {
+ 	case TC_SETUP_CLSFLOWER:
+-		return ppe_offload_flow_cmd(netdev, port_priv->ppe_port->ppe_dev->offload,
+-					     type_data);
++		/* hw-tc-offload turned off: no new flow, but the flows already
++		 * in hardware must still be destroyed and counted.
++		 */
++		if (cls->command == FLOW_CLS_REPLACE && !tc_can_offload(direct->netdev))
++			return -EOPNOTSUPP;
++		return ppe_offload_flow_cmd(direct->netdev, direct->priv, direct->bind.block,
++					     cls);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+@@ -2023,6 +2427,9 @@ static int ppe_offload_setup_tc_block_cb(enum tc_setup_type type, void *type_dat
+ static int ppe_offload_setup_tc_block(struct net_device *netdev,
+ 				       struct flow_block_offload *f)
+ {
++	struct edma_port_priv *port_priv = netdev_priv(netdev);
++	struct ppe_offload_priv *priv = port_priv->ppe_port->ppe_dev->offload;
++	struct ppe_offload_direct *direct;
+ 	struct flow_block_cb *block_cb;
+ 
+ 	pr_debug("ppe_offload: setup_tc_block netdev=%s binder_type=%d command=%d\n",
+@@ -2031,6 +2438,9 @@ static int ppe_offload_setup_tc_block(struct net_device *netdev,
+ 	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
+ 		return -EOPNOTSUPP;
+ 
++	if (!priv || !edma_port_is_edma_netdev(netdev))
++		return -EOPNOTSUPP;
++
+ 	switch (f->command) {
+ 	case FLOW_BLOCK_BIND:
+ 		block_cb = flow_block_cb_lookup(f->block, ppe_offload_setup_tc_block_cb,
+@@ -2040,17 +2450,37 @@ static int ppe_offload_setup_tc_block(struct net_device *netdev,
+ 			return 0;
+ 		}
+ 
++		direct = kzalloc(sizeof(*direct), GFP_KERNEL);
++		if (!direct)
++			return -ENOMEM;
++		direct->netdev = netdev;
++		direct->priv = priv;
++		direct->bind.block = f->block;
++
+ 		block_cb = flow_block_cb_alloc(ppe_offload_setup_tc_block_cb, netdev,
+-						netdev, NULL);
++						direct, ppe_offload_direct_release);
+ 		if (IS_ERR(block_cb)) {
++			kfree(direct);
+ 			pr_info_ratelimited("ppe_offload: flow_block_cb_alloc failed: %ld\n",
+ 					    PTR_ERR(block_cb));
+ 			return PTR_ERR(block_cb);
+ 		}
+ 
++		/* From here the block callback owns @direct: it is freed by
++		 * ppe_offload_direct_release() when the callback is.
++		 */
++		mutex_lock(&priv->lock);
++		list_add(&direct->bind.node, &priv->binds);
++		mutex_unlock(&priv->lock);
++
++		/* On no driver-wide list: nothing here walks the callbacks,
++		 * and tc and nft bind them under different locks. The core
++		 * unlinks driver_list on some of its paths, so it must be a
++		 * valid (self-linked) node.
++		 */
++		INIT_LIST_HEAD(&block_cb->driver_list);
+ 		flow_block_cb_incref(block_cb);
+ 		flow_block_cb_add(block_cb, f);
+-		list_add_tail(&block_cb->driver_list, &ppe_offload_block_cb_list);
+ 		pr_debug("ppe_offload: block bound on %s\n", netdev_name(netdev));
+ 		return 0;
+ 	case FLOW_BLOCK_UNBIND:
+@@ -2059,10 +2489,8 @@ static int ppe_offload_setup_tc_block(struct net_device *netdev,
+ 		if (!block_cb)
+ 			return -ENOENT;
+ 
+-		if (!flow_block_cb_decref(block_cb)) {
++		if (!flow_block_cb_decref(block_cb))
+ 			flow_block_cb_remove(block_cb, f);
+-			list_del(&block_cb->driver_list);
+-		}
+ 		return 0;
+ 	default:
+ 		return -EOPNOTSUPP;
+@@ -2088,166 +2516,50 @@ int ppe_offload_setup_tc(struct net_device *netdev, enum tc_setup_type type, voi
+ 	}
+ }
+ 
+-/* Indirect block registration -- for devices with no .ndo_setup_tc of their
+- * own (bridges, VLANs) that sit between an EDMA netdevice and the flows we
+- * actually want to offload. It binds tc clsact blocks (TC_SETUP_BLOCK)
+- * only: an nft flowtable binds such a device indirectly with TC_SETUP_FT,
+- * which this does not handle, and a flowtable's flows reach every callback
+- * on its block whatever their ingress device anyway.
+- * ppe_offload_flow_replace() itself is indirect-block-agnostic: it decides
+- * purely from the flow's own FLOW_ACTION_REDIRECT target, not from which
+- * device offered the block.
++/* TCP control flags that must never be accelerated.
++ *
++ * nf_flow_rule_match() builds every TCP flow with tcp.flags = 0 masked to
++ * FIN|RST: the flowtable is asking us to accelerate only segments with those
++ * flags clear, so that conntrack still sees the connection close. A PPE flow
++ * entry matches on the 5-tuple alone and cannot express a flag condition, so
++ * the parser-level exceptions programmed below carry it instead -- a segment
++ * carrying FIN or RST is redirected to the CPU and de-accelerates its flow,
++ * leaving the software path to finish the teardown.
+  *
+- * Filtered to bridge masters and VLAN devices only, rather than accepting
+- * every device system-wide with no native .ndo_setup_tc (tunnels, veth,
+- * wireguard, etc.) -- those can never have one of our own EDMA netdevices
+- * as a lower device, so there's no reason to bind blocks on them.
++ * SYN is included, beyond what the mask asks for, because it is how a new
++ * connection reusing a 5-tuple announces itself; the software fast path
++ * keys TCP reopen off tcph->syn (nf_flow_table_ip.c). It is redirected
++ * only, not de-accelerated, which is what the software fast path does
++ * with it: it tears the flow down when the flow is already closing (and a
++ * closing flow's entry was de-accelerated by its FIN or RST already), and
++ * otherwise forwards the SYN and keeps the flow. A de-accelerating SYN
++ * would let any peer that knows a tuple push its flow out of hardware at
++ * will. The vendor driver programs these three, all de-accelerating.
+  */
+-
+-struct ppe_offload_indr_priv {
+-	struct list_head list;
+-	struct net_device *netdev;
+-	struct ppe_offload_priv *priv;
++static const u8 ppe_offload_tcp_exception_flags[] = {
++	PPE_TCP_FLAG_FIN,
++	PPE_TCP_FLAG_SYN,
++	PPE_TCP_FLAG_RST,
+ };
+ 
+-static LIST_HEAD(ppe_offload_indr_priv_list);
++/* Whether each slot of ppe_offload_tcp_exception_flags[] de-accelerates. */
++static const bool ppe_offload_tcp_exception_de_acce[] = {
++	true,
++	false,
++	true,
++};
+ 
+-static struct ppe_offload_indr_priv *ppe_offload_indr_priv_lookup(struct net_device *netdev)
++/* Point one parser slot at @flags. Value and mask are set to the same bits, so
++ * hardware hits when those flags are set and ignores the others -- FIN,ACK, the
++ * ordinary way a peer closes, still matches the FIN slot.
++ */
++static int ppe_offload_tcp_exception_slot(struct ppe_device *ppe_dev,
++					   unsigned int slot, u8 flags)
+ {
+-	struct ppe_offload_indr_priv *indr_priv;
+-
+-	list_for_each_entry(indr_priv, &ppe_offload_indr_priv_list, list)
+-		if (indr_priv->netdev == netdev)
+-			return indr_priv;
+-
+-	return NULL;
+-}
++	u32 addr, mask, val;
+ 
+-static int ppe_offload_indr_setup_block_cb(enum tc_setup_type type, void *type_data,
+-					    void *cb_priv)
+-{
+-	struct ppe_offload_indr_priv *indr_priv = cb_priv;
+-
+-	switch (type) {
+-	case TC_SETUP_CLSFLOWER:
+-		return ppe_offload_flow_cmd(indr_priv->netdev, indr_priv->priv, type_data);
+-	default:
+-		return -EOPNOTSUPP;
+-	}
+-}
+-
+-static void ppe_offload_indr_block_unbind(void *cb_priv)
+-{
+-	struct ppe_offload_indr_priv *indr_priv = cb_priv;
+-
+-	list_del(&indr_priv->list);
+-	kfree(indr_priv);
+-}
+-
+-static int ppe_offload_indr_setup_tc_block(struct net_device *netdev, struct Qdisc *sch,
+-					    struct ppe_offload_priv *priv,
+-					    struct flow_block_offload *f, void *data,
+-					    void (*cleanup)(struct flow_block_cb *block_cb))
+-{
+-	struct ppe_offload_indr_priv *indr_priv;
+-	struct flow_block_cb *block_cb;
+-
+-	if (!netif_is_bridge_master(netdev) && !is_vlan_dev(netdev))
+-		return -EOPNOTSUPP;
+-
+-	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
+-		return -EOPNOTSUPP;
+-
+-	switch (f->command) {
+-	case FLOW_BLOCK_BIND:
+-		if (ppe_offload_indr_priv_lookup(netdev))
+-			return -EEXIST;
+-
+-		indr_priv = kzalloc(sizeof(*indr_priv), GFP_KERNEL);
+-		if (!indr_priv)
+-			return -ENOMEM;
+-
+-		indr_priv->netdev = netdev;
+-		indr_priv->priv = priv;
+-		list_add(&indr_priv->list, &ppe_offload_indr_priv_list);
+-
+-		block_cb = flow_indr_block_cb_alloc(ppe_offload_indr_setup_block_cb, indr_priv,
+-						     indr_priv, ppe_offload_indr_block_unbind,
+-						     f, netdev, sch, data, priv, cleanup);
+-		if (IS_ERR(block_cb)) {
+-			list_del(&indr_priv->list);
+-			kfree(indr_priv);
+-			return PTR_ERR(block_cb);
+-		}
+-
+-		flow_block_cb_add(block_cb, f);
+-		list_add_tail(&block_cb->driver_list, &ppe_offload_block_cb_list);
+-		return 0;
+-	case FLOW_BLOCK_UNBIND:
+-		indr_priv = ppe_offload_indr_priv_lookup(netdev);
+-		if (!indr_priv)
+-			return -ENOENT;
+-
+-		block_cb = flow_block_cb_lookup(f->block, ppe_offload_indr_setup_block_cb,
+-						 indr_priv);
+-		if (!block_cb)
+-			return -ENOENT;
+-
+-		flow_indr_block_cb_remove(block_cb, f);
+-		list_del(&block_cb->driver_list);
+-		return 0;
+-	default:
+-		return -EOPNOTSUPP;
+-	}
+-}
+-
+-static int ppe_offload_indr_setup_tc_cb(struct net_device *netdev, struct Qdisc *sch,
+-					 void *cb_priv, enum tc_setup_type type,
+-					 void *type_data, void *data,
+-					 void (*cleanup)(struct flow_block_cb *block_cb))
+-{
+-	switch (type) {
+-	case TC_SETUP_BLOCK:
+-		return ppe_offload_indr_setup_tc_block(netdev, sch, cb_priv, type_data,
+-							data, cleanup);
+-	default:
+-		return -EOPNOTSUPP;
+-	}
+-}
+-
+-/* TCP control flags that must never be accelerated.
+- *
+- * nf_flow_rule_match() builds every TCP flow with tcp.flags = 0 masked to
+- * FIN|RST: the flowtable is asking us to accelerate only segments with those
+- * flags clear, so that conntrack still sees the connection close. A PPE flow
+- * entry matches on the 5-tuple alone and cannot express a flag condition, so
+- * the parser-level exceptions programmed below carry it instead -- a segment
+- * carrying one of these flags is redirected to the CPU and de-accelerates its
+- * flow, leaving the software path to finish the teardown.
+- *
+- * SYN is included, beyond what the mask asks for, because it is how a new
+- * connection reusing a still-live 5-tuple announces itself; the software fast
+- * path makes the same check (nf_flow_table_ip.c keys TCP reopen off tcph->syn).
+- * Without it hardware would forward the new connection under the old entry's
+- * translation. The vendor driver programs exactly these three.
+- */
+-static const u8 ppe_offload_tcp_exception_flags[] = {
+-	PPE_TCP_FLAG_FIN,
+-	PPE_TCP_FLAG_SYN,
+-	PPE_TCP_FLAG_RST,
+-};
+-
+-/* Point one parser slot at @flags. Value and mask are set to the same bits, so
+- * hardware hits when those flags are set and ignores the others -- FIN,ACK, the
+- * ordinary way a peer closes, still matches the FIN slot.
+- */
+-static int ppe_offload_tcp_exception_slot(struct ppe_device *ppe_dev,
+-					   unsigned int slot, u8 flags)
+-{
+-	u32 addr, mask, val;
+-
+-	addr = PPE_L4_EXCEPTION_PARSING_CTRL_ADDR +
+-		(slot / 2) * PPE_L4_EXCEPTION_PARSING_CTRL_INC;
++	addr = PPE_L4_EXCEPTION_PARSING_CTRL_ADDR +
++		(slot / 2) * PPE_L4_EXCEPTION_PARSING_CTRL_INC;
+ 
+ 	if (slot % 2) {
+ 		mask = PPE_L4_EXCEPTION_TCP_FLAGS_ODD |
+@@ -2411,6 +2723,8 @@ static bool ppe_offload_tcp_exception_init(struct ppe_device *ppe_dev)
+ 		      PPE_L4_EXCEPTION_TCP_FLAG_SLOTS);
+ 	BUILD_BUG_ON(PPE_L3_EXCEPTION_TCP_FLAGS_0 + PPE_L4_EXCEPTION_TCP_FLAG_SLOTS >
+ 		      PPE_L3_EXCEPTION_ENTRIES);
++	BUILD_BUG_ON(ARRAY_SIZE(ppe_offload_tcp_exception_de_acce) !=
++		     ARRAY_SIZE(ppe_offload_tcp_exception_flags));
+ 
+ 	for (i = 0; i < ARRAY_SIZE(ppe_offload_tcp_exception_flags); i++) {
+ 		ret = ppe_offload_tcp_exception_slot(ppe_dev, i,
+@@ -2418,7 +2732,7 @@ static bool ppe_offload_tcp_exception_init(struct ppe_device *ppe_dev)
+ 		if (!ret)
+ 			ret = ppe_offload_l3_exception_action(ppe_dev,
+ 							      PPE_L3_EXCEPTION_TCP_FLAGS_0 + i,
+-							      true);
++							      ppe_offload_tcp_exception_de_acce[i]);
+ 		if (ret) {
+ 			dev_err(ppe_dev->dev,
+ 				"failed to program TCP exception slot %u: %d\n", i, ret);
+@@ -2469,7 +2783,8 @@ static bool ppe_offload_tcp_exception_init(struct ppe_device *ppe_dev)
+ 			return false;
+ 		}
+ 
+-		ret = ppe_offload_l3_exception_verify(ppe_dev, index, true, "TCP");
++		ret = ppe_offload_l3_exception_verify(ppe_dev, index,
++						      ppe_offload_tcp_exception_de_acce[i], "TCP");
+ 		if (ret)
+ 			return false;
+ 	}
+@@ -2482,27 +2797,48 @@ static bool ppe_offload_tcp_exception_init(struct ppe_device *ppe_dev)
+ 	return false;
+ }
+ 
+-/* Exception codes for a packet the parser could not classify to an L4
+- * 5-tuple the way the software fast path does: the fast path sends any
+- * fragment through the slow path -- full netfilter and reassembly
+- * (nf_flow_table_ip.c). A flow entry matches on the 5-tuple the parser
+- * did find, so without this the first fragment of a datagram would be
+- * forwarded by hardware and the rest reassembled by nobody. Redirected
+- * without de-accelerating: the flow goes on, the odd packet takes the
+- * software path.
++/* Exception codes for a packet the software fast path would not forward
++ * itself (nf_flow_table_ip.c): a fragment, an IPv4 header with options,
++ * a TTL about to expire, and a header that does not parse -- too short,
++ * truncated, a bad total length or header checksum, an L4 header that
++ * does not fit. Software sends those through the slow path (full
++ * netfilter, reassembly, ICMP time exceeded, ip_rcv_options() dropping a
++ * source route) or drops them; a flow entry matches on the 5-tuple the
++ * parser did find, so without these hardware would translate and forward
++ * them on a flow hit. The list is the vendor's for these headers (nss-ppe
++ * ppe_drv_exception.c) plus the fragment one.
++ *
++ * Redirected WITHOUT de-accelerating, unlike the vendor for half of them:
++ * the software fast path punts such a packet and goes on forwarding the
++ * flow, and so does this. De-accelerating would also let any remote peer
++ * of an offloaded download take it out of hardware with one crafted
++ * packet. Only the TCP control flags, which do change the flow's state,
++ * de-accelerate (ppe_offload_tcp_exception_init()).
+  */
+ static const u8 ppe_offload_hdr_exception_codes[] = {
++	PPE_L3_EXCEPTION_UNKNOWN_L2_PROT,
++	PPE_L3_EXCEPTION_IPV4_SMALL_IHL,
++	PPE_L3_EXCEPTION_IPV4_WITH_OPTION,
++	PPE_L3_EXCEPTION_IPV4_HDR_INCOMPLETE,
++	PPE_L3_EXCEPTION_IPV4_BAD_TOTAL_LEN,
++	PPE_L3_EXCEPTION_IPV4_DATA_INCOMPLETE,
+ 	PPE_L3_EXCEPTION_IPV4_FRAG,
++	PPE_L3_EXCEPTION_IPV4_SMALL_TTL,
++	PPE_L3_EXCEPTION_IPV4_CHECKSUM_ERR,
++	PPE_L3_EXCEPTION_TCP_HDR_INCOMPLETE,
++	PPE_L3_EXCEPTION_TCP_SMALL_DATA_OFFSET,
++	PPE_L3_EXCEPTION_UDP_HDR_INCOMPLETE,
++	PPE_L3_EXCEPTION_UDP_LITE_HDR_INCOMPLETE,
+ };
+ 
+ /**
+- * ppe_offload_hdr_exception_init() - Program the fragment exception.
++ * ppe_offload_hdr_exception_init() - Program the header exceptions.
+  * @ppe_dev: PPE device.
+  *
+- * Return: true if it was programmed and read back, false otherwise.
++ * Return: true if every one was programmed and read back, false otherwise.
+  *
+  * As with the TCP exceptions, failure is not fatal: flows are then
+- * declined, since the parser would forward what software reassembles.
++ * declined, since hardware would forward what software punts or drops.
+  */
+ static bool ppe_offload_hdr_exception_init(struct ppe_device *ppe_dev)
+ {
+@@ -2529,7 +2865,7 @@ static bool ppe_offload_hdr_exception_init(struct ppe_device *ppe_dev)
+ 			return false;
+ 	}
+ 
+-	dev_dbg(ppe_dev->dev, "fragment exception programmed and verified\n");
++	dev_dbg(ppe_dev->dev, "header exceptions programmed and verified\n");
+ 	return true;
+ }
+ 
+@@ -2549,6 +2885,9 @@ int ppe_offload_init(struct ppe_device *ppe_dev)
+ 		return -ENOMEM;
+ 
+ 	priv->ppe_dev = ppe_dev;
++	INIT_LIST_HEAD(&priv->flows);
++	INIT_LIST_HEAD(&priv->binds);
++	INIT_WORK(&priv->trip_work, ppe_offload_trip_work);
+ 	ppe_host_pool_init(&priv->host_pool);
+ 	ppe_nexthop_pool_init(&priv->nexthop_pool);
+ 	ppe_pub_ip_pool_init(&priv->pub_ip_pool);
+@@ -2572,62 +2911,721 @@ int ppe_offload_init(struct ppe_device *ppe_dev)
+ 		return ret;
+ 	}
+ 
+-	ret = flow_indr_dev_register(ppe_offload_indr_setup_tc_cb, priv);
+-	if (ret) {
+-		ppe_offload_fdb_follow_exit(priv);
+-		rhashtable_destroy(&priv->flow_table);
++	ppe_dev->offload = priv;
++
++	return 0;
++}
++
++/* Save @words consecutive registers from @addr as one snapshot entry, to be
++ * written back by ppe_offload_snap_restore(). Under priv->lock.
++ */
++static int ppe_offload_snap_save(struct ppe_offload_priv *priv, u32 addr,
++				 unsigned int words)
++{
++	struct ppe_offload_snap *snap;
++	int ret;
++
++	if (WARN_ON_ONCE(!words || words > PPE_OFFLOAD_SNAP_WORDS ||
++			 priv->snap_num >= PPE_OFFLOAD_SNAP_MAX))
++		return -ENOSPC;
++
++	snap = &priv->snap[priv->snap_num];
++	ret = regmap_bulk_read(priv->ppe_dev->regmap, addr, snap->val, words);
++	if (ret)
++		return ret;
++
++	snap->addr = addr;
++	snap->words = words;
++	memset(snap->mask, 0xff, sizeof(snap->mask));
++	priv->snap_num++;
++
++	return 0;
++}
++
++/* Save the entry at @addr, @words words, of which only the @mask bits of
++ * the first word are to be restored. Under priv->lock, and under RTNL when
++ * the other bits are a port's MTU (ppe_port_set_maxframe() runs under it).
++ */
++static int ppe_offload_snap_save_masked(struct ppe_offload_priv *priv, u32 addr,
++					unsigned int words, u32 mask)
++{
++	struct ppe_offload_snap *snap;
++	int ret;
++
++	ret = ppe_offload_snap_save(priv, addr, words);
++	if (ret)
+ 		return ret;
++
++	snap = &priv->snap[priv->snap_num - 1];
++	memset(snap->mask, 0, sizeof(snap->mask));
++	snap->mask[0] = mask;
++
++	return 0;
++}
++
++/* Write every saved register back, the last saved first, each entry's
++ * words in their own order, the bits not saved as they are now, and read
++ * them back. A register that does not read back as saved latches
++ * priv->degraded. Under priv->lock.
++ */
++static void ppe_offload_snap_restore(struct ppe_offload_priv *priv)
++{
++	struct regmap *regmap = priv->ppe_dev->regmap;
++	u32 back[PPE_OFFLOAD_SNAP_WORDS];
++	unsigned int bad = 0;
++
++	while (priv->snap_num) {
++		struct ppe_offload_snap *snap = &priv->snap[--priv->snap_num];
++		u32 want[PPE_OFFLOAD_SNAP_WORDS];
++		unsigned int i;
++		bool ok;
++
++		/* The bits not saved are taken as they are now. */
++		ok = !regmap_bulk_read(regmap, snap->addr, back, snap->words);
++		for (i = 0; ok && i < snap->words; i++)
++			want[i] = (back[i] & ~snap->mask[i]) | (snap->val[i] & snap->mask[i]);
++		ok = ok && !regmap_bulk_write(regmap, snap->addr, want, snap->words) &&
++		     !regmap_bulk_read(regmap, snap->addr, back, snap->words) &&
++		     !memcmp(back, want, snap->words * sizeof(u32));
++		if (!ok) {
++			pr_err("ppe_offload: restoring %u word(s) at %#x failed\n",
++			       snap->words, snap->addr);
++			bad++;
++		}
+ 	}
+ 
+-	ppe_dev->offload = priv;
++	if (bad) {
++		priv->degraded = true;
++		pr_err("ppe_offload: %u register restore(s) failed, offload stays off; reboot to get the reset state back\n",
++		       bad);
++	}
++}
++
++/* The exception registers ppe_offload_tcp_exception_init() and
++ * ppe_offload_hdr_exception_init() change, for one exception code.
++ */
++static int ppe_offload_snap_exception(struct ppe_offload_priv *priv, u32 code)
++{
++	int ret;
++
++	ret = ppe_offload_snap_save(priv, PPE_L3_EXCEPTION_CMD_ADDR +
++				    code * PPE_L3_EXCEPTION_CMD_INC, 1);
++	if (!ret)
++		ret = ppe_offload_snap_save(priv, PPE_L3_EXP_L3_FLOW_CTRL_ADDR +
++					    code * PPE_L3_EXP_L3_FLOW_CTRL_INC, 1);
++	if (!ret)
++		ret = ppe_offload_snap_save(priv, PPE_L3_FLOW_HIT_EXP_CTRL_ADDR +
++					    code * PPE_L3_FLOW_HIT_EXP_CTRL_INC, 1);
++	if (!ret)
++		ret = ppe_offload_snap_save(priv, PPE_L3_FLOW_HIT_MISS_EXP_CTRL_ADDR +
++					    code * PPE_L3_FLOW_HIT_MISS_EXP_CTRL_INC, 1);
++
++	return ret;
++}
++
++static int ppe_offload_snap_exceptions(struct ppe_offload_priv *priv)
++{
++	unsigned int i;
++	int ret;
++
++	/* The TCP flag slots in use, two to a parser register. */
++	for (i = 0; i < DIV_ROUND_UP(ARRAY_SIZE(ppe_offload_tcp_exception_flags), 2); i++) {
++		ret = ppe_offload_snap_save(priv, PPE_L4_EXCEPTION_PARSING_CTRL_ADDR +
++					    i * PPE_L4_EXCEPTION_PARSING_CTRL_INC, 1);
++		if (ret)
++			return ret;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(ppe_offload_tcp_exception_flags); i++) {
++		ret = ppe_offload_snap_exception(priv, PPE_L3_EXCEPTION_TCP_FLAGS_0 + i);
++		if (ret)
++			return ret;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(ppe_offload_hdr_exception_codes); i++) {
++		ret = ppe_offload_snap_exception(priv, ppe_offload_hdr_exception_codes[i]);
++		if (ret)
++			return ret;
++	}
+ 
+ 	return 0;
+ }
+ 
++/* Save the L3 interface entries edma_port_l3_if_program() writes for one
++ * EDMA port: its ingress and egress L3 interface, its MY_MAC entry and
++ * its L3_VP_PORT binding (restored last word last: it latches there).
++ */
++static int ppe_offload_snap_port(struct net_device *netdev, void *arg)
++{
++	struct edma_port_priv *port_priv = netdev_priv(netdev);
++	u32 l3_if = port_priv->l3_if_index, port = port_priv->ppe_port->port_id;
++	struct ppe_offload_priv *priv = arg;
++	int ret;
++
++	if (!l3_if || l3_if > PPE_MY_MAC_TBL_ENTRIES || port >= PPE_L3_VP_PORT_TBL_ENTRIES)
++		return -ERANGE;
++
++	ret = ppe_offload_snap_save(priv, PPE_IN_L3_IF_TBL_ADDR + l3_if * PPE_IN_L3_IF_TBL_INC,
++				    PPE_IN_L3_IF_TBL_WORDS);
++	if (!ret)
++		ret = ppe_offload_snap_save(priv, PPE_EG_L3_IF_TBL_ADDR +
++					    l3_if * PPE_EG_L3_IF_TBL_INC,
++					    PPE_EG_L3_IF_TBL_WORDS);
++	if (!ret)
++		ret = ppe_offload_snap_save(priv, PPE_MY_MAC_TBL_ADDR +
++					    (l3_if - 1) * PPE_MY_MAC_TBL_INC,
++					    PPE_MY_MAC_TBL_WORDS);
++	if (!ret)
++		ret = ppe_offload_snap_save(priv, PPE_L3_VP_PORT_TBL_ADDR +
++					    port * PPE_L3_VP_PORT_TBL_INC,
++					    PPE_L3_VP_PORT_TBL_WORDS);
++	if (!ret)
++		ret = ppe_offload_snap_save_masked(priv, PPE_MRU_MTU_CTRL_TBL_ADDR +
++						   port * PPE_MRU_MTU_CTRL_TBL_INC,
++						   PPE_OFFLOAD_MRU_MTU_WORDS,
++						   PPE_MRU_MTU_CTRL_W0_MTU_CMD);
++
++	return ret;
++}
++
++/* While offload is on, a frame too big for its egress port goes to the CPU
++ * instead of being dropped (the PPE's setup drops it): what the PPE inserts
++ * itself (a VLAN tag, a switch's head tag) can take a full-size frame past
++ * the port's MTU at zero margin, and a drop there would come after the
++ * flow hit, out of sight of every check. Only the command is changed; the
++ * port's MTU stays the port's. Under RTNL, which MTU changes hold.
++ */
++static int ppe_offload_mtu_cmd_port(struct net_device *netdev, void *arg)
++{
++	struct edma_port_priv *port_priv = netdev_priv(netdev);
++	struct regmap *regmap = port_priv->ppe_port->ppe_dev->regmap;
++	u32 reg = PPE_MRU_MTU_CTRL_TBL_ADDR +
++		  port_priv->ppe_port->port_id * PPE_MRU_MTU_CTRL_TBL_INC;
++	u32 val[PPE_OFFLOAD_MRU_MTU_WORDS];
++	int ret;
++
++	ASSERT_RTNL();
++
++	ret = regmap_bulk_read(regmap, reg, val, ARRAY_SIZE(val));
++	if (ret)
++		return ret;
++	val[0] = (val[0] & ~PPE_MRU_MTU_CTRL_W0_MTU_CMD) |
++		 FIELD_PREP(PPE_MRU_MTU_CTRL_W0_MTU_CMD, PPE_ACTION_REDIRECT_TO_CPU);
++	ret = regmap_bulk_write(regmap, reg, val, ARRAY_SIZE(val));
++	if (!ret)
++		ret = regmap_bulk_read(regmap, reg, val, ARRAY_SIZE(val));
++	if (!ret && FIELD_GET(PPE_MRU_MTU_CTRL_W0_MTU_CMD, val[0]) != PPE_ACTION_REDIRECT_TO_CPU)
++		ret = -EIO;
++	if (ret)
++		netdev_err(netdev, "ppe_offload: port MTU command not set: %d\n", ret);
++
++	return ret;
++}
++
++static int ppe_offload_program_port(struct net_device *netdev, void *arg)
++{
++	int ret;
++
++	ret = edma_port_l3_if_program(netdev);
++	if (!ret)
++		ret = ppe_offload_mtu_cmd_port(netdev, arg);
++
++	return ret;
++}
++
++/* Delete the hardware entry at @index and check that its slot reads back
++ * invalid (the table is readable at its own address, as the vendor's
++ * IN_FLOW_TBL; measured on a GL-BE9300 by Kamil Bienkiewicz's IPv6
++ * entry self-test). Under priv->lock.
++ */
++static int ppe_offload_index_del(struct ppe_offload_priv *priv, u32 index)
++{
++	u32 word0;
++	int ret;
++
++	ret = ppe_flow_entry_del(priv->ppe_dev, index);
++	if (!ret)
++		ret = regmap_read(priv->ppe_dev->regmap, PPE_IN_FLOW_TBL_ADDR +
++				  index * PPE_IN_FLOW_TBL_INC, &word0);
++	if (!ret && (word0 & PPE_FLOW_TBL_VALID))
++		ret = -EIO;
++
++	return ret;
++}
++
++static int ppe_offload_flow_hw_del(struct ppe_offload_priv *priv,
++				   struct ppe_offload_flow_entry *entry)
++{
++	return ppe_offload_index_del(priv, entry->flow_index);
++}
++
++/* @entry's hardware entry could not be deleted and may still forward: no
++ * new flow from now on. Counted and logged once each time the entry
++ * becomes stuck; a withdraw leaves it alone while it is, while a DESTROY,
++ * an unbind, disable and a re-point retry the delete. Under priv->lock.
++ */
++static void ppe_offload_flow_stuck(struct ppe_offload_priv *priv,
++				   struct ppe_offload_flow_entry *entry, int err)
++{
++	priv->degraded = true;
++	if (entry->stuck)
++		return;
++	entry->stuck = true;
++	atomic_long_inc(&priv->counters.stuck);
++	pr_err("ppe_offload: flow entry %u could not be deleted: %d; new flows declined, disable and reboot\n",
++	       entry->flow_index, err);
++}
++
++/* Drop a tracked flow: delete its hardware entry, if it still owns one,
++ * then let go of what it points at. A flow whose entry cannot be deleted
++ * stays tracked, with everything it points at, and latches priv->degraded:
++ * hardware is not doing what it is told, so no further flow is accepted.
++ * Under priv->lock.
++ *
++ * Return: 0 if dropped, a negative error code (logged) if not.
++ */
++static int ppe_offload_flow_drop(struct ppe_offload_priv *priv,
++				 struct ppe_offload_flow_entry *entry)
++{
++	int ret;
++
++	if (entry->flow_valid) {
++		ret = ppe_offload_flow_hw_del(priv, entry);
++		if (ret)
++			ret = ppe_offload_flow_hw_del(priv, entry);
++		if (ret) {
++			ppe_offload_flow_stuck(priv, entry, ret);
++			return ret;
++		}
++	}
++
++	ppe_offload_flow_forget(priv, entry);
++
++	return 0;
++}
++
++/* Drop every tracked flow and the hardware entries it owns. A flow whose
++ * hardware entry cannot be deleted stays tracked, with the nexthop, host
++ * and public IP entries it points at. Under priv->lock.
++ *
++ * Return: the number of flows that could not be dropped, those at an
++ * unknown index (@flows_lost) included.
++ */
++static unsigned int ppe_offload_flush(struct ppe_offload_priv *priv, unsigned int *dropped)
++{
++	struct ppe_offload_flow_entry *entry, *tmp;
++	unsigned int stuck = 0;
++
++	*dropped = 0;
++	list_for_each_entry_safe(entry, tmp, &priv->flows, list) {
++		if (ppe_offload_flow_drop(priv, entry))
++			stuck++;
++		else
++			(*dropped)++;
++	}
++
++	return stuck + priv->flows_lost;
++}
++
++/* Whether the L3 routing failures flow offload relies on reach the CPU:
++ * a flow's source interface not matching (SRC_L3_IF), an MRU or MTU
++ * failure on an L3 interface, and a flow's PMTU failure. They are left as
++ * the PPE resets them (redirect); were any set otherwise, hardware would
++ * forward or drop what software has to see, so offload stays off.
++ */
++static bool ppe_offload_route_ctrl_ok(struct ppe_device *ppe_dev)
++{
++	const u32 cpu = PPE_L3_EXCEPTION_REDIRECT_TO_CPU;
++	u32 ctrl, ext;
++
++	if (regmap_read(ppe_dev->regmap, PPE_L3_ROUTE_CTRL_ADDR, &ctrl) ||
++	    regmap_read(ppe_dev->regmap, PPE_L3_ROUTE_CTRL_EXT_ADDR, &ext))
++		return false;
++
++	if (FIELD_GET(PPE_L3_ROUTE_CTRL_IP_MRU_CHECK_FAIL, ctrl) != cpu ||
++	    FIELD_GET(PPE_L3_ROUTE_CTRL_IP_MTU_FAIL, ctrl) != cpu ||
++	    FIELD_GET(PPE_L3_ROUTE_CTRL_IP_MTU_DF_FAIL, ctrl) != cpu ||
++	    FIELD_GET(PPE_L3_ROUTE_CTRL_FLOW_SRC_IF_CHECK_CMD, ctrl) != cpu ||
++	    FIELD_GET(PPE_L3_ROUTE_CTRL_EXT_FLOW_PMTU_FAIL, ext) != cpu ||
++	    FIELD_GET(PPE_L3_ROUTE_CTRL_EXT_FLOW_PMTU_DF_FAIL, ext) != cpu) {
++		pr_err("ppe_offload: L3 route control %#x/%#x does not send routing failures to the CPU\n",
++		       ctrl, ext);
++		return false;
++	}
++
++	return true;
++}
++
++/* Turn flow offload on. Under RTNL, which ports change their MAC address
++ * and MTU under, and which serializes this against disable.
++ *
++ * Return: 0 when flows are now accepted, a negative error code otherwise
++ * (everything it wrote is then written back).
++ */
++static int ppe_offload_enable(struct ppe_offload_priv *priv)
++{
++	struct ppe_device *ppe_dev = priv->ppe_dev;
++	int ret = 0;
++
++	ASSERT_RTNL();
++
++	mutex_lock(&priv->lock);
++
++	if (priv->enabled)
++		goto unlock;
++
++	if (priv->degraded) {
++		pr_err("ppe_offload: not enabled: an earlier disable left hardware state behind, reboot first\n");
++		ret = -EIO;
++		goto unlock;
++	}
++
++	if (!ppe_offload_route_ctrl_ok(ppe_dev)) {
++		ret = -EIO;
++		goto unlock;
++	}
++
++	/* Every entry enabling may save: the TCP flag parser words, four
++	 * words per exception code, and five per port.
++	 */
++	BUILD_BUG_ON(DIV_ROUND_UP(ARRAY_SIZE(ppe_offload_tcp_exception_flags), 2) +
++		     4 * (ARRAY_SIZE(ppe_offload_tcp_exception_flags) +
++			  ARRAY_SIZE(ppe_offload_hdr_exception_codes)) +
++		     5 * PPE_OFFLOAD_PORTS_MAX > PPE_OFFLOAD_SNAP_MAX);
++
++	priv->snap_num = 0;
++	ret = ppe_offload_snap_exceptions(priv);
++	if (!ret)
++		ret = edma_port_for_each_netdev(ppe_offload_snap_port, priv);
++	if (ret) {
++		/* Nothing was written yet. */
++		priv->snap_num = 0;
++		pr_err("ppe_offload: not enabled: saving the registers it changes failed: %d\n",
++		       ret);
++		goto unlock;
++	}
++
++	priv->tcp_exceptions_ok = ppe_offload_tcp_exception_init(ppe_dev);
++	priv->hdr_exceptions_ok = ppe_offload_hdr_exception_init(ppe_dev);
++
++	ret = edma_port_for_each_netdev(ppe_offload_program_port, NULL);
++	if (ret) {
++		ppe_offload_snap_restore(priv);
++		priv->tcp_exceptions_ok = false;
++		priv->hdr_exceptions_ok = false;
++		pr_err("ppe_offload: not enabled: programming the port L3 interfaces failed: %d\n",
++		       ret);
++		goto unlock;
++	}
++
++	priv->tripped = false;
++	priv->rearm_count = 0;
++	WRITE_ONCE(priv->enabled, true);
++	pr_info("ppe_offload: enabled: TCP exceptions %s, header exceptions %s\n",
++		priv->tcp_exceptions_ok ? "ok" : "FAILED (TCP declined)",
++		priv->hdr_exceptions_ok ? "ok" : "FAILED (all flows declined)");
++
++unlock:
++	mutex_unlock(&priv->lock);
++
++	return ret;
++}
++
++/* Turn flow offload off: decline from now on, delete every hardware entry
++ * this code owns and write the saved registers back. Under RTNL.
++ */
++static void ppe_offload_disable(struct ppe_offload_priv *priv)
++{
++	unsigned int flows, stuck;
++
++	ASSERT_RTNL();
++
++	mutex_lock(&priv->lock);
++
++	if (!priv->enabled) {
++		mutex_unlock(&priv->lock);
++		return;
++	}
++
++	WRITE_ONCE(priv->enabled, false);
++	stuck = ppe_offload_flush(priv, &flows);
++	if (stuck) {
++		/* Those entries may still forward: keep everything they
++		 * rely on (exceptions, port L3 interfaces) as programmed.
++		 */
++		priv->degraded = true;
++		mutex_unlock(&priv->lock);
++		pr_err("ppe_offload: disable incomplete: %u flow entr%s still in hardware, its state kept; offload stays off, reboot to recover\n",
++		       stuck, stuck == 1 ? "y" : "ies");
++		return;
++	}
++	ppe_offload_snap_restore(priv);
++	priv->tcp_exceptions_ok = false;
++	priv->hdr_exceptions_ok = false;
++
++	mutex_unlock(&priv->lock);
++
++	pr_info("ppe_offload: disabled: %u flow(s) back to the software path\n", flows);
++}
++
++/* What the driver tracks, from its own memory only: no register is read,
++ * so this is safe to look at under load. The packet and byte counts are
++ * those of the last statistics request from the flowtable.
++ */
++static int ppe_offload_flows_show(struct seq_file *m, void *v)
++{
++	struct ppe_offload_priv *priv = m->private;
++	struct ppe_offload_flow_entry *entry;
++	unsigned int n = 0;
++
++	mutex_lock(&priv->lock);
++
++	seq_printf(m, "enabled %d degraded %d tripped %d\n",
++		   priv->enabled, priv->degraded, priv->tripped);
++	seq_printf(m, "accepted %ld declined %ld rearmed_superseded %ld rearmed_invalid %ld rearmed_deacce %ld withdrawn %ld unbound %ld stuck %ld\n",
++		   atomic_long_read(&priv->counters.accepted),
++		   atomic_long_read(&priv->counters.declined),
++		   atomic_long_read(&priv->counters.rearmed_superseded),
++		   atomic_long_read(&priv->counters.rearmed_invalid),
++		   atomic_long_read(&priv->counters.rearmed_deacce),
++		   atomic_long_read(&priv->counters.withdrawn),
++		   atomic_long_read(&priv->counters.unbound),
++		   atomic_long_read(&priv->counters.stuck));
++
++	list_for_each_entry(entry, &priv->flows, list) {
++		seq_printf(m, "flow %u: valid %d nexthop %u host %u dsa_port %u packets %llu bytes %llu idle %ums\n",
++			   entry->flow_index, entry->flow_valid, entry->nexthop_index,
++			   entry->host_index,
++			   entry->dsa_fixed ? entry->dsa_index : 0,
++			   entry->stats_packets, entry->stats_bytes,
++			   jiffies_to_msecs(jiffies - entry->lastused));
++		n++;
++	}
++	seq_printf(m, "%u flow(s)\n", n);
++
++	mutex_unlock(&priv->lock);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(ppe_offload_flows);
++
++/* The first two words of every tracked flow's hardware entry: VALID and
++ * DE_ACCE. This reads registers, one pair per flow: for the bench, at
++ * idle, never under load.
++ */
++static int ppe_offload_flows_hw_show(struct seq_file *m, void *v)
++{
++	struct ppe_offload_priv *priv = m->private;
++	struct ppe_offload_flow_entry *entry;
++	u32 words[2];
++
++	mutex_lock(&priv->lock);
++	list_for_each_entry(entry, &priv->flows, list) {
++		if (!entry->flow_valid) {
++			seq_printf(m, "flow %u: superseded\n", entry->flow_index);
++			continue;
++		}
++		if (regmap_bulk_read(priv->ppe_dev->regmap, PPE_IN_FLOW_TBL_ADDR +
++				     entry->flow_index * PPE_IN_FLOW_TBL_INC, words,
++				     ARRAY_SIZE(words))) {
++			seq_printf(m, "flow %u: read failed\n", entry->flow_index);
++			continue;
++		}
++		seq_printf(m, "flow %u: valid %d de_acce %d words %08x %08x\n", entry->flow_index,
++			   !!(words[0] & PPE_FLOW_TBL_VALID), !!(words[1] & PPE_FLOW_TBL_DE_ACCE),
++			   words[0], words[1]);
++	}
++	mutex_unlock(&priv->lock);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(ppe_offload_flows_hw);
++
++/* The PPE whose offload the parameter switches: one per SoC. Set by
++ * ppe_offload_start() and cleared by ppe_offload_stop(), under
++ * ppe_offload_param_lock, which also orders parameter writes.
++ */
++static struct ppe_offload_priv *ppe_offload_instance;
++static bool ppe_offload_param;
++static DEFINE_MUTEX(ppe_offload_param_lock);
++
++static int ppe_offload_param_set(const char *val, const struct kernel_param *kp)
++{
++	bool on;
++	int ret;
++
++	ret = kstrtobool(val, &on);
++	if (ret)
++		return ret;
++
++	mutex_lock(&ppe_offload_param_lock);
++	if (ppe_offload_instance) {
++		rtnl_lock();
++		if (on)
++			ret = ppe_offload_enable(ppe_offload_instance);
++		else
++			ppe_offload_disable(ppe_offload_instance);
++		rtnl_unlock();
++	}
++	if (!ret)
++		WRITE_ONCE(ppe_offload_param, on);
++	mutex_unlock(&ppe_offload_param_lock);
++
++	return ret;
++}
++
++static int ppe_offload_param_get(char *buffer, const struct kernel_param *kp)
++{
++	return sysfs_emit(buffer, "%c\n", READ_ONCE(ppe_offload_param) ? 'Y' : 'N');
++}
++
++static const struct kernel_param_ops ppe_offload_param_ops = {
++	.set = ppe_offload_param_set,
++	.get = ppe_offload_param_get,
++};
++
++module_param_cb(flow_offload, &ppe_offload_param_ops, NULL, 0644);
++
++/* Offload tripped (ppe_offload_rearm_trip()): turn it off as writing 0 to
++ * the parameter would, unless it was stopped meanwhile.
++ */
++static void ppe_offload_trip_work(struct work_struct *work)
++{
++	struct ppe_offload_priv *priv = container_of(work, struct ppe_offload_priv, trip_work);
++	bool tripped;
++
++	mutex_lock(&ppe_offload_param_lock);
++	if (ppe_offload_instance == priv) {
++		rtnl_lock();
++		/* Not if offload was disabled and enabled again meanwhile:
++		 * enabling clears it, and the parameter lock and RTNL keep it
++		 * from changing again until the disable below.
++		 */
++		mutex_lock(&priv->lock);
++		tripped = priv->tripped;
++		mutex_unlock(&priv->lock);
++		if (tripped) {
++			ppe_offload_disable(priv);
++			WRITE_ONCE(ppe_offload_param, false);
++		}
++		rtnl_unlock();
++	}
++	mutex_unlock(&ppe_offload_param_lock);
++}
++MODULE_PARM_DESC(flow_offload,
++		 "Offload nftables flowtable flows to the PPE (default N; writable at runtime)");
++
++/**
++ * ppe_offload_enabled() - Whether flow offload is on.
++ * @ppe_dev: PPE device.
++ *
++ * Stable under RTNL, which enabling and disabling hold.
++ *
++ * Return: true while flows are accepted and the port L3 interfaces are
++ * programmed.
++ */
++bool ppe_offload_enabled(const struct ppe_device *ppe_dev)
++{
++	return ppe_dev->offload && READ_ONCE(ppe_dev->offload->enabled);
++}
++
+ /**
+- * ppe_offload_hw_init() - Program the offload settings that need live hardware.
++ * ppe_offload_start() - Make offload switchable, and switch it on if asked.
+  * @ppe_dev: PPE device.
+  *
+- * Split out of ppe_offload_init() because that runs before
+- * ppe_clock_init_and_reset() and ppe_hw_config(): at that point the PPE is
+- * still unclocked and held in reset, register writes do not stick, and reads
+- * come back as reset-state junk. Must be called after ppe_hw_config().
++ * Called at the end of probe, with the EDMA ports registered.
++ */
++void ppe_offload_start(struct ppe_device *ppe_dev)
++{
++	struct ppe_offload_priv *priv = ppe_dev->offload;
++
++	if (!priv)
++		return;
++
++	if (ppe_dev->debugfs_root) {
++		priv->flows_dentry = debugfs_create_file("offload_flows", 0400,
++							 ppe_dev->debugfs_root, priv,
++							 &ppe_offload_flows_fops);
++		priv->flows_hw_dentry = debugfs_create_file("offload_flows_hw", 0400,
++							    ppe_dev->debugfs_root, priv,
++							    &ppe_offload_flows_hw_fops);
++	}
++
++	mutex_lock(&ppe_offload_param_lock);
++	rtnl_lock();
++	ppe_offload_instance = priv;
++	if (ppe_offload_param && ppe_offload_enable(priv))
++		WRITE_ONCE(ppe_offload_param, false);
++	rtnl_unlock();
++	mutex_unlock(&ppe_offload_param_lock);
++}
++
++/**
++ * ppe_offload_stop() - Switch offload off for good.
++ * @ppe_dev: PPE device.
+  *
+- * Nothing here is fatal to probe. Until it runs, @tcp_exceptions_ok and
+- * @hdr_exceptions_ok are false (the priv is zero-allocated), so every flow
+- * keeps being declined -- and no traffic can reach the offload path before
+- * edma_setup() brings the netdevs up anyway.
++ * Called first thing on remove, while the EDMA ports still exist.
+  */
+-void ppe_offload_hw_init(struct ppe_device *ppe_dev)
++void ppe_offload_stop(struct ppe_device *ppe_dev)
+ {
+ 	struct ppe_offload_priv *priv = ppe_dev->offload;
+ 
+ 	if (!priv)
+ 		return;
+ 
+-	priv->tcp_exceptions_ok = ppe_offload_tcp_exception_init(ppe_dev);
+-	priv->hdr_exceptions_ok = ppe_offload_hdr_exception_init(ppe_dev);
++	debugfs_remove(priv->flows_dentry);
++	priv->flows_dentry = NULL;
++	debugfs_remove(priv->flows_hw_dentry);
++	priv->flows_hw_dentry = NULL;
++
++	mutex_lock(&ppe_offload_param_lock);
++	rtnl_lock();
++	ppe_offload_disable(priv);
++	if (ppe_offload_instance == priv)
++		ppe_offload_instance = NULL;
++	rtnl_unlock();
++	mutex_unlock(&ppe_offload_param_lock);
++
++	/* Disabled and no longer the instance: no flow is offered, so the
++	 * trip cannot be queued again (and finds no instance if it was).
++	 * Only then is it waited for, outside the locks it takes.
++	 */
++	cancel_work_sync(&priv->trip_work);
+ }
+ 
+-/* Free one tracked flow during teardown, removing whatever it still owns in
+- * hardware first. Called with no concurrent users: the indirect block callback
+- * is already unregistered.
++/* Free every tracked flow during teardown, those kept in no hash table
++ * after a failed add included: delete its hardware entry, read back, and
++ * only then let go of what it points at. Called with no concurrent users:
++ * offload is off, and the block callbacks went with the ports.
++ *
++ * Return: the flows whose entry could not be deleted, those at an unknown
++ * index (priv->flows_lost) included; what they point at is left as it is.
+  */
+-static void ppe_offload_flow_free_fn(void *ptr, void *arg)
++static unsigned int ppe_offload_flows_free(struct ppe_offload_priv *priv)
+ {
+-	struct ppe_offload_flow_entry *entry = ptr;
+-	struct ppe_offload_priv *priv = arg;
++	struct ppe_offload_flow_entry *entry, *tmp;
++	unsigned int stuck = priv->flows_lost;
+ 
+-	if (entry->dsa_fixed)
+-		hash_del(&entry->dsa_fixed_hnode);
+-	ppe_offload_flow_disown(priv, entry);
+-	if (entry->flow_valid)
+-		ppe_flow_entry_del(priv->ppe_dev, entry->flow_index);
+-	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, entry->host_index);
+-	ppe_nexthop_pool_deref(priv->ppe_dev, &priv->nexthop_pool, entry->nexthop_index);
+-	if (entry->pub_ip_valid)
+-		ppe_pub_ip_pool_deref(priv->ppe_dev, &priv->pub_ip_pool, entry->pub_ip_index);
+-	kfree(entry);
++	mutex_lock(&priv->lock);
++	list_for_each_entry_safe(entry, tmp, &priv->flows, list) {
++		if (!entry->flow_valid || !ppe_offload_index_del(priv, entry->flow_index)) {
++			ppe_offload_flow_forget(priv, entry);
++			continue;
++		}
++		stuck++;
++		rhashtable_remove_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
++		list_del(&entry->list);
++		if (entry->dsa_fixed) {
++			spin_lock_bh(&priv->dsa_fixed_lock);
++			hash_del(&entry->dsa_fixed_hnode);
++			spin_unlock_bh(&priv->dsa_fixed_lock);
++		}
++		ppe_offload_flow_disown(priv, entry);
++		kfree(entry);
++	}
++	mutex_unlock(&priv->lock);
++
++	return stuck;
+ }
+ 
+ /**
+@@ -2637,22 +3635,28 @@ static void ppe_offload_flow_free_fn(void *ptr, void *arg)
+ void ppe_offload_destroy(struct ppe_device *ppe_dev)
+ {
+ 	struct ppe_offload_priv *priv = ppe_dev->offload;
++	unsigned int stuck;
+ 
+ 	if (!priv)
+ 		return;
+ 
+-	flow_indr_dev_unregister(ppe_offload_indr_setup_tc_cb, priv,
+-				  ppe_offload_indr_block_unbind);
+ 	/* No more moves once the flows below start going away. */
+ 	ppe_offload_fdb_follow_exit(priv);
+-	/* Free the tracked flows AND tear down the hardware entries they own.
+-	 * rhashtable_destroy() would leak every entry and leave hardware still
+-	 * forwarding for them -- and the pools torn down just below would then
+-	 * be zeroed underneath those still-programmed entries.
++	/* Free the tracked flows AND tear down the hardware entries they own:
++	 * rhashtable_destroy() alone would leak every entry and leave hardware
++	 * still forwarding for them. The pools are zeroed and freed only when
++	 * no entry may still forward through them; otherwise they stay as
++	 * hardware has them.
+ 	 */
+-	rhashtable_free_and_destroy(&priv->flow_table, ppe_offload_flow_free_fn, priv);
+-	ppe_pub_ip_pool_destroy(ppe_dev, &priv->pub_ip_pool);
+-	ppe_nexthop_pool_destroy(ppe_dev, &priv->nexthop_pool);
+-	ppe_host_pool_destroy(ppe_dev, &priv->host_pool);
++	stuck = ppe_offload_flows_free(priv);
++	rhashtable_destroy(&priv->flow_table);
++	if (stuck) {
++		pr_err("ppe_offload: %u flow entr%s could not be deleted at unload: the entries they point at are left as they are, reboot to recover\n",
++		       stuck, stuck == 1 ? "y" : "ies");
++	} else {
++		ppe_pub_ip_pool_destroy(ppe_dev, &priv->pub_ip_pool);
++		ppe_nexthop_pool_destroy(ppe_dev, &priv->nexthop_pool);
++		ppe_host_pool_destroy(ppe_dev, &priv->host_pool);
++	}
+ 	ppe_dev->offload = NULL;
+ }
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.h
+@@ -12,8 +12,10 @@ struct net_device;
+ enum tc_setup_type;
+ 
+ int ppe_offload_init(struct ppe_device *ppe_dev);
+-void ppe_offload_hw_init(struct ppe_device *ppe_dev);
++void ppe_offload_start(struct ppe_device *ppe_dev);
++void ppe_offload_stop(struct ppe_device *ppe_dev);
+ void ppe_offload_destroy(struct ppe_device *ppe_dev);
++bool ppe_offload_enabled(const struct ppe_device *ppe_dev);
+ 
+ int ppe_offload_setup_tc(struct net_device *netdev, enum tc_setup_type type,
+ 			  void *type_data);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -1253,6 +1253,7 @@
+ #define PPE_MY_MAC_TBL_ADDR			0x200000
+ #define PPE_MY_MAC_TBL_ENTRIES			8
+ #define PPE_MY_MAC_TBL_INC			0x8
++#define PPE_MY_MAC_TBL_WORDS			2
+ 
+ /* Word 0 (MAC_DA_0) is a single whole-word value, no bitfield mask. */
+ 
+@@ -1328,6 +1329,7 @@
+ #define PPE_EG_L3_IF_TBL_ADDR			0x023000
+ #define PPE_EG_L3_IF_TBL_ENTRIES		256
+ #define PPE_EG_L3_IF_TBL_INC			0x10
++#define PPE_EG_L3_IF_TBL_WORDS			3
+ 
+ /* Word 0 (MAC_ADDR_0) is a single whole-word value, no bitfield mask. */
+ 
+@@ -1363,7 +1365,8 @@
+ /* The flow table itself, as hardware lays it out in the IPE L3 block:
+  * vendor IPE_L3_BASE_ADDR (0x200000) + IN_FLOW_TBL_ADDRESS (0x40000), one
+  * 0x20-byte slot per index; a two-slot IPv6 entry starts at an even index.
+- * Written through the table op only.
++ * Written through the table op only; VALID and DE_ACCE are read directly
++ * (ppe_offload_flow_stale()).
+  */
+ #define PPE_IN_FLOW_TBL_ADDR			0x240000
+ #define PPE_IN_FLOW_TBL_INC			0x20
+@@ -1493,11 +1496,38 @@
+  */
+ #define PPE_L3_EXCEPTION_TCP_FLAGS_0		46
+ 
+-/* Exception code (vendor fal_sec.h FAL_SEC_EXP_*) the parser raises for
+- * an IPv4 fragment, which it cannot classify to an L4 5-tuple the way
+- * software does. Programmed to redirect to the CPU on a flow hit, see
+- * ppe_offload_hdr_exception_init().
++/* Exception codes (vendor fal_sec.h FAL_SEC_EXP_*) the parser raises for
++ * a frame whose L2, IPv4 or L4 header the software fast path would not
++ * forward as it stands. Programmed to redirect to the CPU on a flow hit,
++ * see ppe_offload_hdr_exception_init().
+  */
++#define PPE_L3_EXCEPTION_UNKNOWN_L2_PROT		0
++#define PPE_L3_EXCEPTION_IPV4_SMALL_IHL			5
++#define PPE_L3_EXCEPTION_IPV4_WITH_OPTION		6
++#define PPE_L3_EXCEPTION_IPV4_HDR_INCOMPLETE		7
++#define PPE_L3_EXCEPTION_IPV4_BAD_TOTAL_LEN		8
++#define PPE_L3_EXCEPTION_IPV4_DATA_INCOMPLETE		9
+ #define PPE_L3_EXCEPTION_IPV4_FRAG			10
++#define PPE_L3_EXCEPTION_IPV4_SMALL_TTL			12
++#define PPE_L3_EXCEPTION_IPV4_CHECKSUM_ERR		14
++#define PPE_L3_EXCEPTION_TCP_HDR_INCOMPLETE		42
++#define PPE_L3_EXCEPTION_TCP_SMALL_DATA_OFFSET		45
++#define PPE_L3_EXCEPTION_UDP_HDR_INCOMPLETE		55
++#define PPE_L3_EXCEPTION_UDP_LITE_HDR_INCOMPLETE	61
++
++/* L3 routing exception actions (vendor L3_ROUTE_CTRL / L3_ROUTE_CTRL_EXT,
++ * IPE_L3_BASE_ADDR 0x200000 + 0x480 / 0x494 on APPE). Each command is a
++ * fal_fwd_cmd_t (PPE_L3_EXCEPTION_FORWARD..REDIRECT_TO_CPU); flow offload
++ * relies on these being redirect-to-CPU and only reads them.
++ */
++#define PPE_L3_ROUTE_CTRL_ADDR			0x200480
++#define PPE_L3_ROUTE_CTRL_IP_MRU_CHECK_FAIL	GENMASK(1, 0)
++#define PPE_L3_ROUTE_CTRL_IP_MTU_FAIL		GENMASK(4, 3)
++#define PPE_L3_ROUTE_CTRL_IP_MTU_DF_FAIL	GENMASK(7, 6)
++#define PPE_L3_ROUTE_CTRL_FLOW_SRC_IF_CHECK_CMD	GENMASK(13, 12)
++
++#define PPE_L3_ROUTE_CTRL_EXT_ADDR		0x200494
++#define PPE_L3_ROUTE_CTRL_EXT_FLOW_PMTU_FAIL	GENMASK(9, 8)
++#define PPE_L3_ROUTE_CTRL_EXT_FLOW_PMTU_DF_FAIL	GENMASK(12, 11)
+ 
+ #endif
