@@ -1,12 +1,35 @@
 # RTL8372N bench plan
 
-Bench test of `rtl8372n_dsa` on a GL-BE9300. This driver has never run on
-hardware: only its P0 base did (probe, links, software bridging), before the
-PHY binding, standalone VLAN transparency, traps and offload were added. Run
-the phases in order, each only after the previous one passed; on a failure,
-capture (section 6) and return to the previous phase's configuration.
-Ports: lan1 = 7, lan2 = 6, lan3 = 5, lan4 = 4, CPU = 3 on the conduit `lan`;
-WAN is not on the switch. "Debug" lines exist only in the debug build.
+Bench test of `rtl8372n_dsa` on a GL-BE9300; what has run so far is in
+section 0. Run the phases in order, each only after the previous one passed;
+on a failure, capture (section 6) and return to the previous phase's
+configuration. Ports: lan1 = 7, lan2 = 6, lan3 = 5, lan4 = 4, CPU = 3 on the
+conduit `lan`; WAN is not on the switch. "Debug" lines exist only in the
+debug build.
+
+## 0. Bench record
+
+2026-10-20/21, one GL-BE9300 that is also the live gateway, debug image
+r37571-89c18ad1cb, hosts: a PC on lan1 and a managed switch on lan4.
+
+- **Phase 1** (offload off): 1.1 passed on five boots (a power cycle among
+  them) and two module reloads; TABLE_RST cleared the sentinel in 290-520 us.
+  1.2 passed for the PHY IDs, the binding, 2.5G links and EEE off (MMD 7.60
+  and 7.62 read 0). 1.3 passed for pings and 1500-byte packets both ways;
+  95% of LAN ingress went to one PPE queue. 1.5: VID 1 frames kept their tag.
+  1.7: plain `rmmod` failed (each attached PHY pinned the module, fixed since
+  by "rtl8372n: let the module unload while its PHYs are attached");
+  unbinding through sysfs first, the reload passed. 1.8 passed. Not run:
+  forced speeds, cable test, 1.4, 1.6.
+- **Phase 2**: 2.1, 2.6 (static entries, ageing), 2.7 (Wi-Fi stations as
+  CPU-port entries), 2.8, and 2.9 on idle ports passed; lan1-lan4 unicast
+  was switched in hardware. Not run: 2.4, 2.5, 2.10, roaming.
+- **Phase 3**, with lan1 PVID 1 and tagged 10/20, lan4 a tagged-only trunk in
+  1/10/20: the 3.1 entries matched `bridge vlan show`; untagged lan1 to
+  tagged lan4 in hardware; VID 10 tagged to the router both ways; VID 30
+  dropped at ingress; 3.7 passed. Not run: link-local frames on a
+  tagged-only port, 3.6, 3.8.
+- Two days of normal use in that layout: no stop lines, no EDMA errors.
 
 ## 1. Prerequisites and recovery
 
@@ -42,9 +65,10 @@ WAN is not on the switch. "Debug" lines exist only in the debug build.
 - **Build** with `RTL837X_DSA_DEBUG` (most checks are `dev_dbg` lines; the
   target has no dynamic debug), `kmod-ramoops`, `mdio-tools` (1.2) and the
   router tools `ip-full`, `ip-bridge`, `tcpdump`, `iperf3` and `ethtool-full`
-  (`--cable-test` needs netlink, which the default `ethtool` lacks). Leave
-  `RTL837X_DSA_OFFLOAD` off: phase 1 runs with bridges in software. Rebuild
-  without `RTL837X_DSA_DEBUG` before an image stays in service.
+  (`--cable-test` needs netlink, which the default `ethtool` lacks). Turn
+  `RTL837X_DSA_OFFLOAD` off (on by default): phase 1 runs with bridges in
+  software. Rebuild without `RTL837X_DSA_DEBUG` before an image stays in
+  service.
 
 ```sh
 ./scripts/feeds update -a && ./scripts/feeds install -a
@@ -53,6 +77,7 @@ cp configs/ap.config .config      # spare unit (AP profile: no NAT, no PPPoE)
 # and the rest stay
 cat >> .config <<'EOF'
 CONFIG_RTL837X_DSA_DEBUG=y
+# CONFIG_RTL837X_DSA_OFFLOAD is not set
 CONFIG_PACKAGE_kmod-ramoops=y
 CONFIG_PACKAGE_mdio-tools=y
 CONFIG_PACKAGE_ip-full=y
@@ -67,9 +92,9 @@ grep -ac 'joined bridge' build_dir/target-*/linux-qualcommbe_ipq53xx/rtl837x-dsa
 grep -c is_link_local_ether_addr build_dir/target-*/linux-qualcommbe_ipq53xx/linux-*/net/dsa/tag_rtl8_4.c  # 1: 0432
 ```
 
-- **The `offload` parameter** is read at probe. It defaults to off (every
-  bridge in software), or to on in an image built with
-  `CONFIG_RTL837X_DSA_OFFLOAD=y`. `options rtl8372n_dsa offload=1` (or `=0`)
+- **The `offload` parameter** is read at probe. It defaults to on, or to off
+  (every bridge in software) in an image built without
+  `CONFIG_RTL837X_DSA_OFFLOAD`. `options rtl8372n_dsa offload=1` (or `=0`)
   in `/etc/modules.conf`, which sysupgrade keeps, overrides either default
   from the next boot. `cat /sys/module/rtl8372n_dsa/parameters/offload`
   reads `N` in phase 1, `Y` in phases 2 and 3: check it after every boot.
@@ -157,8 +182,8 @@ for da, et in (("00", 38), ("02", 0x8809), ("03", 0x888e), ("0e", 0x88cc)):
 ## 4. Phase 2: offload on, VLAN-unaware br-lan
 
 Add `options rtl8372n_dsa offload=1` to `/etc/modules.conf` and reboot, or
-flash an image built with `CONFIG_RTL837X_DSA_OFFLOAD=y` (and no `offload=0`
-line there).
+flash an image built with `CONFIG_RTL837X_DSA_OFFLOAD=y`, the default (and
+no `offload=0` line there).
 The default br-lan (lan1-lan4, no `bridge-vlan`) is offloaded at boot.
 
 | # | Do | Expect |

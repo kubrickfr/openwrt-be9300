@@ -3,7 +3,7 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=rtl837x-dsa
 PKG_VERSION:=0.0.2
-PKG_RELEASE:=9
+PKG_RELEASE:=10
 PKG_MAINTAINER:=air jinkela (air_jinkela@163.com)
 PKG_CONFIG_DEPENDS:=CONFIG_RTL837X_DSA_DEBUG CONFIG_RTL837X_DSA_OFFLOAD
 
@@ -39,16 +39,16 @@ define KernelPackage/$(PKG_NAME)/config
 		  or FDB change logs a line; leave this off in production.
 
 	config RTL837X_DSA_OFFLOAD
-		bool "Offload bridging to the switch by default (not yet bench-tested)"
-		default n
+		bool "Offload bridging to the switch by default"
+		default y
 		help
 		  Sets the default of the rtl8372n_dsa "offload" module
-		  parameter. Off, every bridge on the LAN ports runs in
-		  software and each port reaches only the CPU; on, one
-		  bridge and its VLANs are switched in hardware. Either
+		  parameter. On, one bridge and its VLANs are switched in
+		  hardware; off, every bridge on the LAN ports runs in
+		  software and each port reaches only the CPU. Either
 		  default is overridden at boot by "options rtl8372n_dsa
-		  offload=0" (or =1) in /etc/modules.conf. Leave this off
-		  until the offload has passed the bench (TESTING.md).
+		  offload=0" (or =1) in /etc/modules.conf. Turn it off for
+		  phase 1 of the bench plan (TESTING.md).
 
   endif
 endef
