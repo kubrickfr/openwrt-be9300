@@ -1,0 +1,929 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: offload towards ports of a 
+ VLAN-aware bridge
+
+The emulated head tag carries no VLAN (VSEL=0, KEEP=0), so the RTL8372N
+classifies the frame to its CPU port's PVID, VLAN 1 on the rtl8372n
+driver, and sends it out of the named port tagged or untagged as VLAN
+1's entry says. The switch exempts the CPU's frames from its egress
+membership check, so the driver checks it.
+
+Besides the switch bridging the port itself (previous patch), require
+its VLAN filtering on the port to equal the bridge's, the port to
+forward, and, in a VLAN-aware 802.1Q bridge on an rtl8372n, either
+nothing is pushed and the port's PVID is 1 and VLAN 1 is the only VLAN
+it egresses untagged in, or VLAN 1 is pushed towards a tagged member of
+VLAN 1. Every port's flows are dropped when its VLANs or STP state
+change or when it joins or leaves a bridge or gets a VLAN upper, and
+every port-addressed flow when a bridge's VLAN filtering or protocol
+changes: synchronously in the notifier (before or after the bridge
+applies the change, depending on the change; an STP state is notified
+deferred, together with DSA's own port state update), and again from a
+workqueue once it is complete; a generation count makes flows offered in
+between retry (-EAGAIN, which withdraws nothing). The MTU of the
+bridge's VLAN 1 upper caps the PMTU too. The FDB follower applies the
+same conditions to the port it re-points a flow to and follows only
+learns in VID 1 of a VLAN-aware bridge.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../net/ethernet/qualcomm/ppe/ppe_offload.c   | 567 ++++++++++++++++--
+ 1 file changed, 512 insertions(+), 55 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -61,12 +61,13 @@
+  *   nexthop's tag inserts, since hardware cannot run the tagger:
+  *   see ppe_offload_dsa_egress(). The port is taken from the DSA
+  *   structures of the redirect target only; a port in a bridge the
+- *   switch does not offload for it, a port of a VLAN-aware bridge, a
+- *   port behind a LAG conduit, a VLAN push on top of a DSA port, a
+- *   tagger other than rtl8_4, and a conduit whose egress TPIDs are not
+- *   set up for the emulated head tag are all declined.
++ *   switch does not offload for it, a VLAN-aware bridge port outside
++ *   VLAN 1 (ppe_offload_dsa_vlan_ok()), a port behind a LAG conduit, a
++ *   VLAN push on top of an unbridged or VLAN-unaware port, a tagger other
++ *   than rtl8_4, and a conduit whose egress TPIDs are not set up for the
++ *   emulated head tag are all declined.
+  *   Where the inserts name the port outright (rtl8_4), a client that
+- *   its own VLAN-unaware bridge later learns on another of its ports
++ *   its own bridge later learns on another of its ports
+  *   has its flows re-pointed there, see ppe_offload_fdb_event().
+  * - Tagged ingress (the reply direction on a tagged WAN) arrives as a
+  *   FLOW_DISSECTOR_KEY_VLAN match on the real device plus a
+@@ -167,6 +168,7 @@
+ #include <linux/moduleparam.h>
+ #include <linux/mutex.h>
+ #include <linux/netdevice.h>
++#include <linux/of.h>
+ #include <linux/regmap.h>
+ #include <linux/rtnetlink.h>
+ #include <net/dsa.h>
+@@ -233,13 +235,15 @@ struct ppe_offload_flow_entry {
+ 	bool stuck;
+ 	/* Only an SNAT flow holds a public IP table entry. */
+ 	bool pub_ip_valid;
+-	/* Set when the nexthop's tag inserts name a DSA user port outright
+-	 * (struct ppe_offload_egress::dsa_fixed) and that port is in a
+-	 * VLAN-unaware bridge: the entry sits in
+-	 * ppe_offload_priv::dsa_fixed_ht so that the bridge learning @dmac
+-	 * on another of its ports on the same switch can re-point it, for
+-	 * which the programmed nexthop and flow entry are kept. @dsa_ds is
+-	 * only ever compared, never dereferenced.
++	/* Set for every flow whose nexthop's tag inserts name a DSA user
++	 * port outright (struct ppe_offload_egress::dsa_fixed), bridged or
++	 * not: the entry sits in ppe_offload_priv::dsa_fixed_ht so that a
++	 * bridge or upper change concerning that port drops it
++	 * (ppe_offload_dsa_flush_work()) and, when the port is in a bridge
++	 * (@dsa_bridge_ifindex != 0), so that the bridge learning @dmac on
++	 * another of its ports on the same switch can re-point it, for which
++	 * the programmed nexthop and flow entry are kept. @dsa_ds is only
++	 * ever compared, never dereferenced.
+ 	 */
+ 	bool dsa_fixed;
+ 	/* A move for @dmac is queued and has not looked at this entry yet;
+@@ -250,6 +254,11 @@ struct ppe_offload_flow_entry {
+ 	const struct dsa_switch *dsa_ds;
+ 	int dsa_ifindex;
+ 	int dsa_bridge_ifindex;
++	/* The egress's VLAN-aware bridge port state, see
++	 * ppe_offload_dsa_vlan_ok(); compared by the FDB follower.
++	 */
++	bool dsa_vlan_aware;
++	bool dsa_vlan_tagged;
+ 	unsigned int dsa_index;
+ 	u8 dmac[ETH_ALEN];
+ 	struct ppe_nexthop_entry nexthop;
+@@ -313,6 +322,20 @@ struct ppe_offload_snap {
+ 	u32 mask[PPE_OFFLOAD_SNAP_WORDS];
+ };
+ 
++/* Ports of the switch whose ppe_offload_vlan1_untagged_only() answer is
++ * kept: the rtl8_4 forwarding mask's width, and then some.
++ */
++#define PPE_OFFLOAD_VLAN1_CACHE		16
++
++/* A port's answer from ppe_offload_vlan1_untagged_only(), valid for that
++ * device while dsa_gen holds @gen. Under ppe_offload_priv::vlan1_lock.
++ */
++struct ppe_offload_vlan1_cache {
++	int ifindex;
++	int gen;
++	bool only;
++};
++
+ /**
+  * struct ppe_offload_bind - One flow block callback of this driver.
+  * @node: In ppe_offload_priv::binds, under its lock.
+@@ -392,6 +415,16 @@ struct ppe_offload_counters {
+  * @fdb_nb: The switchdev notifier that feeds it.
+  * @fdb_moves: Move work items queued and not yet done, see
+  * PPE_OFFLOAD_FDB_MOVES_MAX.
++ * @switchdev_nb: Bridge VLAN/STP changes, see ppe_offload_switchdev_event().
++ * @dsa_flush_work: Drops port-addressed flows after such a change, on
++ * @fdb_wq.
++ * @dsa_flush_ports: The ports it is to drop them for, see
++ * ppe_offload_dsa_ports().
++ * @dsa_gen: Bumped by such a change and at the end of its flush; a
++ * port-addressed flow is added only if it did not move since the flow was
++ * checked against its bridge.
++ * @vlan1_lock: Guards @vlan1_cache.
++ * @vlan1_cache: See ppe_offload_vlan1_untagged_only().
+  * @enabled: Whether flows are accepted: set once enabling has programmed
+  * and read back everything, cleared first thing on disable. Written under
+  * RTNL and @lock, read under either.
+@@ -412,6 +445,7 @@ struct ppe_offload_counters {
+  * 0 for none (ppe_offload_egress_apply()). Written under @lock.
+  * @egress_failed: Applying profile E failed; conduits stay declined until
+  * offload is disabled. Written under @lock.
++ * @netdev_nb: Drops port-addressed flows when a switch port's uppers change.
+  * @flows_dentry: The debugfs listing of what is tracked.
+  * @flows_hw_dentry: The debugfs listing of the tracked flows' entries as
+  * hardware has them.
+@@ -443,6 +477,12 @@ struct ppe_offload_priv {
+ 	struct workqueue_struct *fdb_wq;
+ 	struct notifier_block fdb_nb;
+ 	atomic_t fdb_moves;
++	struct notifier_block switchdev_nb;
++	struct work_struct dsa_flush_work;
++	atomic_t dsa_flush_ports;
++	atomic_t dsa_gen;
++	spinlock_t vlan1_lock; /* see @vlan1_cache */
++	struct ppe_offload_vlan1_cache vlan1_cache[PPE_OFFLOAD_VLAN1_CACHE];
+ 	bool enabled;
+ 	struct list_head flows;
+ 	struct ppe_offload_snap snap[PPE_OFFLOAD_SNAP_MAX];
+@@ -451,6 +491,7 @@ struct ppe_offload_priv {
+ 	unsigned int flows_lost;
+ 	u32 egress_port;
+ 	bool egress_failed;
++	struct notifier_block netdev_nb;
+ 	struct dentry *flows_dentry;
+ 	struct dentry *flows_hw_dentry;
+ 	struct list_head binds;
+@@ -607,13 +648,17 @@ static bool ppe_offload_rule_has_vlan_key(const struct flow_rule *rule,
+  * @ctag: Insert a C-VLAN tag with @cvid on egress.
+  * @cvid: TCI of that tag.
+  * @dsa_index: Switch port index when the egress is a DSA user port.
+- * @bridge_ifindex: ifindex of the VLAN-unaware bridge that port is in, or 0.
++ * @bridge_ifindex: ifindex of the bridge (VLAN-aware or not) that port is in,
++ * or 0.
+  * @dsa_ifindex: That user port's ifindex.
+  * @dsa_ds: That user port's switch, for identity comparison only.
+  * @dsa: Whether the egress is a DSA user port at all.
+  * @dsa_fixed: Whether the tag inserts name that port outright (rather than
+  * leaving the choice to the switch's own FDB), see ppe_offload_dsa_egress().
+- * @mtu_cap: MTU of the bridge that port is in, which caps the
++ * @vlan_aware: The port is in a VLAN-aware bridge: the flow's frames are
++ * in VLAN 1 there, see ppe_offload_dsa_vlan_ok().
++ * @vlan_tagged: ... and leave the port tagged.
++ * @mtu_cap: MTU of the bridge that port is in and of its VLAN 1 upper, which caps the
+  * flow's PMTU; 0 if none.
+  */
+ struct ppe_offload_egress {
+@@ -628,6 +673,8 @@ struct ppe_offload_egress {
+ 	int bridge_ifindex;
+ 	bool dsa;
+ 	bool dsa_fixed;
++	bool vlan_aware;
++	bool vlan_tagged;
+ 	unsigned int mtu_cap;
+ };
+ 
+@@ -790,6 +837,136 @@ static bool ppe_offload_rtl8_4_egress_ready(struct ppe_offload_priv *priv,
+ 	return !READ_ONCE(priv->egress_failed) && (!owner || owner == port);
+ }
+ 
++/* The VLAN an untagged frame from the CPU is classified to on the
++ * RTL8372N: the rtl8372n driver keeps the CPU port VLAN-unaware with PVID 1
++ * (package/kernel/rtl8372n/src/rtl8372n_vlan.c).
++ */
++#define PPE_OFFLOAD_RTL8372N_CPU_VID	1
++
++/* Whether @dev, port @dp of a VLAN-aware bridge, has PVID 1 and egresses
++ * untagged in VLAN 1 alone: then an untagged flow towards it is in VLAN 1,
++ * where the emulated head tag delivers it and where the FDB follower
++ * looks for its client. There is no exported walk of a port's VLANs, so
++ * every other VID is looked up, and the answer is kept per port until
++ * dsa_gen moves: every change that could alter it (a port's VLANs or
++ * PVID, a bridge join or leave) bumps dsa_gen when it is notified and
++ * again once it is complete, so an answer taken in between is not kept
++ * past it.
++ * Under RCU.
++ */
++static bool ppe_offload_vlan1_untagged_only(struct ppe_offload_priv *priv,
++					    const struct dsa_port *dp,
++					    const struct net_device *dev)
++{
++	struct ppe_offload_vlan1_cache *c = NULL;
++	int gen = atomic_read(&priv->dsa_gen);
++	struct bridge_vlan_info vinfo;
++	bool hit = false, only = false;
++	u16 pvid, vid;
++
++	if (dp->index < ARRAY_SIZE(priv->vlan1_cache)) {
++		c = &priv->vlan1_cache[dp->index];
++		spin_lock_bh(&priv->vlan1_lock);
++		hit = c->ifindex == dev->ifindex && c->gen == gen;
++		only = c->only;
++		spin_unlock_bh(&priv->vlan1_lock);
++		if (hit)
++			return only;
++		only = false;
++	}
++
++	if (br_vlan_get_pvid_rcu(dev, &pvid) || pvid != PPE_OFFLOAD_RTL8372N_CPU_VID)
++		goto out;
++
++	for (vid = 1; vid < VLAN_N_VID - 1; vid++)
++		if (vid != PPE_OFFLOAD_RTL8372N_CPU_VID &&
++		    !br_vlan_get_info_rcu(dev, vid, &vinfo) &&
++		    (vinfo.flags & BRIDGE_VLAN_INFO_UNTAGGED))
++			goto out;
++	only = true;
++
++out:
++	if (c) {
++		spin_lock_bh(&priv->vlan1_lock);
++		c->ifindex = dev->ifindex;
++		c->gen = gen;
++		c->only = only;
++		spin_unlock_bh(&priv->vlan1_lock);
++	}
++
++	return only;
++}
++
++/* Whether a flow may leave through @odev, a port of the VLAN-aware bridge
++ * @bridge, behind the emulated head tag. The tag carries no VLAN and asks
++ * for none (VSEL=0, KEEP=0), and the inserts have no room for a third
++ * tag, so the switch classifies the frame to its CPU port's PVID, VLAN 1
++ * on the rtl8372n driver, and sends it out of the named port tagged or
++ * untagged as VLAN 1's entry says for that port (ORIGINAL egress mode on a
++ * VLAN-aware port, same file). That is only the flow's own VLAN on the wire
++ * when:
++ *
++ * - no VLAN is pushed, the port's PVID is 1 and VLAN 1 is the only VLAN
++ *   it egresses untagged in: the flow is in VLAN 1 (the bridge resolved
++ *   the port for it and leaves it untagged) and leaves untagged, as
++ *   software sends it;
++ * - VLAN 1 is pushed and the port is a tagged member of VLAN 1.
++ *
++ * Anything else (another VID, a second tag, an 802.1ad bridge, another
++ * switch driver) is declined. The bridge must be the one the switch
++ * offloads for the port (ppe_offload_dsa_egress()): a port the switch
++ * driver leaves to software bridging is VLAN-unaware in hardware and
++ * would send the frame untagged whatever the bridge says. The switch
++ * exempts the CPU's frames from its egress membership check, so nothing
++ * downstream would catch a wrong port: membership is checked here when
++ * the flow is accepted, and ppe_offload_switchdev_event() drops the
++ * port's flows whenever its VLANs or STP state change. Under RCU.
++ *
++ * Return: 0 if allowed, a negative error code (declined, logged) if not.
++ */
++static int ppe_offload_dsa_vlan_ok(struct ppe_offload_priv *priv, struct net_device *odev,
++				   struct dsa_port *dp, const struct net_device *bridge,
++				   bool vlan_push_seen, u16 vlan_push_vid, bool *tagged)
++{
++	struct bridge_vlan_info vinfo;
++	u16 proto;
++
++	if (!dp->ds->dev || !of_device_is_compatible(dp->ds->dev->of_node, "realtek,rtl8372n"))
++		return ppe_offload_decline("odev=%s vlan-aware bridge on a switch other than rtl8372n",
++					    netdev_name(odev));
++
++	if (br_vlan_get_proto(bridge, &proto) || proto != ETH_P_8021Q)
++		return ppe_offload_decline("odev=%s bridge vlan protocol not 802.1Q",
++					    netdev_name(odev));
++
++	if (br_vlan_get_info_rcu(odev, PPE_OFFLOAD_RTL8372N_CPU_VID, &vinfo))
++		return ppe_offload_decline("odev=%s not a member of vlan %u",
++					    netdev_name(odev), PPE_OFFLOAD_RTL8372N_CPU_VID);
++
++	if (vlan_push_seen) {
++		if (vlan_push_vid != PPE_OFFLOAD_RTL8372N_CPU_VID)
++			return ppe_offload_decline("odev=%s vlan push %u: only vlan %u can be emulated",
++						    netdev_name(odev), vlan_push_vid,
++						    PPE_OFFLOAD_RTL8372N_CPU_VID);
++		if (vinfo.flags & BRIDGE_VLAN_INFO_UNTAGGED)
++			return ppe_offload_decline("odev=%s vlan push to an untagged member",
++						    netdev_name(odev));
++		*tagged = true;
++	} else {
++		if (!(vinfo.flags & BRIDGE_VLAN_INFO_UNTAGGED))
++			return ppe_offload_decline("odev=%s untagged egress, port tagged in vlan %u",
++						    netdev_name(odev),
++						    PPE_OFFLOAD_RTL8372N_CPU_VID);
++		if (!ppe_offload_vlan1_untagged_only(priv, dp, odev))
++			return ppe_offload_decline("odev=%s untagged egress: pvid not %u or another untagged vlan",
++						    netdev_name(odev),
++						    PPE_OFFLOAD_RTL8372N_CPU_VID);
++		*tagged = false;
++	}
++
++	return 0;
++}
++
+ /* Resolve a redirect to a DSA user port into the conduit's PPE port plus
+  * the tag inserts that make the switch deliver the frame to that port,
+  * mirroring mtk_flow_get_dsa_port() for the port lookup. Hardware cannot
+@@ -801,10 +978,10 @@ static bool ppe_offload_rtl8_4_egress_ready(struct ppe_offload_priv *priv,
+  *
+  * Only the DSA structures of the redirect target decide the port; the
+  * switch's FDB is never read. Declined: a port in a bridge the switch does
+- * not offload for it, a port of a VLAN-aware bridge (its frames would
+- * need the bridge VLAN as a further tag), a conduit in a LAG, a VLAN push
+- * on top of the port, any other tagger, and a conduit whose egress TPIDs
+- * are not set up for the emulated head tag.
++ * not offload for it, a VLAN-aware bridge port outside what
++ * ppe_offload_dsa_vlan_ok() allows, a conduit in a LAG, a VLAN push on top
++ * of an unbridged or VLAN-unaware port, any other tagger, and a conduit
++ * whose egress TPIDs are not set up for the emulated head tag.
+  *
+  * Runs on the flowtable's offload workqueue, which holds neither RTNL
+  * nor RCU by itself (and must not take RTNL: the flowtable flushes this
+@@ -823,19 +1000,16 @@ static bool ppe_offload_rtl8_4_egress_ready(struct ppe_offload_priv *priv,
+  * Return: 0 with @egress filled in, a negative error code to decline.
+  */
+ static int ppe_offload_dsa_egress(struct ppe_offload_priv *priv, struct net_device *odev,
+-				  struct dsa_port *dp, bool vlan_push_seen,
++				  struct dsa_port *dp, bool vlan_push_seen, u16 vlan_push_vid,
+ 				  struct ppe_offload_egress *egress)
+ {
+ 	const struct dsa_device_ops *tag_ops = dp->cpu_dp->tag_ops;
+ 	struct net_device *bridge;
+ 	struct net_device *conduit;
+ 	bool vlan_aware = false;
++	bool tagged = false;
+ 	int ret = 0;
+ 
+-	if (vlan_push_seen)
+-		return ppe_offload_decline("odev=%s vlan push on a dsa port unsupported",
+-					    netdev_name(odev));
+-
+ 	if (dp->cpu_port_in_lag)
+ 		return ppe_offload_decline("odev=%s conduit is a lag", netdev_name(odev));
+ 
+@@ -854,28 +1028,53 @@ static int ppe_offload_dsa_egress(struct ppe_offload_priv *priv, struct net_devi
+ 	if (bridge) {
+ 		vlan_aware = br_vlan_enabled(bridge);
+ 		egress->bridge_ifindex = bridge->ifindex;
+-		/* Routed through the bridge: its MTU is the one the packets
+-		 * have to fit, not only the port's.
++		/* Routed through the bridge, or its VLAN 1 upper (the only
++		 * VLAN accepted, ppe_offload_dsa_vlan_ok()): their MTU is the
++		 * one the packets have to fit, not only the port's. Taking the
++		 * upper's when the route went through the bridge itself only
++		 * punts more to the CPU.
+ 		 */
+ 		egress->mtu_cap = READ_ONCE(bridge->mtu);
+-		/* The switch must bridge the port itself: one it leaves to
+-		 * software bridging (it refused the join, or the port has a
+-		 * VLAN upper) is a standalone port in hardware, and DSA does
+-		 * not track its STP state either.
++		if (vlan_aware) {
++			struct net_device *upper;
++
++			upper = __vlan_find_dev_deep_rcu(bridge, htons(ETH_P_8021Q),
++							 PPE_OFFLOAD_RTL8372N_CPU_VID);
++			if (upper)
++				egress->mtu_cap = min(egress->mtu_cap, READ_ONCE(upper->mtu));
++		}
++		/* The switch must bridge the port itself, with the bridge's
++		 * VLAN filtering: one it leaves to software bridging (it
++		 * refused the join, or the port has a VLAN upper) is a
++		 * standalone port in hardware, and DSA does not track its STP
++		 * state either.
+ 		 */
+ 		if (dsa_port_bridge_dev_get(dp) != bridge)
+ 			ret = ppe_offload_decline("odev=%s bridge not offloaded by the switch",
+ 						   netdev_name(odev));
++		else if (dsa_port_is_vlan_filtering(dp) != vlan_aware)
++			ret = ppe_offload_decline("odev=%s switch vlan filtering differs from the bridge",
++						   netdev_name(odev));
++		else if (vlan_aware)
++			ret = ppe_offload_dsa_vlan_ok(priv, odev, dp, bridge, vlan_push_seen,
++						      vlan_push_vid, &tagged);
+ 	}
+ 	rcu_read_unlock();
+ 
+ 	if (ret)
+ 		return ret;
+ 
+-	if (vlan_aware)
+-		return ppe_offload_decline("odev=%s is a port of a vlan-aware bridge",
++	if (vlan_push_seen && !vlan_aware)
++		return ppe_offload_decline("odev=%s vlan push on a dsa port unsupported",
+ 					    netdev_name(odev));
+ 
++	/* A bridge port that does not forward is no destination for
++	 * hardware either; ppe_offload_switchdev_event() drops the port's
++	 * flows when that changes.
++	 */
++	if (bridge && READ_ONCE(dp->stp_state) != BR_STATE_FORWARDING)
++		return ppe_offload_decline("odev=%s not forwarding", netdev_name(odev));
++
+ 	if (tag_ops->proto != DSA_TAG_PROTO_RTL8_4)
+ 		return ppe_offload_decline("odev=%s tagger %d unsupported", netdev_name(odev),
+ 					    tag_ops->proto);
+@@ -896,11 +1095,23 @@ static int ppe_offload_dsa_egress(struct ppe_offload_priv *priv, struct net_devi
+ 	egress->dsa_index = dp->index;
+ 	egress->dsa_ifindex = odev->ifindex;
+ 	egress->dsa_ds = dp->ds;
++	egress->vlan_aware = vlan_aware;
++	egress->vlan_tagged = tagged;
+ 
+ 	return 0;
+ }
+ #endif
+ 
++/* Whether @dev is a DSA user port. */
++static bool ppe_offload_is_dsa_user(const struct net_device *dev)
++{
++#if IS_ENABLED(CONFIG_NET_DSA)
++	return dsa_user_dev_check(dev);
++#else
++	return false;
++#endif
++}
++
+ /* Resolve the device a flow's packets arrive on down to the EDMA port
+  * whose ingress L3 interface hardware will match against, mirroring
+  * the redirect-target resolution done for egress. A VLAN upper or a
+@@ -1261,6 +1472,7 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	bool snat = false;
+ 	u8 ip_proto;
+ 	int action;
++	int dsa_gen = atomic_read(&priv->dsa_gen);
+ 	const char *stage = NULL;
+ 	int ret;
+ 
+@@ -1585,9 +1797,12 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	 * actually stacked on it with that VID: that is what the flowtable's
+ 	 * forward path resolved from, and a push with no such upper (e.g.
+ 	 * a hand-written tc rule) is not a flow this driver can vouch for.
+-	 * The upper's MTU is the one the packets have to fit.
++	 * The upper's MTU is the one the packets have to fit. A push towards
++	 * a DSA user port is its VLAN-aware bridge's VLAN instead, checked
++	 * against the bridge in ppe_offload_dsa_vlan_ok(); the bridge and its
++	 * VLAN 1 upper cap the PMTU (ppe_offload_dsa_egress()).
+ 	 */
+-	if (vlan_push_seen && !is_vlan_dev(odev)) {
++	if (vlan_push_seen && !is_vlan_dev(odev) && !ppe_offload_is_dsa_user(odev)) {
+ 		struct net_device *upper;
+ 
+ 		rcu_read_lock();
+@@ -1631,7 +1846,8 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		struct dsa_port *dp = dsa_port_from_netdev(odev);
+ 
+ 		if (!IS_ERR(dp)) {
+-			ret = ppe_offload_dsa_egress(priv, odev, dp, vlan_push_seen, &egress);
++			ret = ppe_offload_dsa_egress(priv, odev, dp, vlan_push_seen,
++						     vlan_push_vid, &egress);
+ 			if (ret)
+ 				return ret;
+ 			if (egress.mtu_cap)
+@@ -1747,6 +1963,13 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		}
+ 	}
+ 
++	if (egress.dsa && atomic_read(&priv->dsa_gen) != dsa_gen) {
++		/* Re-offered within a second, against the bridge as it is. */
++		ret = -EAGAIN;
++		stage = "bridge change";
++		goto unlock;
++	}
++
+ 	if (egress.dsa) {
+ 		ret = ppe_offload_egress_apply(priv, port_priv->ppe_port->port_id);
+ 		if (ret) {
+@@ -1892,12 +2115,17 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	list_add(&entry->list, &priv->flows);
+ 	ppe_offload_flow_own(priv, entry);
+ 
+-	/* An unbridged port has no FDB to move the client with. */
+-	if (egress.dsa_fixed && egress.bridge_ifindex) {
++	/* Every port-addressed flow, so that a bridge change drops it
++	 * (ppe_offload_dsa_flush_work()); one towards an unbridged port
++	 * (bridge ifindex 0) is never followed.
++	 */
++	if (egress.dsa_fixed) {
+ 		entry->dsa_fixed = true;
+ 		entry->dsa_ds = egress.dsa_ds;
+ 		entry->dsa_ifindex = egress.dsa_ifindex;
+ 		entry->dsa_bridge_ifindex = egress.bridge_ifindex;
++		entry->dsa_vlan_aware = egress.vlan_aware;
++		entry->dsa_vlan_tagged = egress.vlan_tagged;
+ 		entry->dsa_index = egress.dsa_index;
+ 		ether_addr_copy(entry->dmac, eth.bytes);
+ 		entry->nexthop = nexthop;
+@@ -1979,8 +2207,10 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		 */
+ 		if (ret == -EIO && !strcmp(stage, "host"))
+ 			pr_info_once("ppe_offload: host table add failed (full?), flows stay in software\n");
+-		else if (ret == -EOPNOTSUPP)
+-			/* Already said once by the check that raised it. */
++		else if (ret == -EOPNOTSUPP || ret == -EAGAIN)
++			/* Already said once by the check that raised it, or
++			 * retried at the next refresh.
++			 */
+ 			pr_debug("ppe_offload: replace declined at %s\n", stage);
+ 		else if (ret == -ENOSPC)
+ 			pr_info_once("ppe_offload: %s table full, flows stay in software\n",
+@@ -2041,9 +2271,11 @@ static int ppe_offload_flow_destroy(struct ppe_offload_priv *priv, struct flow_c
+  * learning to the bridge), and until then its inbound traffic stays on the
+  * old port, exactly as the software flowtable would leave it for good.
+  *
+- * Only a move within the flow's own VLAN-unaware bridge counts, learned
+- * without a VLAN: that is the one domain in which the bridge itself would
+- * send the client's traffic to the new port. Another bridge on the same
++ * Only a move within the flow's own bridge counts, learned without a VLAN
++ * in a VLAN-unaware bridge or in VID 1 in a VLAN-aware one (where the
++ * emulated tag delivers, see ppe_offload_dsa_vlan_ok()): that is the one
++ * domain in which the bridge itself would send the client's traffic to the
++ * new port. Another bridge on the same
+  * switch learning the address (a guest port claiming a trusted client's
+  * MAC) must not pull the flow across, which it otherwise would, since the
+  * emulated head tag addresses the port outright with no FDB or VLAN check
+@@ -2080,6 +2312,7 @@ struct ppe_offload_fdb_move {
+ 	struct net_device *dev;
+ 	netdevice_tracker tracker;
+ 	u8 addr[ETH_ALEN];
++	u16 vid;
+ };
+ 
+ /* Re-point one fixed-port flow at @dp. Called under priv->lock.
+@@ -2174,8 +2407,10 @@ static void ppe_offload_fdb_move_work(struct work_struct *work)
+ 	struct ppe_offload_flow_entry *entry;
+ 	unsigned int moved = 0, failed = 0, dropped = 0;
+ 	struct edma_port_priv *port_priv;
++	struct bridge_vlan_info vinfo;
+ 	struct net_device *bridge;
+ 	struct net_device *conduit;
++	bool vlan_aware, tagged = false;
+ 	struct hlist_node *tmp;
+ 	struct dsa_port *dp;
+ 
+@@ -2189,11 +2424,35 @@ static void ppe_offload_fdb_move_work(struct work_struct *work)
+ 	if (IS_ERR(dp) || dp->index >= PPE_OFFLOAD_RTL8_4_RX_BITS)
+ 		goto out;
+ 	bridge = dsa_port_bridge_dev_get(dp);
+-	if (!bridge || br_vlan_enabled(bridge))
++	if (!bridge)
++		goto out;
++
++	/* In a VLAN-aware bridge, only a learn in the VLAN the emulated tag
++	 * delivers in, on a port that is a member there in the way the flow
++	 * leaves (see ppe_offload_dsa_vlan_ok()).
++	 */
++	vlan_aware = br_vlan_enabled(bridge);
++	if (move->vid != (vlan_aware ? PPE_OFFLOAD_RTL8372N_CPU_VID : 0))
+ 		goto out;
+ 	/* What ppe_offload_dsa_egress() asks of a bridged port. */
+-	if (netdev_master_upper_dev_get(move->dev) != bridge)
++	if (netdev_master_upper_dev_get(move->dev) != bridge ||
++	    dsa_port_is_vlan_filtering(dp) != vlan_aware)
+ 		goto out;
++	if (vlan_aware) {
++		bool only;
++
++		if (!dp->ds->dev ||
++		    !of_device_is_compatible(dp->ds->dev->of_node, "realtek,rtl8372n"))
++			goto out;
++		if (br_vlan_get_info(move->dev, PPE_OFFLOAD_RTL8372N_CPU_VID, &vinfo))
++			goto out;
++		tagged = !(vinfo.flags & BRIDGE_VLAN_INFO_UNTAGGED);
++		rcu_read_lock();
++		only = ppe_offload_vlan1_untagged_only(priv, dp, move->dev);
++		rcu_read_unlock();
++		if (!tagged && !only)
++			goto out;
++	}
+ 
+ 	/* The bridge learns on a port before it forwards to it; a port it
+ 	 * would not deliver to is no destination for hardware either.
+@@ -2228,6 +2487,8 @@ static void ppe_offload_fdb_move_work(struct work_struct *work)
+ 		if (!entry->flow_valid || entry->dsa_ds != dp->ds ||
+ 		    entry->nexthop.port != port_priv->ppe_port->port_id ||
+ 		    entry->dsa_bridge_ifindex != bridge->ifindex ||
++		    entry->dsa_vlan_aware != vlan_aware ||
++		    (vlan_aware && entry->dsa_vlan_tagged != tagged) ||
+ 		    entry->dsa_ifindex == move->dev->ifindex ||
+ 		    !ether_addr_equal(entry->dmac, move->addr))
+ 			continue;
+@@ -2301,11 +2562,13 @@ static int ppe_offload_fdb_event(struct notifier_block *nb, unsigned long event,
+ 
+ 	/* The bridge reports a local (its own) address against the bridge
+ 	 * device, only a DSA user port can be the new home of a client this
+-	 * driver addresses by port, a VLAN-aware bridge's entries carry a
+-	 * VID this cannot follow, and a locked entry (MAB) is the bridge
+-	 * withholding forwarding, not granting it.
++	 * driver addresses by port, a VLAN-aware bridge's flows here are all
++	 * in VLAN 1 (ppe_offload_dsa_vlan_ok()) and a VLAN-unaware one learns
++	 * without a VID, and a locked entry (MAB) is the bridge withholding
++	 * forwarding, not granting it.
+ 	 */
+-	if (fdb_info->is_local || fdb_info->vid || fdb_info->locked ||
++	if (fdb_info->is_local || fdb_info->locked ||
++	    (fdb_info->vid && fdb_info->vid != PPE_OFFLOAD_RTL8372N_CPU_VID) ||
+ 	    !dsa_user_dev_check(dev))
+ 		return NOTIFY_DONE;
+ 
+@@ -2326,6 +2589,7 @@ static int ppe_offload_fdb_event(struct notifier_block *nb, unsigned long event,
+ 			       ether_addr_to_u64(fdb_info->addr)) {
+ 		if (!ether_addr_equal(entry->dmac, fdb_info->addr) ||
+ 		    entry->dsa_bridge_ifindex != bridge->ifindex ||
++		    fdb_info->vid != (entry->dsa_vlan_aware ? PPE_OFFLOAD_RTL8372N_CPU_VID : 0) ||
+ 		    READ_ONCE(entry->dsa_ifindex) == dev->ifindex ||
+ 		    entry->move_pending)
+ 			continue;
+@@ -2347,6 +2611,7 @@ static int ppe_offload_fdb_event(struct notifier_block *nb, unsigned long event,
+ 	netdev_hold(dev, &move->tracker, GFP_ATOMIC);
+ 	move->dev = dev;
+ 	ether_addr_copy(move->addr, fdb_info->addr);
++	move->vid = fdb_info->vid;
+ 	queue_work(priv->fdb_wq, &move->work);
+ 
+ 	return NOTIFY_DONE;
+@@ -2363,6 +2628,150 @@ static int ppe_offload_fdb_event(struct notifier_block *nb, unsigned long event,
+ 	return NOTIFY_DONE;
+ }
+ 
++/* Port-addressed flows go back to software whenever a bridge changes what
++ * it would send them through: a port's VLANs (membership, tagged or not,
++ * PVID), its STP state, or the bridge's VLAN filtering or protocol. The
++ * emulated head tag names a port outright and the switch exempts the CPU's
++ * frames from its egress membership check, so nothing else stops a stale
++ * entry. The switchdev notification arrives under RTNL, in process
++ * context, during the bridge's change: before it for a VLAN added and for
++ * the bridge's VLAN protocol, after it for the bridge's VLAN filtering and
++ * a deleted VLAN's PVID, and for a port's STP state deferred
++ * (SWITCHDEV_F_DEFER), after the bridge applied it, in the pass in which
++ * DSA programs the switch port's state (the software flowtable does not
++ * consult STP either). The second flush from fdb_wq and the generation
++ * count make the result independent of that order. The flows
++ * towards the port it concerns (all of them, for a change to a bridge
++ * itself) are dropped there and then, and again from fdb_wq once the
++ * change is complete, so
++ * that the flowtable's next refresh (within a second while software
++ * forwards them) re-offers them against the bridge as it is now. Coarse
++ * on purpose: these changes are rare, and the cost is a second of software
++ * path for that port's clients.
++ */
++/* Every port: a change to a bridge itself. */
++#define PPE_OFFLOAD_DSA_ALL		BIT(31)
++
++/* The ports a bridge change on @dev concerns, as a mask of switch port
++ * indices. Under RTNL.
++ */
++static u32 ppe_offload_dsa_ports(const struct net_device *dev)
++{
++	struct dsa_port *dp;
++
++	if (!dsa_user_dev_check(dev))
++		return PPE_OFFLOAD_DSA_ALL;
++	dp = dsa_port_from_netdev((struct net_device *)dev);
++	if (IS_ERR(dp) || dp->index >= 31)
++		return PPE_OFFLOAD_DSA_ALL;
++
++	return BIT(dp->index);
++}
++
++static void ppe_offload_dsa_flush(struct ppe_offload_priv *priv, u32 ports)
++{
++	struct ppe_offload_flow_entry *entry;
++	unsigned int dropped = 0, stuck = 0;
++	struct hlist_node *tmp;
++	int bkt;
++
++	mutex_lock(&priv->lock);
++
++	hash_for_each_safe(priv->dsa_fixed_ht, bkt, tmp, entry, dsa_fixed_hnode) {
++		if (!(ports & PPE_OFFLOAD_DSA_ALL) &&
++		    (entry->dsa_index >= 31 || !(ports & BIT(entry->dsa_index))))
++			continue;
++		if (ppe_offload_flow_drop(priv, entry))
++			stuck++;
++		else
++			dropped++;
++	}
++	atomic_inc(&priv->dsa_gen);
++
++	mutex_unlock(&priv->lock);
++
++	if (stuck)
++		pr_err("ppe_offload: bridge change: %u port-addressed flow entr%s could not be deleted\n",
++		       stuck, stuck == 1 ? "y" : "ies");
++	if (dropped)
++		pr_info_ratelimited("ppe_offload: bridge change: %u port-addressed flow(s) back to software\n",
++				    dropped);
++}
++
++/* The flush again once the change is complete: RTNL is taken after it. */
++static void ppe_offload_dsa_flush_work(struct work_struct *work)
++{
++	struct ppe_offload_priv *priv = container_of(work, struct ppe_offload_priv,
++						     dsa_flush_work);
++
++	rtnl_lock();
++	ppe_offload_dsa_flush(priv, atomic_xchg(&priv->dsa_flush_ports, 0));
++	rtnl_unlock();
++}
++
++/* A bridge change is being notified (under RTNL, in process context,
++ * before or after the bridge applies it, see PPE_OFFLOAD_DSA_ALL): drop the
++ * port-addressed flows now, and once more from fdb_wq after it, for a flow
++ * added against the bridge in between.
++ */
++static void ppe_offload_dsa_change(struct ppe_offload_priv *priv, const struct net_device *dev)
++{
++	u32 ports = ppe_offload_dsa_ports(dev);
++
++	ASSERT_RTNL();
++
++	atomic_inc(&priv->dsa_gen);
++	ppe_offload_dsa_flush(priv, ports);
++	atomic_or(ports, &priv->dsa_flush_ports);
++	queue_work(priv->fdb_wq, &priv->dsa_flush_work);
++}
++
++static int ppe_offload_switchdev_event(struct notifier_block *nb, unsigned long event,
++				       void *ptr)
++{
++	struct ppe_offload_priv *priv = container_of(nb, struct ppe_offload_priv,
++						     switchdev_nb);
++	struct net_device *dev = switchdev_notifier_info_to_dev(ptr);
++	bool relevant = false;
++
++	switch (event) {
++	case SWITCHDEV_PORT_OBJ_ADD:
++	case SWITCHDEV_PORT_OBJ_DEL: {
++		const struct switchdev_notifier_port_obj_info *info = ptr;
++
++		relevant = info->obj->id == SWITCHDEV_OBJ_ID_PORT_VLAN;
++		break;
++	}
++	case SWITCHDEV_PORT_ATTR_SET: {
++		const struct switchdev_notifier_port_attr_info *info = ptr;
++
++		switch (info->attr->id) {
++		case SWITCHDEV_ATTR_ID_PORT_STP_STATE:
++		case SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING:
++		case SWITCHDEV_ATTR_ID_BRIDGE_VLAN_PROTOCOL:
++			relevant = true;
++			break;
++		default:
++			break;
++		}
++		break;
++	}
++	default:
++		break;
++	}
++
++	/* Only changes to a DSA user port or to a bridge matter. A flow being
++	 * added meanwhile may have been checked against the bridge before the
++	 * change is complete: the generation bumped here and again at the
++	 * end of the flush makes its add decline (ppe_offload_flow_replace()),
++	 * so it is re-offered against the final state.
++	 */
++	if (relevant && (dsa_user_dev_check(dev) || netif_is_bridge_master(dev)))
++		ppe_offload_dsa_change(priv, dev);
++
++	return NOTIFY_DONE;
++}
++
+ static int ppe_offload_fdb_follow_init(struct ppe_offload_priv *priv)
+ {
+ 	int ret;
+@@ -2371,22 +2780,36 @@ static int ppe_offload_fdb_follow_init(struct ppe_offload_priv *priv)
+ 	if (!priv->fdb_wq)
+ 		return -ENOMEM;
+ 
++	INIT_WORK(&priv->dsa_flush_work, ppe_offload_dsa_flush_work);
++
+ 	priv->fdb_nb.notifier_call = ppe_offload_fdb_event;
+ 	ret = register_switchdev_notifier(&priv->fdb_nb);
+-	if (ret) {
+-		destroy_workqueue(priv->fdb_wq);
+-		priv->fdb_wq = NULL;
+-	}
++	if (ret)
++		goto destroy_wq;
++
++	priv->switchdev_nb.notifier_call = ppe_offload_switchdev_event;
++	ret = register_switchdev_blocking_notifier(&priv->switchdev_nb);
++	if (ret)
++		goto unregister_fdb;
++
++	return 0;
++
++unregister_fdb:
++	unregister_switchdev_notifier(&priv->fdb_nb);
++destroy_wq:
++	destroy_workqueue(priv->fdb_wq);
++	priv->fdb_wq = NULL;
+ 
+ 	return ret;
+ }
+ 
+-/* Stops new moves, then waits for the queued ones. */
++/* Stops new moves and flushes, then waits for the queued ones. */
+ static void ppe_offload_fdb_follow_exit(struct ppe_offload_priv *priv)
+ {
+ 	if (!priv->fdb_wq)
+ 		return;
+ 
++	unregister_switchdev_blocking_notifier(&priv->switchdev_nb);
+ 	unregister_switchdev_notifier(&priv->fdb_nb);
+ 	destroy_workqueue(priv->fdb_wq);
+ 	priv->fdb_wq = NULL;
+@@ -2506,12 +2929,14 @@ static int ppe_offload_flow_cmd(struct net_device *netdev, struct ppe_offload_pr
+ 		/* The decision does not depend on which of the callbacks
+ 		 * bound to the flowtable is asked (only on the rule and on
+ 		 * the driver's state), so every callback withdraws alike.
+-		 * -EEXIST is the flow already in hardware, healthy.
++		 * -EEXIST is the flow already in hardware, healthy; -EAGAIN
++		 * a device or bridge change raced the offer, whose handler
++		 * takes out of hardware whatever it concerns.
+ 		 */
+ 		ret = ppe_offload_flow_replace(netdev, priv, block, cls);
+ 		if (ret == -EOPNOTSUPP)
+ 			atomic_long_inc(&priv->counters.declined);
+-		if (ret && ret != -EEXIST)
++		if (ret && ret != -EEXIST && ret != -EAGAIN)
+ 			ppe_offload_flow_withdraw(priv, cls->cookie);
+ 		return ret;
+ 	case FLOW_CLS_DESTROY:
+@@ -3045,6 +3470,26 @@ static bool ppe_offload_hdr_exception_init(struct ppe_device *ppe_dev)
+ 	return true;
+ }
+ 
++/* A switch port joining or leaving a bridge, or gaining or losing a VLAN
++ * upper (which the switch driver refuses on a port of the offloaded
++ * bridge; a port that has one when it joins is bridged in software): its
++ * port-addressed flows go, as for a bridge VLAN change, before the link
++ * and after it. Under RTNL, as netdevice notifiers are.
++ */
++static int ppe_offload_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
++{
++#if IS_ENABLED(CONFIG_NET_DSA) && IS_ENABLED(CONFIG_NET_SWITCHDEV)
++	struct ppe_offload_priv *priv = container_of(nb, struct ppe_offload_priv, netdev_nb);
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++
++	if ((event == NETDEV_PRECHANGEUPPER || event == NETDEV_CHANGEUPPER) &&
++	    dsa_user_dev_check(dev))
++		ppe_offload_dsa_change(priv, dev);
++#endif
++
++	return NOTIFY_DONE;
++}
++
+ /**
+  * ppe_offload_init() - Initialize PPE hardware flow-offload state.
+  * @ppe_dev: PPE device.
+@@ -3080,6 +3525,7 @@ int ppe_offload_init(struct ppe_device *ppe_dev)
+ 
+ 	hash_init(priv->dsa_fixed_ht);
+ 	spin_lock_init(&priv->dsa_fixed_lock);
++	spin_lock_init(&priv->vlan1_lock);
+ 	atomic_set(&priv->fdb_moves, 0);
+ 	ret = ppe_offload_fdb_follow_init(priv);
+ 	if (ret) {
+@@ -3087,6 +3533,14 @@ int ppe_offload_init(struct ppe_device *ppe_dev)
+ 		return ret;
+ 	}
+ 
++	priv->netdev_nb.notifier_call = ppe_offload_netdev_event;
++	ret = register_netdevice_notifier(&priv->netdev_nb);
++	if (ret) {
++		ppe_offload_fdb_follow_exit(priv);
++		rhashtable_destroy(&priv->flow_table);
++		return ret;
++	}
++
+ 	ppe_dev->offload = priv;
+ 
+ 	return 0;
+@@ -3599,10 +4053,12 @@ static int ppe_offload_flows_show(struct seq_file *m, void *v)
+ 		   atomic_long_read(&priv->counters.stuck));
+ 
+ 	list_for_each_entry(entry, &priv->flows, list) {
+-		seq_printf(m, "flow %u: valid %d nexthop %u host %u dsa_port %u packets %llu bytes %llu idle %ums\n",
++		seq_printf(m, "flow %u: valid %d nexthop %u host %u dsa_port %u%s packets %llu bytes %llu idle %ums\n",
+ 			   entry->flow_index, entry->flow_valid, entry->nexthop_index,
+ 			   entry->host_index,
+ 			   entry->dsa_fixed ? entry->dsa_index : 0,
++			   entry->dsa_vlan_aware ? (entry->dsa_vlan_tagged ? " vlan1-tagged" :
++						    " vlan1-untagged") : "",
+ 			   entry->stats_packets, entry->stats_bytes,
+ 			   jiffies_to_msecs(jiffies - entry->lastused));
+ 		n++;
+@@ -3846,6 +4302,7 @@ void ppe_offload_destroy(struct ppe_device *ppe_dev)
+ 	if (!priv)
+ 		return;
+ 
++	unregister_netdevice_notifier(&priv->netdev_nb);
+ 	/* No more moves once the flows below start going away. */
+ 	ppe_offload_fdb_follow_exit(priv);
+ 	/* Free the tracked flows AND tear down the hardware entries they own:
