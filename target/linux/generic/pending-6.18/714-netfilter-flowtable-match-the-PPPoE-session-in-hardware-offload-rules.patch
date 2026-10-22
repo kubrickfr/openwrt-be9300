@@ -1,0 +1,102 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] netfilter: flowtable: match the PPPoE session in hardware
+ offload rules
+
+A flow received in a PPPoE session is looked up in software by its
+session: nf_flow_tuple_encap() records the session ID of a PPPoE frame
+in the tuple, the flow's own tuple carries the session it was set up
+with (nft_dev_path_info(), flow_offload_fill_route()), and the encap
+IDs are part of the lookup key. A frame of another session, or a plain
+IP frame with the same 5-tuple, does not hit the flow.
+
+nf_flow_rule_match() only turns 802.1Q encapsulations into match keys.
+For a direction of a flow received through a PPPoE interface, the
+hardware rule therefore matches the ingress device and the inner
+5-tuple (the VLAN key is filled but not flagged in used_keys), and
+nothing says that the packets arrive in a PPPoE session, let alone which
+one. A driver that programs the rule as given accepts frames that
+software never forwards through this flow: plain IP, or another session,
+on the same port with the same 5-tuple.
+
+Add the session to the match as FLOW_DISSECTOR_KEY_PPPOE, filled the way
+cls_flower fills it: the session ID, the PPP protocol of the tuple's
+family (PPP_IP or PPP_IPV6) and the type ETH_P_PPP_SES, all with full
+masks, and basic.n_proto keeps the inner protocol as before. Set the key
+in used_keys so that drivers can program it or decline the rule. PPPoE
+is always the innermost encapsulation of the tuple, after any VLAN.
+
+The key is set on whichever direction of a flow is received through a
+PPPoE interface: the reply of a connection routed out through it, or the
+original direction of one opened from that side (a DNAT port forward,
+inbound IPv6). act_ct flows have no encapsulation. Of the drivers that
+handle TC_SETUP_FT, mtk_eth_soc and airoha read the keys they know and
+ignore this one, as they already ignore the VLAN; mlx5 checks used_keys
+against the keys it supports and now declines such a rule, as it already
+declines the opposite direction, which carries FLOW_ACTION_PPPOE_PUSH.
+
+The VLAN keys set by this function are still not in used_keys; that is
+left alone here.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ include/net/netfilter/nf_flow_table.h |  1 +
+ net/netfilter/nf_flow_table_offload.c | 31 +++++++++++++++++++++++++++
+ 2 files changed, 32 insertions(+)
+
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -25,6 +25,7 @@ struct nf_flow_key {
+ 	struct flow_dissector_key_basic			basic;
+ 	struct flow_dissector_key_vlan			vlan;
+ 	struct flow_dissector_key_vlan			cvlan;
++	struct flow_dissector_key_pppoe			pppoe;
+ 	union {
+ 		struct flow_dissector_key_ipv4_addrs	ipv4;
+ 		struct flow_dissector_key_ipv6_addrs	ipv6;
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -89,6 +89,35 @@ static void nf_flow_rule_vlan_match(struct flow_dissector_key_vlan *key,
+ 	mask->vlan_tpid = 0xffff;
+ }
+ 
++/* Match the PPPoE session a flow is received in, as the software path
++ * does: nf_flow_tuple_encap() records the session ID of a PPPoE frame in
++ * the tuple it looks the flow up with. The key is filled the way
++ * cls_flower fills it, with the PPP protocol of the tuple's family.
++ */
++static void nf_flow_rule_pppoe_match(struct nf_flow_match *match,
++				     const struct flow_offload_tuple *tuple)
++{
++	struct nf_flow_key *mask = &match->mask;
++	struct nf_flow_key *key = &match->key;
++	int i;
++
++	for (i = 0; i < tuple->encap_num; i++) {
++		if (tuple->encap[i].proto != htons(ETH_P_PPP_SES))
++			continue;
++
++		NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_PPPOE, pppoe);
++		key->pppoe.session_id = htons(tuple->encap[i].id);
++		mask->pppoe.session_id = htons(0xffff);
++		key->pppoe.ppp_proto = htons(tuple->l3proto == AF_INET ?
++					     PPP_IP : PPP_IPV6);
++		mask->pppoe.ppp_proto = htons(0xffff);
++		key->pppoe.type = htons(ETH_P_PPP_SES);
++		mask->pppoe.type = htons(0xffff);
++		match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_PPPOE);
++		break;
++	}
++}
++
+ static int nf_flow_rule_match(struct nf_flow_match *match,
+ 			      const struct flow_offload_tuple *tuple,
+ 			      struct dst_entry *other_dst)
+@@ -168,6 +197,8 @@ static int nf_flow_rule_match(struct nf_flow_match *match,
+ 	match->dissector.used_keys |= BIT_ULL(key->control.addr_type);
+ 	mask->basic.n_proto = 0xffff;
+ 
++	nf_flow_rule_pppoe_match(match, tuple);
++
+ 	switch (tuple->l4proto) {
+ 	case IPPROTO_TCP:
+ 		key->tcp.flags = 0;
