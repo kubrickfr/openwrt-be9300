@@ -53,7 +53,7 @@ profiles of the trees it grew from are not carried.
 | SoC | Qualcomm IPQ5332, 4× Cortex-A53 |
 | Wi-Fi 2.4 GHz | on-SoC radio, ath12k over AHB |
 | Wi-Fi 5 / 6 GHz | 2× QCN9274, ath12k over PCIe |
-| Switch | RTL8372N, out-of-tree SDK-free DSA driver (`realtek,rtl8372n`, native `rtl8_4` tag; benched on a GL-BE9300 in October 2026, see `package/kernel/rtl837x/TESTING.md`); SoC↔switch link is 10GBASE-R |
+| Switch | RTL8372N, out-of-tree SDK-free DSA driver (`realtek,rtl8372n`, native `rtl8_4` tag; benched on a GL-BE9300 in October 2026, see `package/kernel/rtl8372n/TESTING.md`); SoC↔switch link is 10GBASE-R |
 | WAN | RTL8221B 2.5G PHY, `2500base-x` to the SoC |
 | Storage | eMMC |
 
@@ -62,7 +62,7 @@ profiles of the trees it grew from are not carried.
 | Subsystem | State |
 |---|---|
 | Boot / procd / SSH | working |
-| LAN (RTL8372N via DSA + EDMA/PPE) | working with the new driver, one bridge switched in hardware (bench results in `package/kernel/rtl837x/TESTING.md`) |
+| LAN (RTL8372N via DSA + EDMA/PPE) | working with the new driver, one bridge switched in hardware (bench results in `package/kernel/rtl8372n/TESTING.md`) |
 | WAN (2.5G) | working at 2.5 Gbps; 1G/100M link rates untested |
 | VLANs (bridge-vlan on DSA) | working: one VLAN-aware bridge offloaded, access and trunk ports, tagged-only ports (some checks still need more hosts, see `TESTING.md`) |
 | Flow offloading | software flowtable only; no PPE hardware flow offload (see below) |
@@ -183,7 +183,7 @@ uci commit firewall && fw4 reload
 - **Switch driver limits.** With offload on, one bridge is switched in
   hardware and a second one runs in software; there is no MDB, so multicast
   floods per `mcast_flood` whatever IGMP snooping decides. The full list is
-  section 7 of `package/kernel/rtl837x/TESTING.md`. The VLAN-filtering and
+  section 7 of `package/kernel/rtl8372n/TESTING.md`. The VLAN-filtering and
   IGMP-snooping issues seen with the previous driver (2026-10-04) have not
   been retested.
 - **Unprogrammed ART country.** The regulatory country is read from the ART
@@ -211,7 +211,7 @@ The switch driver offloads one bridge and its VLANs to the switch
 (`CONFIG_RTL837X_DSA_OFFLOAD`, on by default). `options rtl8372n_dsa
 offload=0` (or `=1`) in `/etc/modules.conf` overrides that at boot; with
 offload off, every bridge runs in software. See
-`package/kernel/rtl837x/TESTING.md`.
+`package/kernel/rtl8372n/TESTING.md`.
 
 Images land in `bin/targets/qualcommbe/ipq53xx/`. The build fails if the
 kernel image is larger than the 7 MiB `0:HLOS` partition, rather than
@@ -356,7 +356,7 @@ Patches from this work that have gone upstream or are in review:
 Maksims Neroba wrote the SDK-free RTL8372N DSA driver the switch package is
 based on (perceival/openwrt-flint3#104), adapting Airjinkela's DSA refactor;
 his P1 work found the switch's table locking, STP encoding and L2 flush
-completion bit used by the offload (see `package/kernel/rtl837x/PROVENANCE.md`).
+completion bit used by the offload (see `package/kernel/rtl8372n/PROVENANCE.md`).
 
 Kamil Bienkiewicz (perceival) wrote the EDMA checksum fallback (0431), the
 earlier rtl837x VLAN ingress and

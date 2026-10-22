@@ -2,7 +2,7 @@ From: Francois Guerraz <kubrick@fgv6.net>
 Subject: [PATCH] net: dsa: tag_rtl8_4: do not mark trapped link-local frames
  as forwarded
 
-The RTL8372N driver (package/kernel/rtl837x) sets the switch's
+The RTL8372N driver (package/kernel/rtl8372n) sets the switch's
 reserved-multicast actions to trap 01:80:c2:00:00:00 and 02-0f (STP,
 LACP, EAPOL, LLDP, ...) to the CPU, so the switch never forwards these
 frames between its ports. The trapped frames are expected to carry an

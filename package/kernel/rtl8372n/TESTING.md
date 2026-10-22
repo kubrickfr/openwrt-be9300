@@ -88,7 +88,7 @@ CONFIG_PACKAGE_ethtool-full=y
 EOF
 make defconfig
 make -j"$(nproc)"
-grep -ac 'joined bridge' build_dir/target-*/linux-qualcommbe_ipq53xx/rtl837x-dsa-*/rtl8372n_dsa.ko  # >= 1
+grep -ac 'joined bridge' build_dir/target-*/linux-qualcommbe_ipq53xx/rtl8372n-*/rtl8372n_dsa.ko  # >= 1
 grep -c is_link_local_ether_addr build_dir/target-*/linux-qualcommbe_ipq53xx/linux-*/net/dsa/tag_rtl8_4.c  # 1: 0432
 ```
 
@@ -258,7 +258,7 @@ config bridge-vlan
 ## 6. What to capture
 
 - Build: `git rev-parse HEAD`; `sha256sum` of the sysupgrade image and of the
-  `kmod-rtl837x-dsa` package in `bin/targets/qualcommbe/ipq53xx/packages`;
+  `kmod-dsa-rtl8372n` package in `bin/targets/qualcommbe/ipq53xx/packages`;
   the `grep -ac 'joined bridge'` count.
 - Per boot: the `offload` parameter, full `dmesg` saved right after boot (the
   128 KiB log must still start at `Booting Linux`), `/sys/fs/pstore/*`.

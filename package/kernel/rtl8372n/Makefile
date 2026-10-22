@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
-PKG_NAME:=rtl837x-dsa
+PKG_NAME:=rtl8372n
 PKG_VERSION:=0.0.2
 PKG_RELEASE:=10
 PKG_MAINTAINER:=air jinkela (air_jinkela@163.com)
@@ -9,9 +9,9 @@ PKG_CONFIG_DEPENDS:=CONFIG_RTL837X_DSA_DEBUG CONFIG_RTL837X_DSA_OFFLOAD
 
 include $(INCLUDE_DIR)/package.mk
 
-define KernelPackage/$(PKG_NAME)
-  SUBMENU:=Other modules
-  TITLE:=$(PKG_NAME)
+define KernelPackage/dsa-rtl8372n
+  SUBMENU:=Network Devices
+  TITLE:=Realtek RTL8372N switch DSA support
   # The switch uses its native RTL8_4 DSA tag.
   KCONFIG:=CONFIG_NET_DSA_TAG_RTL8_4
   FILES:= \
@@ -24,8 +24,13 @@ define KernelPackage/$(PKG_NAME)
   CONFLICTS:=kmod-dsa-rtl8365mb
 endef
 
-define KernelPackage/$(PKG_NAME)/config
-  if PACKAGE_kmod-$(PKG_NAME)
+define KernelPackage/dsa-rtl8372n/description
+  DSA driver for the Realtek RTL8372N switch (4x 2.5G + 10G uplink), as
+  on the GL.iNet GL-BE9300, with bridge and VLAN offload.
+endef
+
+define KernelPackage/dsa-rtl8372n/config
+  if PACKAGE_kmod-dsa-rtl8372n
 
 	config RTL837X_DSA_DEBUG
 		bool "Print the driver's debug messages (bench builds)"
@@ -63,4 +68,4 @@ define Build/Compile
 		modules
 endef
 
-$(eval $(call KernelPackage,rtl837x-dsa))
+$(eval $(call KernelPackage,dsa-rtl8372n))
