@@ -1,0 +1,2546 @@
+From: Kamil Bienkiewicz <perceivalpercy@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: add the flow, host, nexthop 
+ and L3 interface tables
+
+The PPE routes and translates a flow in hardware from five tables: the
+flow table (5-tuple and NAT overlay, hashed), the host table (the
+address the flow entry points at), the nexthop table (egress port, tag
+inserts, rewritten MAC and address), the public IP table (SNAT source),
+and the L3 interface tables with MY_MAC and the port-to-L3-interface
+binding. Add primitives for each, for the IPv4 layouts:
+
+- table operations through the IPE_L3 indirect-op registers, stamping
+  and matching a command ID so that a result is never taken from another
+  operation, under a per-table lock;
+- encoders for the IPv4 NAT flow entry (SNAT and DNAT overlays, source
+  L3 interface, PMTU) and the IPv4 host entry;
+- per-flow hit counters, read as deltas, cleared when an index is
+  programmed;
+- refcounted pools for host, nexthop and public IP entries, so that
+  flows sharing one share the entry;
+- the APPE register map of these tables (IPQ5332 builds as APPE/MPPE),
+  the MY_MAC table and the port-to-L3-interface binding included.
+
+Nothing calls them yet.
+
+Ported from Kamil Bienkiewicz's flow offload series for the GL-BE9300
+(perceival/openwrt-flint3 2365932733), his patches 0411-0418, 0421,
+0431, 0433, 0434, 0436-0438, 0440 and 0441, the flow table base of 0454,
+the @deacclr_en kernel-doc of 0442 and the table parts of 0450, 0451 and
+0455, folded into their final state. Changes in the port: the IPv6 flow
+and host layouts are left out (the IPv6 entry sizes stay, the table
+operations taking either), the parser, TPID and exception registers move
+to the patches that use them, and comments that pointed at IPv6 code or
+at later patches are reworded; nothing else. His 0440 and 0441 carry no
+Signed-off-by in his tree; this port carries none.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/net/ethernet/qualcomm/ppe/Makefile    |   2 +
+ drivers/net/ethernet/qualcomm/ppe/ppe.c       |   2 +
+ drivers/net/ethernet/qualcomm/ppe/ppe.h       |  10 +
+ drivers/net/ethernet/qualcomm/ppe/ppe_flow.c  | 266 +++++++++++++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_flow.h  |  54 ++++
+ .../net/ethernet/qualcomm/ppe/ppe_flow_ipv4.c | 117 +++++++
+ .../net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h | 110 +++++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_host.c  | 130 ++++++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_host.h  |  24 ++
+ .../net/ethernet/qualcomm/ppe/ppe_host_ipv4.c |  51 +++
+ .../net/ethernet/qualcomm/ppe/ppe_host_ipv4.h |  30 ++
+ .../net/ethernet/qualcomm/ppe/ppe_host_pool.c | 153 +++++++++
+ .../net/ethernet/qualcomm/ppe/ppe_host_pool.h |  45 +++
+ drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.c | 283 ++++++++++++++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.h |  90 ++++++
+ .../net/ethernet/qualcomm/ppe/ppe_nexthop.c   | 134 ++++++++
+ .../net/ethernet/qualcomm/ppe/ppe_nexthop.h   |  53 +++
+ .../ethernet/qualcomm/ppe/ppe_nexthop_pool.c  | 163 ++++++++++
+ .../ethernet/qualcomm/ppe/ppe_nexthop_pool.h  |  58 ++++
+ .../net/ethernet/qualcomm/ppe/ppe_pub_ip.c    |  62 ++++
+ .../net/ethernet/qualcomm/ppe/ppe_pub_ip.h    |  16 +
+ .../ethernet/qualcomm/ppe/ppe_pub_ip_pool.c   | 141 ++++++++
+ .../ethernet/qualcomm/ppe/ppe_pub_ip_pool.h   |  54 ++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_regs.h  | 306 ++++++++++++++++++
+ 24 files changed, 2354 insertions(+)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/Makefile
++++ b/drivers/net/ethernet/qualcomm/ppe/Makefile
+@@ -5,6 +5,8 @@
+ 
+ obj-$(CONFIG_QCOM_PPE) += qcom-ppe.o
+ qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o
++qcom-ppe-objs += ppe_flow.o ppe_flow_ipv4.o ppe_host.o ppe_host_ipv4.o ppe_host_pool.o \
++		 ppe_nexthop.o ppe_nexthop_pool.o ppe_l3_if.o ppe_pub_ip.o ppe_pub_ip_pool.o
+ 
+ #EDMA
+ qcom-ppe-objs += edma.o edma_cfg_rx.o edma_cfg_tx.o edma_debugfs.o edma_port.o edma_rx.o edma_tx.o edma_ethtool.o
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c
+@@ -238,6 +238,8 @@ static int qcom_ppe_probe(struct platform_device *pdev)
+ 			    PPE_CLK_RATE;
+ 	ppe_dev->num_ports = num_ports;
+ 	ppe_dev->num_icc_paths = num_icc;
++	mutex_init(&ppe_dev->flow_tbl_lock);
++	mutex_init(&ppe_dev->host_tbl_lock);
+ 
+ 	ret = ppe_clock_init_and_reset(ppe_dev, ppe_icc_data);
+ 	if (ret)
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.h
+@@ -9,6 +9,7 @@
+ #include <linux/compiler.h>
+ #include <linux/device.h>
+ #include <linux/interconnect.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ 
+ struct device;
+@@ -25,6 +26,13 @@ struct ppe_ports;
+  * @num_ports: Number of PPE ports.
+  * @debugfs_root: Debugfs root entry.
+  * @ports: PPE MAC ports.
++ * @flow_tbl_lock: Serializes access to the flow table's shared
++ * command/data/result register triplet (see ppe_flow.c) against
++ * concurrent add/del calls.
++ * @host_tbl_lock: Serializes access to the host table's shared
++ * command/data/result register triplet (see ppe_host.c) against
++ * concurrent add/del calls. Independent of @flow_tbl_lock: the two
++ * tables use entirely separate registers.
+  * @num_icc_paths: Number of interconnect paths.
+  * @icc_paths: Interconnect path array.
+  *
+@@ -39,6 +47,8 @@ struct ppe_device {
+ 	unsigned int num_ports;
+ 	struct dentry *debugfs_root;
+ 	struct ppe_ports *ports;
++	struct mutex flow_tbl_lock;
++	struct mutex host_tbl_lock;
+ 	unsigned int num_icc_paths;
+ 	struct icc_bulk_data icc_paths[] __counted_by(num_icc_paths);
+ };
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+@@ -0,0 +1,266 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* PPE flow table -- hardware NAT/routing flow entries. Unlike the rest of
++ * the PPE's tables, which are addressed directly (one MMIO offset per
++ * entry), the flow table is accessed indirectly through a fixed
++ * command/data/result register triplet: write the entry's data words,
++ * write a command describing the operation and target index, then poll
++ * the result register until hardware reports the operation done.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/mutex.h>
++#include <linux/regmap.h>
++
++#include "ppe.h"
++#include "ppe_flow.h"
++#include "ppe_regs.h"
++
++/* Values for PPE_IN_FLOW_TBL_OP's OP_TYPE field. */
++enum ppe_flow_tbl_op_type {
++	PPE_FLOW_TBL_OP_ADD = 0,
++	PPE_FLOW_TBL_OP_DEL,
++	PPE_FLOW_TBL_OP_GET,
++	PPE_FLOW_TBL_OP_FLUSH,
++};
++
++/* Per-table command tag, mirroring the vendor SDK's hppe_flow.c
++ * flow_cmd_id -- see ppe_host_cmd_id in ppe_host.c.
++ */
++static u32 ppe_flow_cmd_id;
++
++/* Trigger the given flow table operation and wait for hardware to
++ * complete it. *index is the entry index to operate on for
++ * PPE_FLOW_OP_MODE_INDEX (input); for PPE_FLOW_OP_MODE_HASH it is
++ * ignored on input and set to the hardware-assigned index on success.
++ */
++static int ppe_flow_tbl_op_wait(struct ppe_device *ppe_dev,
++				 enum ppe_flow_tbl_op_type op_type,
++				 enum ppe_flow_op_mode mode, u32 *index)
++{
++	u32 val, rslt, cmd_id;
++	int ret;
++
++	cmd_id = ppe_flow_cmd_id++ & FIELD_MAX(PPE_IN_FLOW_TBL_OP_CMD_ID);
++
++	val = FIELD_PREP(PPE_IN_FLOW_TBL_OP_CMD_ID, cmd_id);
++	val |= FIELD_PREP(PPE_IN_FLOW_TBL_OP_OP_TYPE, op_type);
++	val |= FIELD_PREP(PPE_IN_FLOW_TBL_OP_HASH_BLOCK_BITMAP, 3);
++	val |= FIELD_PREP(PPE_IN_FLOW_TBL_OP_OP_MODE, mode);
++	val |= FIELD_PREP(PPE_IN_FLOW_TBL_OP_ENTRY_INDEX, *index);
++
++	ret = regmap_write(ppe_dev->regmap, PPE_IN_FLOW_TBL_OP_ADDR, val);
++	if (ret)
++		return ret;
++
++	/* VALID_CNT is a counter, not a one-shot valid bit, and nothing clears
++	 * it between operations -- a stale result left by a previous op would
++	 * otherwise satisfy the poll immediately and we would adopt ITS entry
++	 * index. Match the command tag we just issued, which is what the tag is
++	 * for, so an add cannot return a foreign index (leaving the entry we
++	 * actually programmed untracked and never deleted) and a delete cannot
++	 * remove an unrelated live flow.
++	 */
++	ret = regmap_read_poll_timeout(ppe_dev->regmap, PPE_IN_FLOW_TBL_OP_RSLT_ADDR,
++					rslt,
++					FIELD_GET(PPE_IN_FLOW_TBL_OP_RSLT_VALID_CNT, rslt) &&
++					FIELD_GET(PPE_IN_FLOW_TBL_OP_RSLT_CMD_ID, rslt) == cmd_id,
++					10, 2000);
++	if (ret)
++		return ret;
++
++	/* A hash-mode add is refused when no way of the key's bucket is free:
++	 * the only refusal seen on the GL-BE9300, and what callers need to
++	 * tell from a fault. Any other refusal stays -EIO.
++	 */
++	if (FIELD_GET(PPE_IN_FLOW_TBL_OP_RSLT_OP_RSLT, rslt))
++		return op_type == PPE_FLOW_TBL_OP_ADD && mode == PPE_FLOW_OP_MODE_HASH ?
++		       -ENOSPC : -EIO;
++
++	*index = FIELD_GET(PPE_IN_FLOW_TBL_OP_RSLT_ENTRY_INDEX, rslt);
++
++	/* The result field is 12 bits wide but the MPPE table only has
++	 * PPE_IN_FLOW_TBL_ENTRIES slots. Report it rather than fail: the
++	 * op has already taken effect, and callers size their per-index
++	 * state by the field width, so the index stays usable.
++	 */
++	if (*index >= PPE_IN_FLOW_TBL_ENTRIES)
++		dev_warn_once(ppe_dev->dev, "flow table op returned index %u beyond table size %u\n",
++			      *index, PPE_IN_FLOW_TBL_ENTRIES);
++
++	return 0;
++}
++
++/**
++ * ppe_flow_counter_get() - Read a flow entry's cumulative hit counters.
++ * @ppe_dev: PPE device.
++ * @index: Flow table entry index.
++ * @packets: Out: packets matched by this entry since it was programmed.
++ * @bytes: Out: bytes matched by this entry since it was programmed.
++ *
++ * The counters live in a separate table from the flow entries themselves and are
++ * addressed directly (no command/result handshake). They are cumulative, are not
++ * clear-on-read, and are only zeroed when ppe_flow_entry_add() clears them for a
++ * freshly programmed index -- so the caller keeps the previous reading and
++ * reports a delta.
++ *
++ * The byte counter is 40 bits split across two words, and hardware keeps
++ * counting between the two reads, so a naive read can combine a pre-carry low
++ * word with a post-carry high byte and be wrong by 4GiB. Re-read the high byte
++ * and retry if it moved.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_flow_counter_get(struct ppe_device *ppe_dev, u32 index,
++			 u64 *packets, u64 *bytes)
++{
++	u32 addr, pkt, lo, hi, hi_again;
++	int ret, tries;
++
++	if (index >= PPE_IN_FLOW_CNT_TBL_ENTRIES)
++		return -EINVAL;
++
++	addr = PPE_IN_FLOW_CNT_TBL_ADDR + index * PPE_IN_FLOW_CNT_TBL_INC;
++
++	ret = regmap_read(ppe_dev->regmap, addr, &pkt);
++	if (ret)
++		return ret;
++
++	ret = regmap_read(ppe_dev->regmap, addr + 2 * sizeof(u32), &hi);
++	if (ret)
++		return ret;
++
++	/* Bounded: each retry needs another 32-bit carry to race us again. */
++	for (tries = 0; tries < 3; tries++) {
++		ret = regmap_read(ppe_dev->regmap, addr + sizeof(u32), &lo);
++		if (ret)
++			return ret;
++
++		ret = regmap_read(ppe_dev->regmap, addr + 2 * sizeof(u32), &hi_again);
++		if (ret)
++			return ret;
++
++		if (hi_again == hi)
++			break;
++
++		hi = hi_again;
++	}
++
++	*packets = pkt;
++	*bytes = (u64)FIELD_GET(PPE_IN_FLOW_CNT_TBL_BYTE_HI, hi) << 32 | lo;
++
++	return 0;
++}
++
++/**
++ * ppe_flow_counter_clear() - Zero a flow entry's hit counters.
++ * @ppe_dev: PPE device.
++ * @index: Flow table entry index.
++ *
++ * The counter table is separate RAM from the flow table and hardware does NOT
++ * reset it when a flow entry is programmed -- the vendor SDK exposes a distinct
++ * "counter cleanup" operation for exactly this and never calls it itself. Without
++ * an explicit clear, a reused index (a hash collision, or the same 5-tuple
++ * reconnecting) would report the previous occupant's entire lifetime as one
++ * instantaneous delta.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_flow_counter_clear(struct ppe_device *ppe_dev, u32 index)
++{
++	u32 addr;
++	int ret, i;
++
++	if (index >= PPE_IN_FLOW_CNT_TBL_ENTRIES)
++		return -EINVAL;
++
++	addr = PPE_IN_FLOW_CNT_TBL_ADDR + index * PPE_IN_FLOW_CNT_TBL_INC;
++
++	for (i = 0; i < PPE_IN_FLOW_CNT_TBL_WORDS; i++) {
++		ret = regmap_write(ppe_dev->regmap, addr + i * sizeof(u32), 0);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * ppe_flow_entry_add() - Add (or overwrite) a PPE flow table entry.
++ * @ppe_dev: PPE device.
++ * @mode: Hash-based or caller-indexed entry placement.
++ * @entry: The flow entry to write, as @num_words 32-bit words.
++ * @num_words: Number of words in @entry: PPE_FLOW_TBL_IPV4_ENTRY_WORDS or
++ * PPE_FLOW_TBL_IPV6_ENTRY_WORDS.
++ * @index: In PPE_FLOW_OP_MODE_INDEX, the entry index to write to (input).
++ * On success, always holds the entry's final hardware index: unchanged
++ * for PPE_FLOW_OP_MODE_INDEX, hardware-assigned for PPE_FLOW_OP_MODE_HASH.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_flow_entry_add(struct ppe_device *ppe_dev, enum ppe_flow_op_mode mode,
++			const u32 *entry, unsigned int num_words, u32 *index)
++{
++	unsigned int i;
++	int ret;
++
++	if (num_words > PPE_IN_FLOW_TBL_OP_DATA_ENTRIES)
++		return -EINVAL;
++
++	mutex_lock(&ppe_dev->flow_tbl_lock);
++
++	for (i = 0; i < num_words; i++) {
++		ret = regmap_write(ppe_dev->regmap,
++				    PPE_IN_FLOW_TBL_OP_DATA_ADDR + i * PPE_IN_FLOW_TBL_OP_DATA_INC,
++				    entry[i]);
++		if (ret)
++			goto out;
++	}
++
++	ret = ppe_flow_tbl_op_wait(ppe_dev, PPE_FLOW_TBL_OP_ADD, mode, index);
++	if (ret)
++		goto out;
++
++	/* Zero the hit counters for the index we just programmed, while still
++	 * holding the table lock and before the caller can publish the entry.
++	 * Hardware keeps them in separate RAM that survives a flow entry being
++	 * overwritten, so a reused index would otherwise attribute the previous
++	 * occupant's lifetime totals to this flow on its first stats poll.
++	 */
++	ret = ppe_flow_counter_clear(ppe_dev, *index);
++	if (ret) {
++		/* The add has landed; callers treat an error as "nothing
++		 * programmed" and release the entries it points at, so take
++		 * it back out rather than leave a live entry nobody tracks.
++		 */
++		if (ppe_flow_tbl_op_wait(ppe_dev, PPE_FLOW_TBL_OP_DEL,
++					 PPE_FLOW_OP_MODE_INDEX, index))
++			dev_warn(ppe_dev->dev,
++				 "flow entry %u left programmed after a counter clear failure\n",
++				 *index);
++	}
++out:
++	mutex_unlock(&ppe_dev->flow_tbl_lock);
++	return ret;
++}
++
++/**
++ * ppe_flow_entry_del() - Delete a PPE flow table entry by index.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to delete.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_flow_entry_del(struct ppe_device *ppe_dev, u32 index)
++{
++	int ret;
++
++	mutex_lock(&ppe_dev->flow_tbl_lock);
++	ret = ppe_flow_tbl_op_wait(ppe_dev, PPE_FLOW_TBL_OP_DEL, PPE_FLOW_OP_MODE_INDEX, &index);
++	mutex_unlock(&ppe_dev->flow_tbl_lock);
++
++	return ret;
++}
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
+@@ -0,0 +1,54 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_FLOW_H__
++#define __PPE_FLOW_H__
++
++#include <linux/types.h>
++
++#include "ppe.h"
++
++/* Number of 32-bit words that make up one flow entry of each family.
++ * These are the entries' own sizes (the vendor SDK's union in_flow_tbl_u
++ * val[6] and union in_flow_ipv6_5tuple_tbl_u val[9] for this APPE chip,
++ * see ppe_regs.h), not the wider 11-word capacity of
++ * PPE_IN_FLOW_TBL_OP_DATA, which is sized for the largest entry type
++ * sharing this trigger mechanism. Word 5 of the IPv4 entry and word 3
++ * of the IPv6 one hold the top bits of the path MTU the hardware checks
++ * each packet against.
++ */
++#define PPE_FLOW_TBL_IPV4_ENTRY_WORDS		6
++#define PPE_FLOW_TBL_IPV6_ENTRY_WORDS		9
++#define PPE_FLOW_TBL_MAX_ENTRY_WORDS		PPE_FLOW_TBL_IPV6_ENTRY_WORDS
++
++/* The table is laid out in IPv4-sized slots (PPE_IN_FLOW_TBL_ENTRIES of
++ * them); an IPv6 entry is twice the size and takes two consecutive ones.
++ * The vendor SDK addresses the per-slot hit counters with the very index
++ * an IPv6 add returns, so the index is in slot units for both families.
++ * Only IPv4 entries are programmed here.
++ */
++#define PPE_FLOW_TBL_IPV4_ENTRY_SLOTS		1
++#define PPE_FLOW_TBL_IPV6_ENTRY_SLOTS		2
++
++/**
++ * enum ppe_flow_op_mode - PPE flow table addressing mode.
++ * @PPE_FLOW_OP_MODE_HASH: Hardware selects the entry slot by hashing the
++ * entry's key fields; the assigned index is returned to the caller.
++ * @PPE_FLOW_OP_MODE_INDEX: Caller supplies the exact entry index to
++ * operate on.
++ */
++enum ppe_flow_op_mode {
++	PPE_FLOW_OP_MODE_HASH = 0,
++	PPE_FLOW_OP_MODE_INDEX,
++};
++
++int ppe_flow_counter_get(struct ppe_device *ppe_dev, u32 index,
++			 u64 *packets, u64 *bytes);
++int ppe_flow_counter_clear(struct ppe_device *ppe_dev, u32 index);
++int ppe_flow_entry_add(struct ppe_device *ppe_dev, enum ppe_flow_op_mode mode,
++			const u32 *entry, unsigned int num_words, u32 *index);
++int ppe_flow_entry_del(struct ppe_device *ppe_dev, u32 index);
++
++#endif
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.c
+@@ -0,0 +1,117 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* IPv4 5-tuple flow entry field encoding, SNAT variant.
++ *
++ * This packs/unpacks struct ppe_flow_ipv4_nat_entry to/from the
++ * PPE_FLOW_TBL_IPV4_ENTRY_WORDS-word format ppe_flow_entry_add()/whatever
++ * read-back path is eventually built expects. Field layout is cross-word:
++ * PRI_PROFILE splits 1+4 bits across words 1/2, the 32-bit IP address
++ * splits 20+12 bits across words 2/3, and L4_DPORT splits 4+12 bits
++ * across words 3/4, and the APPE-only PMTU splits 11+3 bits across
++ * words 4/5 -- all confirmed against the vendor SDK's own packed
++ * bitfield struct (struct in_flow_tbl_0, include/hsl/hppe/hppe_flow_reg.h)
++ * and its actual field-assignment code (adpt_hppe_flow_entry_add(),
++ * src/adpt/hppe/adpt_hppe_flow.c), not derived from the field-offset
++ * table alone.
++ *
++ * IP address representation matches ppe_nexthop.c's dnat_ip: a plain
++ * 32-bit register value equal to be32_to_cpu() of the address, confirmed
++ * via fal_ip4_addr_t's definition (a bare a_uint32_t assigned with no
++ * byte manipulation in vendor code).
++ */
++
++#include <linux/bitfield.h>
++#include <linux/types.h>
++
++#include "ppe_flow.h"
++#include "ppe_flow_ipv4.h"
++#include "ppe_regs.h"
++
++/**
++ * ppe_flow_ipv4_nat_entry_encode() - Pack an IPv4 SNAT or DNAT flow entry.
++ * @entry: The entry to pack.
++ * @words: Where to write the packed PPE_FLOW_TBL_IPV4_ENTRY_WORDS words.
++ */
++void ppe_flow_ipv4_nat_entry_encode(const struct ppe_flow_ipv4_nat_entry *entry,
++				    u32 words[PPE_FLOW_TBL_IPV4_ENTRY_WORDS])
++{
++	u32 ip = be32_to_cpu(entry->match_ip);
++
++	words[0] = entry->valid ? PPE_FLOW_TBL_VALID : 0;
++	/* ENTRY_TYPE is always 0 (IPv4) in this file. */
++	words[0] |= entry->host_addr_is_dst ? PPE_FLOW_TBL_HOST_ADDR_INDEX_TYPE : 0;
++	words[0] |= FIELD_PREP(PPE_FLOW_TBL_HOST_ADDR_INDEX, entry->host_addr_index);
++	words[0] |= FIELD_PREP(PPE_FLOW_TBL_PROTOCOL_TYPE, entry->protocol);
++	words[0] |= FIELD_PREP(PPE_FLOW_TBL_AGE, entry->age);
++	words[0] |= entry->src_l3_if_valid ? PPE_FLOW_TBL_SRC_L3_IF_VALID : 0;
++	words[0] |= FIELD_PREP(PPE_FLOW_TBL_SRC_L3_IF, entry->src_l3_if);
++	words[0] |= FIELD_PREP(PPE_FLOW_TBL_FWD_TYPE, entry->fwd_type);
++
++	words[1] = FIELD_PREP(PPE_FLOW_TBL_SNAT_NEXT_HOP, entry->nat_nexthop);
++	words[1] |= FIELD_PREP(PPE_FLOW_TBL_SNAT_L4_PORT, entry->nat_l4_port);
++	words[1] |= entry->deacclr_en ? PPE_FLOW_TBL_DE_ACCE : 0;
++	words[1] |= entry->copy_to_cpu ? PPE_FLOW_TBL_COPY_TO_CPU_EN : 0;
++	words[1] |= entry->syn_toggle ? PPE_FLOW_TBL_SYN_TOGGLE : 0;
++	words[1] |= FIELD_PREP(PPE_FLOW_TBL_PRI_PROFILE_0, entry->pri_profile & 0x1);
++
++	words[2] = FIELD_PREP(PPE_FLOW_TBL_PRI_PROFILE_1, entry->pri_profile >> 1);
++	words[2] |= FIELD_PREP(PPE_FLOW_TBL_SERVICE_CODE, entry->service_code);
++	words[2] |= FIELD_PREP(PPE_FLOW_TBL_IP_ADDR_0, ip);
++
++	words[3] = FIELD_PREP(PPE_FLOW_TBL_IP_ADDR_1, ip >> 20);
++	words[3] |= FIELD_PREP(PPE_FLOW_TBL_L4_SPORT, entry->match_sport);
++	words[3] |= FIELD_PREP(PPE_FLOW_TBL_L4_DPORT_0, entry->match_dport);
++
++	words[4] = FIELD_PREP(PPE_FLOW_TBL_L4_DPORT_1, entry->match_dport >> 4);
++	words[4] |= entry->pmtu_check_l3 ? PPE_FLOW_TBL_PMTU_CHECK_TYPE : 0;
++	words[4] |= FIELD_PREP(PPE_FLOW_TBL_PMTU_0, entry->pmtu);
++	words[5] = FIELD_PREP(PPE_FLOW_TBL_PMTU_1, entry->pmtu >> 11);
++}
++
++/**
++ * ppe_flow_ipv4_nat_entry_decode() - Unpack an IPv4 SNAT or DNAT flow entry.
++ * @words: The packed PPE_FLOW_TBL_IPV4_ENTRY_WORDS words to unpack.
++ * @entry: Where to store the unpacked entry.
++ *
++ * Recovers FWD_TYPE into entry->fwd_type, but does not validate it:
++ * callers are expected to only decode entries they know use one of the
++ * two NAT layouts (e.g. ones they wrote themselves).
++ */
++void ppe_flow_ipv4_nat_entry_decode(const u32 words[PPE_FLOW_TBL_IPV4_ENTRY_WORDS],
++				    struct ppe_flow_ipv4_nat_entry *entry)
++{
++	u32 ip;
++
++	entry->valid = !!(words[0] & PPE_FLOW_TBL_VALID);
++	entry->fwd_type = FIELD_GET(PPE_FLOW_TBL_FWD_TYPE, words[0]);
++	entry->host_addr_is_dst = !!(words[0] & PPE_FLOW_TBL_HOST_ADDR_INDEX_TYPE);
++	entry->host_addr_index = FIELD_GET(PPE_FLOW_TBL_HOST_ADDR_INDEX, words[0]);
++	entry->protocol = FIELD_GET(PPE_FLOW_TBL_PROTOCOL_TYPE, words[0]);
++	entry->age = FIELD_GET(PPE_FLOW_TBL_AGE, words[0]);
++	entry->src_l3_if_valid = !!(words[0] & PPE_FLOW_TBL_SRC_L3_IF_VALID);
++	entry->src_l3_if = FIELD_GET(PPE_FLOW_TBL_SRC_L3_IF, words[0]);
++
++	entry->nat_nexthop = FIELD_GET(PPE_FLOW_TBL_SNAT_NEXT_HOP, words[1]);
++	entry->nat_l4_port = FIELD_GET(PPE_FLOW_TBL_SNAT_L4_PORT, words[1]);
++	entry->deacclr_en = !!(words[1] & PPE_FLOW_TBL_DE_ACCE);
++	entry->copy_to_cpu = !!(words[1] & PPE_FLOW_TBL_COPY_TO_CPU_EN);
++	entry->syn_toggle = !!(words[1] & PPE_FLOW_TBL_SYN_TOGGLE);
++
++	entry->pri_profile = FIELD_GET(PPE_FLOW_TBL_PRI_PROFILE_0, words[1]) |
++			      (FIELD_GET(PPE_FLOW_TBL_PRI_PROFILE_1, words[2]) << 1);
++	entry->service_code = FIELD_GET(PPE_FLOW_TBL_SERVICE_CODE, words[2]);
++
++	ip = FIELD_GET(PPE_FLOW_TBL_IP_ADDR_0, words[2]) |
++	     (FIELD_GET(PPE_FLOW_TBL_IP_ADDR_1, words[3]) << 20);
++	entry->match_ip = cpu_to_be32(ip);
++
++	entry->match_sport = FIELD_GET(PPE_FLOW_TBL_L4_SPORT, words[3]);
++	entry->match_dport = FIELD_GET(PPE_FLOW_TBL_L4_DPORT_0, words[3]) |
++			      (FIELD_GET(PPE_FLOW_TBL_L4_DPORT_1, words[4]) << 4);
++	entry->pmtu_check_l3 = !!(words[4] & PPE_FLOW_TBL_PMTU_CHECK_TYPE);
++	entry->pmtu = FIELD_GET(PPE_FLOW_TBL_PMTU_0, words[4]) |
++		      (FIELD_GET(PPE_FLOW_TBL_PMTU_1, words[5]) << 11);
++}
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow_ipv4.h
+@@ -0,0 +1,110 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_FLOW_IPV4_H__
++#define __PPE_FLOW_IPV4_H__
++
++#include <linux/types.h>
++
++#include "ppe_flow.h"
++
++/**
++ * enum ppe_flow_protocol - Layer-4 protocol matched by a flow entry.
++ */
++enum ppe_flow_protocol {
++	PPE_FLOW_PROTO_OTHER = 0,
++	PPE_FLOW_PROTO_TCP = 1,
++	PPE_FLOW_PROTO_UDP = 2,
++	PPE_FLOW_PROTO_UDPLITE = 3,
++};
++
++/**
++ * enum ppe_flow_fwd_type - Forwarding action performed by a flow entry.
++ * Hardware field width is 3 bits. The SNAT and DNAT overlays are
++ * bit-for-bit identical (the vendor's in_flow_tbl_0 and in_flow_tbl_3
++ * differ only in the names of the nexthop and L4 port fields), so one
++ * encoder serves both. ROUTE reuses the same word 1 bit range for its
++ * own fields (PPE_FLOW_TBL_ROUTE_* in ppe_regs.h); it, FORWARD, BRIDGE,
++ * DROP and RDT_TO_CPU are not encoded.
++ */
++enum ppe_flow_fwd_type {
++	PPE_FLOW_FWD_FORWARD = 0,
++	PPE_FLOW_FWD_SNAT = 1,
++	PPE_FLOW_FWD_DNAT = 2,
++	PPE_FLOW_FWD_ROUTE = 3,
++	PPE_FLOW_FWD_BRIDGE = 4,
++	PPE_FLOW_FWD_DROP = 5,
++	PPE_FLOW_FWD_RDT_TO_CPU = 6,
++};
++
++/**
++ * struct ppe_flow_ipv4_nat_entry - IPv4 5-tuple flow entry, NAT variants.
++ * @valid: Whether this entry is active.
++ * @host_addr_is_dst: @host_addr_index refers to the destination IP's host
++ * table entry when true, the source IP's when false. The endpoint this
++ * does *not* refer to is @match_ip below.
++ * @host_addr_index: Host table index (see ppe_host.h) for the endpoint
++ * selected by @host_addr_is_dst.
++ * @protocol: Layer-4 protocol to match.
++ * @age: Hardware aging counter; write 0 on entry creation, hardware
++ * updates it as traffic hits the entry.
++ * @src_l3_if_valid: Whether @src_l3_if should be matched.
++ * @src_l3_if: Source L3 interface index to match, when @src_l3_if_valid.
++ * @fwd_type: PPE_FLOW_FWD_SNAT or PPE_FLOW_FWD_DNAT. Selects which
++ * address the nexthop and L4 port rewrite: the source (outbound
++ * masquerade) or the destination (the reply direction).
++ * @nat_nexthop: Nexthop table index (see ppe_nexthop.h) this flow's
++ * traffic egresses through after SNAT rewrite.
++ * @nat_l4_port: L4 port to rewrite matched packets to -- source for
++ * SNAT, destination for DNAT.
++ * @deacclr_en: Whether to de-accelerate this flow. NOT conditional: hardware
++ * applies it to every packet matching the entry, and the action is the global
++ * L3_ROUTE_CTRL.FLOW_DE_ACCE_CMD, which resets to 3 (redirect to CPU). Setting
++ * this therefore disables acceleration for the flow entirely; it is not a way
++ * to except TCP control flags, which is what the ingress parser's TCP flag
++ * exception slots (vendor L4_EXCEPTION_PARSING_CTRL_0..3) are for.
++ * @copy_to_cpu: Whether to also copy matched packets to the CPU path.
++ * @syn_toggle: Updated by hardware; not meaningful to set on creation.
++ * @pri_profile: QoS priority profile index for this flow.
++ * @service_code: Service code applied to matched packets.
++ * @match_ip: The 5-tuple match IP address for the endpoint not covered
++ * by @host_addr_index (network byte order).
++ * @match_sport: Source port to match.
++ * @match_dport: Destination port to match.
++ * @pmtu: Path MTU matched packets are checked against before being
++ * forwarded; a packet exceeding it is redirected to the CPU. Must be
++ * set -- 0 would fail every packet.
++ * @pmtu_check_l3: Compare @pmtu against the L3 packet length (true) or
++ * the length including the L2 header (false).
++ */
++struct ppe_flow_ipv4_nat_entry {
++	bool valid;
++	enum ppe_flow_fwd_type fwd_type;
++	bool host_addr_is_dst;
++	u16 host_addr_index;
++	enum ppe_flow_protocol protocol;
++	u8 age;
++	bool src_l3_if_valid;
++	u8 src_l3_if;
++	u16 nat_nexthop;
++	u16 nat_l4_port;
++	bool deacclr_en;
++	bool copy_to_cpu;
++	u8 syn_toggle;
++	u8 pri_profile;
++	u8 service_code;
++	__be32 match_ip;
++	u16 match_sport;
++	u16 match_dport;
++	u16 pmtu;
++	bool pmtu_check_l3;
++};
++
++void ppe_flow_ipv4_nat_entry_encode(const struct ppe_flow_ipv4_nat_entry *entry,
++				    u32 words[PPE_FLOW_TBL_IPV4_ENTRY_WORDS]);
++void ppe_flow_ipv4_nat_entry_decode(const u32 words[PPE_FLOW_TBL_IPV4_ENTRY_WORDS],
++				    struct ppe_flow_ipv4_nat_entry *entry);
++
++#endif
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host.c
+@@ -0,0 +1,130 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* PPE host table -- IP address to nexthop bindings. Accessed indirectly
++ * with the same command/data/result register sequence as the flow table
++ * (see ppe_flow.c), but through its own register set and with entries
++ * of varying width (3 words for IPv4, 5 for IPv6).
++ */
++
++#include <linux/bitfield.h>
++#include <linux/mutex.h>
++#include <linux/regmap.h>
++
++#include "ppe.h"
++#include "ppe_flow.h"
++#include "ppe_host.h"
++#include "ppe_regs.h"
++
++/* Values for PPE_HOST_TBL_OP's OP_TYPE field. */
++enum ppe_host_tbl_op_type {
++	PPE_HOST_TBL_OP_ADD = 0,
++	PPE_HOST_TBL_OP_DEL,
++	PPE_HOST_TBL_OP_GET,
++	PPE_HOST_TBL_OP_FLUSH,
++};
++
++/* Per-table command tag, mirroring the vendor SDK's hppe_ip.c
++ * host_cmd_id: incremented on every operation and stamped into the OP
++ * command word's CMD_ID field.
++ */
++static u32 ppe_host_cmd_id;
++
++/* Trigger the given host table operation and wait for hardware to
++ * complete it. *index is the entry index to operate on for
++ * PPE_FLOW_OP_MODE_INDEX (input); for PPE_FLOW_OP_MODE_HASH it is
++ * ignored on input and set to the hardware-assigned index on success.
++ */
++static int ppe_host_tbl_op_wait(struct ppe_device *ppe_dev,
++				 enum ppe_host_tbl_op_type op_type,
++				 enum ppe_flow_op_mode mode, u32 *index)
++{
++	u32 val, rslt, cmd_id;
++	int ret;
++
++	cmd_id = ppe_host_cmd_id++ & FIELD_MAX(PPE_HOST_TBL_OP_CMD_ID);
++
++	val = FIELD_PREP(PPE_HOST_TBL_OP_CMD_ID, cmd_id);
++	val |= FIELD_PREP(PPE_HOST_TBL_OP_OP_TYPE, op_type);
++	val |= FIELD_PREP(PPE_HOST_TBL_OP_HASH_BLOCK_BITMAP, 3);
++	val |= FIELD_PREP(PPE_HOST_TBL_OP_OP_MODE, mode);
++	val |= FIELD_PREP(PPE_HOST_TBL_OP_ENTRY_INDEX, *index);
++
++	ret = regmap_write(ppe_dev->regmap, PPE_HOST_TBL_OP_ADDR, val);
++	if (ret)
++		return ret;
++
++	/* Match the command tag we issued -- see the comment in ppe_flow.c. */
++	ret = regmap_read_poll_timeout(ppe_dev->regmap, PPE_HOST_TBL_OP_RSLT_ADDR,
++					rslt,
++					FIELD_GET(PPE_HOST_TBL_OP_RSLT_VALID_CNT, rslt) &&
++					FIELD_GET(PPE_HOST_TBL_OP_RSLT_CMD_ID, rslt) == cmd_id,
++					10, 2000);
++	if (ret)
++		return ret;
++
++	if (FIELD_GET(PPE_HOST_TBL_OP_RSLT_OP_RSLT, rslt))
++		return -EIO;
++
++	*index = FIELD_GET(PPE_HOST_TBL_OP_RSLT_ENTRY_INDEX, rslt);
++
++	return 0;
++}
++
++/**
++ * ppe_host_entry_add() - Add (or overwrite) a PPE host table entry.
++ * @ppe_dev: PPE device.
++ * @mode: Hash-based or caller-indexed entry placement.
++ * @entry: The host entry to write, as PPE_HOST_TBL_IPV4_ENTRY_WORDS (IPv4)
++ * or PPE_HOST_TBL_IPV6_ENTRY_WORDS (IPv6) 32-bit words.
++ * @num_words: Number of words in @entry.
++ * @index: In PPE_FLOW_OP_MODE_INDEX, the entry index to write to (input).
++ * On success, always holds the entry's final hardware index: unchanged
++ * for PPE_FLOW_OP_MODE_INDEX, hardware-assigned for PPE_FLOW_OP_MODE_HASH.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_host_entry_add(struct ppe_device *ppe_dev, enum ppe_flow_op_mode mode,
++			const u32 *entry, unsigned int num_words, u32 *index)
++{
++	unsigned int i;
++	int ret;
++
++	if (num_words > PPE_HOST_TBL_OP_DATA_ENTRIES)
++		return -EINVAL;
++
++	mutex_lock(&ppe_dev->host_tbl_lock);
++
++	for (i = 0; i < num_words; i++) {
++		ret = regmap_write(ppe_dev->regmap,
++				    PPE_HOST_TBL_OP_DATA_ADDR + i * PPE_HOST_TBL_OP_DATA_INC,
++				    entry[i]);
++		if (ret)
++			goto out;
++	}
++
++	ret = ppe_host_tbl_op_wait(ppe_dev, PPE_HOST_TBL_OP_ADD, mode, index);
++out:
++	mutex_unlock(&ppe_dev->host_tbl_lock);
++	return ret;
++}
++
++/**
++ * ppe_host_entry_del() - Delete a PPE host table entry by index.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to delete.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_host_entry_del(struct ppe_device *ppe_dev, u32 index)
++{
++	int ret;
++
++	mutex_lock(&ppe_dev->host_tbl_lock);
++	ret = ppe_host_tbl_op_wait(ppe_dev, PPE_HOST_TBL_OP_DEL, PPE_FLOW_OP_MODE_INDEX, &index);
++	mutex_unlock(&ppe_dev->host_tbl_lock);
++
++	return ret;
++}
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_HOST_H__
++#define __PPE_HOST_H__
++
++#include <linux/types.h>
++
++#include "ppe.h"
++#include "ppe_flow.h" /* for enum ppe_flow_op_mode (HASH/INDEX addressing),
++			* shared across the PPE's indirect tables
++			*/
++
++/* Word count of an IPv4 (3) or IPv6 (5) host table entry. */
++#define PPE_HOST_TBL_IPV4_ENTRY_WORDS		3
++#define PPE_HOST_TBL_IPV6_ENTRY_WORDS		5
++
++int ppe_host_entry_add(struct ppe_device *ppe_dev, enum ppe_flow_op_mode mode,
++			const u32 *entry, unsigned int num_words, u32 *index);
++int ppe_host_entry_del(struct ppe_device *ppe_dev, u32 index);
++
++#endif
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host_ipv4.c
+@@ -0,0 +1,51 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* IPv4 host table entry field encoding.
++ *
++ * key_type, fwd_cmd, syn_toggle and dst_info are hardcoded to the
++ * values the vendor SDK's own SNAT-flow host entries always use
++ * (ppe_drv_host_v4_add(): key_type=0 selects the plain-IPv4 entry
++ * variant, fwd_cmd=FAL_MAC_FRWRD=0 is "forward normally", syn_toggle
++ * and dst_info are left zero) rather than exposed as struct fields --
++ * this driver has no other host entry use case yet that would need
++ * them to vary.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/types.h>
++
++#include "ppe_host.h"
++#include "ppe_host_ipv4.h"
++#include "ppe_regs.h"
++
++/**
++ * ppe_host_ipv4_entry_encode() - Pack an IPv4 host table entry.
++ * @entry: The entry to pack.
++ * @words: Where to write the packed PPE_HOST_TBL_IPV4_ENTRY_WORDS words.
++ */
++void ppe_host_ipv4_entry_encode(const struct ppe_host_ipv4_entry *entry,
++				 u32 words[PPE_HOST_TBL_IPV4_ENTRY_WORDS])
++{
++	words[0] = entry->valid ? PPE_HOST_TBL_VALID : 0;
++	words[0] |= entry->wan ? PPE_HOST_TBL_LAN_WAN : 0;
++
++	words[1] = be32_to_cpu(entry->ip_addr);
++
++	words[2] = 0;
++}
++
++/**
++ * ppe_host_ipv4_entry_decode() - Unpack an IPv4 host table entry.
++ * @words: The packed PPE_HOST_TBL_IPV4_ENTRY_WORDS words to unpack.
++ * @entry: Where to store the unpacked entry.
++ */
++void ppe_host_ipv4_entry_decode(const u32 words[PPE_HOST_TBL_IPV4_ENTRY_WORDS],
++				 struct ppe_host_ipv4_entry *entry)
++{
++	entry->valid = !!(words[0] & PPE_HOST_TBL_VALID);
++	entry->wan = !!(words[0] & PPE_HOST_TBL_LAN_WAN);
++	entry->ip_addr = cpu_to_be32(words[1]);
++}
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host_ipv4.h
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_HOST_IPV4_H__
++#define __PPE_HOST_IPV4_H__
++
++#include <linux/types.h>
++
++#include "ppe_host.h"
++
++/**
++ * struct ppe_host_ipv4_entry - IPv4 host table entry.
++ * @valid: Whether this entry is active.
++ * @wan: True if @ip_addr is a WAN-side address, false if LAN-side.
++ * @ip_addr: The IPv4 address this entry represents (network byte order).
++ */
++struct ppe_host_ipv4_entry {
++	bool valid;
++	bool wan;
++	__be32 ip_addr;
++};
++
++void ppe_host_ipv4_entry_encode(const struct ppe_host_ipv4_entry *entry,
++				 u32 words[PPE_HOST_TBL_IPV4_ENTRY_WORDS]);
++void ppe_host_ipv4_entry_decode(const u32 words[PPE_HOST_TBL_IPV4_ENTRY_WORDS],
++				 struct ppe_host_ipv4_entry *entry);
++
++#endif
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host_pool.c
+@@ -0,0 +1,153 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* Refcounted allocator on top of the host table primitive (ppe_host.c).
++ *
++ * Multiple flows commonly share one host table entry -- every
++ * connection through the same LAN client or the same public WAN IP
++ * references the same entry. The host table's own hardware add
++ * operation already deduplicates by key (see ppe_host_pool.h), so this
++ * layer's only job is counting callers per hardware index and freeing
++ * the entry once the last one is gone.
++ */
++
++#include <linux/errno.h>
++#include <linux/gfp.h>
++#include <linux/refcount.h>
++#include <linux/slab.h>
++#include <linux/xarray.h>
++
++#include "ppe.h"
++#include "ppe_host.h"
++#include "ppe_host_pool.h"
++
++struct ppe_host_pool_entry {
++	refcount_t ref;
++	u32 index;
++};
++
++/**
++ * ppe_host_pool_init() - Initialize a host table pool.
++ * @pool: The pool to initialize.
++ */
++void ppe_host_pool_init(struct ppe_host_pool *pool)
++{
++	xa_init(&pool->entries);
++	mutex_init(&pool->lock);
++}
++
++/**
++ * ppe_host_pool_destroy() - Tear down a host table pool.
++ * @ppe_dev: PPE device.
++ * @pool: The pool to tear down.
++ *
++ * Releases every hardware entry the pool is still tracking. Callers
++ * are expected to have already stopped issuing get/deref calls
++ * against this pool.
++ */
++void ppe_host_pool_destroy(struct ppe_device *ppe_dev, struct ppe_host_pool *pool)
++{
++	struct ppe_host_pool_entry *e;
++	unsigned long index;
++
++	xa_for_each(&pool->entries, index, e) {
++		ppe_host_entry_del(ppe_dev, e->index);
++		kfree(e);
++	}
++
++	xa_destroy(&pool->entries);
++}
++
++/**
++ * ppe_host_pool_get_and_ref() - Add a host table entry, or ref an existing one.
++ * @ppe_dev: PPE device.
++ * @pool: The pool to allocate from.
++ * @mode: Hash-based or caller-indexed entry placement -- see
++ * ppe_host_entry_add(). Dedup only applies for %PPE_FLOW_OP_MODE_HASH,
++ * matching hardware's own behavior.
++ * @entry: The host entry to write -- see ppe_host_entry_add().
++ * @num_words: Number of words in @entry.
++ * @index: On success, the entry's hardware index (new or reused).
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_host_pool_get_and_ref(struct ppe_device *ppe_dev, struct ppe_host_pool *pool,
++			       enum ppe_flow_op_mode mode, const u32 *entry,
++			       unsigned int num_words, u32 *index)
++{
++	struct ppe_host_pool_entry *e;
++	u32 idx = 0;
++	int ret;
++
++	ret = ppe_host_entry_add(ppe_dev, mode, entry, num_words, &idx);
++	if (ret)
++		return ret;
++
++	mutex_lock(&pool->lock);
++
++	e = xa_load(&pool->entries, idx);
++	if (e) {
++		refcount_inc(&e->ref);
++		mutex_unlock(&pool->lock);
++		*index = idx;
++		return 0;
++	}
++
++	e = kzalloc(sizeof(*e), GFP_KERNEL);
++	if (!e) {
++		mutex_unlock(&pool->lock);
++		ppe_host_entry_del(ppe_dev, idx);
++		return -ENOMEM;
++	}
++
++	refcount_set(&e->ref, 1);
++	e->index = idx;
++
++	ret = xa_err(xa_store(&pool->entries, idx, e, GFP_KERNEL));
++	if (ret) {
++		mutex_unlock(&pool->lock);
++		kfree(e);
++		ppe_host_entry_del(ppe_dev, idx);
++		return ret;
++	}
++
++	mutex_unlock(&pool->lock);
++	*index = idx;
++
++	return 0;
++}
++
++/**
++ * ppe_host_pool_deref() - Drop a reference on a pooled host table entry.
++ * @ppe_dev: PPE device.
++ * @pool: The pool @index was allocated from.
++ * @index: The entry index, as returned by ppe_host_pool_get_and_ref().
++ *
++ * Deletes the underlying hardware entry once its last reference is
++ * dropped.
++ */
++void ppe_host_pool_deref(struct ppe_device *ppe_dev, struct ppe_host_pool *pool, u32 index)
++{
++	struct ppe_host_pool_entry *e;
++
++	mutex_lock(&pool->lock);
++
++	e = xa_load(&pool->entries, index);
++	if (!e) {
++		mutex_unlock(&pool->lock);
++		return;
++	}
++
++	if (!refcount_dec_and_test(&e->ref)) {
++		mutex_unlock(&pool->lock);
++		return;
++	}
++
++	xa_erase(&pool->entries, index);
++	mutex_unlock(&pool->lock);
++
++	ppe_host_entry_del(ppe_dev, index);
++	kfree(e);
++}
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_host_pool.h
+@@ -0,0 +1,45 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_HOST_POOL_H__
++#define __PPE_HOST_POOL_H__
++
++#include <linux/mutex.h>
++#include <linux/types.h>
++#include <linux/xarray.h>
++
++#include "ppe.h"
++#include "ppe_host.h"
++
++/**
++ * struct ppe_host_pool - Refcounted host table entry allocator.
++ * @entries: Live host table entries, keyed by hardware index.
++ * @lock: Serializes get/deref against concurrent callers.
++ *
++ * The host table is hash-addressed: hardware itself returns the same
++ * index for two adds with the same key (confirmed against the vendor
++ * SDK's ppe_drv_host_v4_add(), which calls fal_ip_host_add()
++ * unconditionally on every request and only checks *after the fact*
++ * whether the returned index was already tracked in software). This
++ * pool exists purely to count how many callers reference each
++ * already-deduplicated hardware entry, releasing it only once the
++ * last one is done -- unlike the nexthop pool, it does not need to
++ * search for a matching entry itself, since hardware already
++ * guarantees that.
++ */
++struct ppe_host_pool {
++	struct xarray entries;
++	struct mutex lock;
++};
++
++void ppe_host_pool_init(struct ppe_host_pool *pool);
++void ppe_host_pool_destroy(struct ppe_device *ppe_dev, struct ppe_host_pool *pool);
++
++int ppe_host_pool_get_and_ref(struct ppe_device *ppe_dev, struct ppe_host_pool *pool,
++			       enum ppe_flow_op_mode mode, const u32 *entry,
++			       unsigned int num_words, u32 *index);
++void ppe_host_pool_deref(struct ppe_device *ppe_dev, struct ppe_host_pool *pool, u32 index);
++
++#endif
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.c
+@@ -0,0 +1,283 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* PPE ingress/egress L3 interface tables. Like the nexthop table, both
++ * are addressed directly: one fixed-size entry per index, no indirect
++ * command/data/result sequence.
++ *
++ * These are per-interface resources, not per-flow: the vendor driver
++ * populates one entry per netdevice/VSI/LAG/etc at interface
++ * registration time (ppe_drv_iface_l3_if_set(), called from
++ * ppe_drv_dp.c, ppe_drv_br.c, ppe_drv_lag.c, ppe_drv_vp.c and others),
++ * and a flow/nexthop entry only ever references an already-populated
++ * index. Callers of this file are expected to follow the same pattern
++ * -- set up one entry per interface once, then reference its index
++ * from ppe_flow_ipv4_nat_entry.src_l3_if / ppe_nexthop_entry.post_l3_if.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/etherdevice.h>
++#include <linux/regmap.h>
++
++#include "ppe.h"
++#include "ppe_l3_if.h"
++#include "ppe_regs.h"
++
++/**
++ * ppe_l3_if_in_entry_set() - Write a PPE ingress L3 interface table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to write.
++ * @entry: The ingress L3 interface entry to write.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_l3_if_in_entry_set(struct ppe_device *ppe_dev, u32 index,
++			    const struct ppe_l3_if_in_entry *entry)
++{
++	u32 base, val[PPE_IN_L3_IF_TBL_WORDS] = {};
++	int ret;
++	int i;
++
++	if (index >= PPE_IN_L3_IF_TBL_ENTRIES)
++		return -EINVAL;
++
++	/* FIELD_PREP() would silently truncate these to the field width. */
++	if (entry->mru > FIELD_MAX(PPE_IN_L3_IF_TBL_MRU) ||
++	    entry->mtu > FIELD_MAX(PPE_IN_L3_IF_TBL_MTU) ||
++	    entry->mru_ipv6 > FIELD_MAX(PPE_IN_L3_IF_TBL_MRU_IPV6) ||
++	    entry->mtu_ipv6 > FIELD_MAX(PPE_IN_L3_IF_TBL_MTU_IPV6))
++		return -EINVAL;
++
++	val[0] = FIELD_PREP(PPE_IN_L3_IF_TBL_MRU, entry->mru);
++	val[0] |= FIELD_PREP(PPE_IN_L3_IF_TBL_MTU, entry->mtu);
++	val[0] |= entry->ttl_dec_bypass ? PPE_IN_L3_IF_TBL_TTL_DEC_BYPASS : 0;
++	val[0] |= entry->ipv4_uc_route_en ? PPE_IN_L3_IF_TBL_IPV4_UC_ROUTE_EN : 0;
++	val[0] |= entry->ipv6_uc_route_en ? PPE_IN_L3_IF_TBL_IPV6_UC_ROUTE_EN : 0;
++	val[0] |= entry->icmp_trigger_en ? PPE_IN_L3_IF_TBL_ICMP_TRIGGER_EN : 0;
++
++	val[1] = FIELD_PREP(PPE_IN_L3_IF_TBL_TTL_EXCEED_CMD, entry->ttl_exceed_cmd);
++	val[1] |= entry->ttl_exceed_de_acce ? PPE_IN_L3_IF_TBL_TTL_EXCEED_DE_ACCE : 0;
++	val[1] |= FIELD_PREP(PPE_IN_L3_IF_TBL_MAC_BITMAP, entry->mac_bitmap);
++	val[1] |= entry->pppoe_en ? PPE_IN_L3_IF_TBL_PPPOE_EN : 0;
++	val[1] |= FIELD_PREP(PPE_IN_L3_IF_TBL_MRU_IPV6, entry->mru_ipv6);
++
++	val[2] = FIELD_PREP(PPE_IN_L3_IF_TBL_MTU_IPV6, entry->mtu_ipv6);
++
++	base = PPE_IN_L3_IF_TBL_ADDR + index * PPE_IN_L3_IF_TBL_INC;
++	for (i = 0; i < PPE_IN_L3_IF_TBL_WORDS; i++) {
++		ret = regmap_write(ppe_dev->regmap, base + i * 4, val[i]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * ppe_l3_if_in_entry_get() - Read a PPE ingress L3 interface table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to read.
++ * @entry: Where to store the entry read back.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_l3_if_in_entry_get(struct ppe_device *ppe_dev, u32 index,
++			    struct ppe_l3_if_in_entry *entry)
++{
++	u32 base, val[PPE_IN_L3_IF_TBL_WORDS];
++	int ret;
++	int i;
++
++	if (index >= PPE_IN_L3_IF_TBL_ENTRIES)
++		return -EINVAL;
++
++	base = PPE_IN_L3_IF_TBL_ADDR + index * PPE_IN_L3_IF_TBL_INC;
++	for (i = 0; i < PPE_IN_L3_IF_TBL_WORDS; i++) {
++		ret = regmap_read(ppe_dev->regmap, base + i * 4, &val[i]);
++		if (ret)
++			return ret;
++	}
++
++	entry->mru = FIELD_GET(PPE_IN_L3_IF_TBL_MRU, val[0]);
++	entry->mtu = FIELD_GET(PPE_IN_L3_IF_TBL_MTU, val[0]);
++	entry->ttl_dec_bypass = !!(val[0] & PPE_IN_L3_IF_TBL_TTL_DEC_BYPASS);
++	entry->ipv4_uc_route_en = !!(val[0] & PPE_IN_L3_IF_TBL_IPV4_UC_ROUTE_EN);
++	entry->ipv6_uc_route_en = !!(val[0] & PPE_IN_L3_IF_TBL_IPV6_UC_ROUTE_EN);
++	entry->icmp_trigger_en = !!(val[0] & PPE_IN_L3_IF_TBL_ICMP_TRIGGER_EN);
++
++	entry->ttl_exceed_cmd = FIELD_GET(PPE_IN_L3_IF_TBL_TTL_EXCEED_CMD, val[1]);
++	entry->ttl_exceed_de_acce = !!(val[1] & PPE_IN_L3_IF_TBL_TTL_EXCEED_DE_ACCE);
++	entry->mac_bitmap = FIELD_GET(PPE_IN_L3_IF_TBL_MAC_BITMAP, val[1]);
++	entry->pppoe_en = !!(val[1] & PPE_IN_L3_IF_TBL_PPPOE_EN);
++	entry->mru_ipv6 = FIELD_GET(PPE_IN_L3_IF_TBL_MRU_IPV6, val[1]);
++	entry->mtu_ipv6 = FIELD_GET(PPE_IN_L3_IF_TBL_MTU_IPV6, val[2]);
++
++	return 0;
++}
++
++/**
++ * ppe_l3_if_eg_entry_set() - Write a PPE egress L3 interface table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to write.
++ * @entry: The egress L3 interface entry to write.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_l3_if_eg_entry_set(struct ppe_device *ppe_dev, u32 index,
++			    const struct ppe_l3_if_eg_entry *entry)
++{
++	u32 base, val[3] = {};
++	u64 mac;
++	int ret;
++	int i;
++
++	if (index >= PPE_EG_L3_IF_TBL_ENTRIES)
++		return -EINVAL;
++
++	mac = ether_addr_to_u64(entry->mac_addr);
++
++	val[0] = mac & GENMASK(31, 0);
++
++	val[1] = FIELD_PREP(PPE_EG_L3_IF_TBL_MAC_ADDR_1, mac >> 32);
++	val[1] |= FIELD_PREP(PPE_EG_L3_IF_TBL_SESSION_ID, entry->session_id);
++
++	val[2] = entry->pppoe_en ? PPE_EG_L3_IF_TBL_PPPOE_EN : 0;
++
++	base = PPE_EG_L3_IF_TBL_ADDR + index * PPE_EG_L3_IF_TBL_INC;
++	for (i = 0; i < 3; i++) {
++		ret = regmap_write(ppe_dev->regmap, base + i * 4, val[i]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * ppe_l3_if_eg_entry_get() - Read a PPE egress L3 interface table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to read.
++ * @entry: Where to store the entry read back.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_l3_if_eg_entry_get(struct ppe_device *ppe_dev, u32 index,
++			    struct ppe_l3_if_eg_entry *entry)
++{
++	u32 base, val[3];
++	u64 mac;
++	int ret;
++	int i;
++
++	if (index >= PPE_EG_L3_IF_TBL_ENTRIES)
++		return -EINVAL;
++
++	base = PPE_EG_L3_IF_TBL_ADDR + index * PPE_EG_L3_IF_TBL_INC;
++	for (i = 0; i < 3; i++) {
++		ret = regmap_read(ppe_dev->regmap, base + i * 4, &val[i]);
++		if (ret)
++			return ret;
++	}
++
++	mac = (u64)FIELD_GET(PPE_EG_L3_IF_TBL_MAC_ADDR_1, val[1]) << 32 | val[0];
++	u64_to_ether_addr(mac, entry->mac_addr);
++
++	entry->session_id = FIELD_GET(PPE_EG_L3_IF_TBL_SESSION_ID, val[1]);
++	entry->pppoe_en = !!(val[2] & PPE_EG_L3_IF_TBL_PPPOE_EN);
++
++	return 0;
++}
++
++/**
++ * ppe_my_mac_entry_set() - Write a PPE MY_MAC table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to write.
++ * @mac_addr: The MAC address hardware should treat as its own.
++ * @valid: Whether the entry is active. When false, @mac_addr is
++ * ignored and the entry is cleared.
++ *
++ * An ingress L3 interface selects the entries that apply to it through
++ * its MAC_BITMAP, so an entry written here only takes effect once some
++ * interface names it.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_my_mac_entry_set(struct ppe_device *ppe_dev, u32 index,
++			  const u8 *mac_addr, bool valid)
++{
++	u32 base, val[2] = {};
++	u64 mac;
++	int ret;
++	int i;
++
++	if (index >= PPE_MY_MAC_TBL_ENTRIES)
++		return -EINVAL;
++
++	if (valid) {
++		mac = ether_addr_to_u64(mac_addr);
++		val[0] = mac & GENMASK(31, 0);
++		val[1] = FIELD_PREP(PPE_MY_MAC_TBL_MAC_DA_1, mac >> 32);
++		val[1] |= PPE_MY_MAC_TBL_VALID;
++	}
++
++	base = PPE_MY_MAC_TBL_ADDR + index * PPE_MY_MAC_TBL_INC;
++	for (i = 0; i < 2; i++) {
++		ret = regmap_write(ppe_dev->regmap, base + i * 4, val[i]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * ppe_l3_if_port_bind() - Bind a port to an ingress L3 interface entry.
++ * @ppe_dev: PPE device.
++ * @port_id: The port whose arriving frames the binding applies to.
++ * @l3_if_index: The ingress L3 interface table index to consult.
++ * @valid: Whether the binding is active.
++ *
++ * The rest of this table entry holds unrelated source-guard
++ * configuration, so only the two L3 interface fields are updated.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_l3_if_port_bind(struct ppe_device *ppe_dev, u32 port_id,
++			 u32 l3_if_index, bool valid)
++{
++	u32 addr, val[PPE_L3_VP_PORT_TBL_WORDS];
++	int ret;
++	int i;
++
++	if (port_id >= PPE_L3_VP_PORT_TBL_ENTRIES ||
++	    l3_if_index >= PPE_IN_L3_IF_TBL_ENTRIES)
++		return -EINVAL;
++
++	addr = PPE_L3_VP_PORT_TBL_ADDR + port_id * PPE_L3_VP_PORT_TBL_INC;
++
++	/* The entry only latches when every word is written, so read it
++	 * back, change the two L3 interface fields and write the whole
++	 * entry out again -- writing word 0 alone is silently dropped.
++	 */
++	for (i = 0; i < PPE_L3_VP_PORT_TBL_WORDS; i++) {
++		ret = regmap_read(ppe_dev->regmap, addr + i * 4, &val[i]);
++		if (ret)
++			return ret;
++	}
++
++	val[0] &= ~(PPE_L3_VP_PORT_TBL_L3_IF_VALID |
++		    PPE_L3_VP_PORT_TBL_L3_IF_INDEX);
++	if (valid)
++		val[0] |= PPE_L3_VP_PORT_TBL_L3_IF_VALID |
++			  FIELD_PREP(PPE_L3_VP_PORT_TBL_L3_IF_INDEX, l3_if_index);
++
++	for (i = 0; i < PPE_L3_VP_PORT_TBL_WORDS; i++) {
++		ret = regmap_write(ppe_dev->regmap, addr + i * 4, val[i]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_l3_if.h
+@@ -0,0 +1,90 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_L3_IF_H__
++#define __PPE_L3_IF_H__
++
++#include <linux/if_ether.h>
++#include <linux/types.h>
++
++#include "ppe.h"
++
++/**
++ * enum ppe_l3_if_action - What hardware does with a frame that fails a check.
++ * @PPE_L3_IF_ACTION_FORWARD: Forward it anyway.
++ * @PPE_L3_IF_ACTION_DROP: Drop it.
++ * @PPE_L3_IF_ACTION_COPY_TO_CPU: Forward it and copy it to the CPU.
++ * @PPE_L3_IF_ACTION_REDIRECT_TO_CPU: Send it to the CPU instead.
++ */
++enum ppe_l3_if_action {
++	PPE_L3_IF_ACTION_FORWARD = 0,
++	PPE_L3_IF_ACTION_DROP,
++	PPE_L3_IF_ACTION_COPY_TO_CPU,
++	PPE_L3_IF_ACTION_REDIRECT_TO_CPU,
++};
++
++/**
++ * struct ppe_l3_if_in_entry - PPE ingress L3 interface table entry.
++ * @mru: Maximum receive unit enforced on this L3 interface, in bytes.
++ * @mtu: Maximum transmit unit enforced on this L3 interface, in bytes.
++ * @mru_ipv6: As @mru, for IPv6 packets.
++ * @mtu_ipv6: As @mtu, for IPv6 packets.
++ * @ttl_dec_bypass: Whether to skip decrementing TTL / hop limit for
++ * traffic routed through this L3 interface.
++ * @ipv4_uc_route_en: Whether IPv4 unicast routing is enabled.
++ * @ipv6_uc_route_en: Whether IPv6 unicast routing is enabled.
++ * @icmp_trigger_en: Whether to redirect to the CPU packets that need
++ * an ICMP error generated (e.g. TTL exceeded) on this L3 interface.
++ * @ttl_exceed_cmd: Forwarding command applied to packets whose TTL /
++ * hop limit has been exceeded.
++ * @ttl_exceed_de_acce: Whether to de-accelerate (stop hardware
++ * offloading) a flow when its TTL / hop limit is exceeded.
++ * @mac_bitmap: Bitmap of MY-MAC table entries this L3 interface
++ * accepts as a valid destination MAC.
++ * @pppoe_en: Whether this L3 interface expects PPPoE encapsulation on
++ * ingress.
++ */
++struct ppe_l3_if_in_entry {
++	u16 mru;
++	u16 mtu;
++	u16 mru_ipv6;
++	u16 mtu_ipv6;
++	bool ttl_dec_bypass;
++	bool ipv4_uc_route_en;
++	bool ipv6_uc_route_en;
++	bool icmp_trigger_en;
++	u8 ttl_exceed_cmd;
++	bool ttl_exceed_de_acce;
++	u8 mac_bitmap;
++	bool pppoe_en;
++};
++
++/**
++ * struct ppe_l3_if_eg_entry - PPE egress L3 interface table entry.
++ * @mac_addr: Source MAC address this L3 interface rewrites routed
++ * packets to use on egress.
++ * @session_id: PPPoE session ID applied on egress, when @pppoe_en.
++ * @pppoe_en: Whether to add a PPPoE encapsulation on egress.
++ */
++struct ppe_l3_if_eg_entry {
++	u8 mac_addr[ETH_ALEN];
++	u16 session_id;
++	bool pppoe_en;
++};
++
++int ppe_my_mac_entry_set(struct ppe_device *ppe_dev, u32 index,
++			  const u8 *mac_addr, bool valid);
++int ppe_l3_if_port_bind(struct ppe_device *ppe_dev, u32 port_id,
++			 u32 l3_if_index, bool valid);
++int ppe_l3_if_in_entry_set(struct ppe_device *ppe_dev, u32 index,
++			    const struct ppe_l3_if_in_entry *entry);
++int ppe_l3_if_in_entry_get(struct ppe_device *ppe_dev, u32 index,
++			    struct ppe_l3_if_in_entry *entry);
++int ppe_l3_if_eg_entry_set(struct ppe_device *ppe_dev, u32 index,
++			    const struct ppe_l3_if_eg_entry *entry);
++int ppe_l3_if_eg_entry_get(struct ppe_device *ppe_dev, u32 index,
++			    struct ppe_l3_if_eg_entry *entry);
++
++#endif
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop.c
+@@ -0,0 +1,134 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* PPE nexthop table -- egress rewrite rules (destination MAC, optional
++ * DNAT destination IP, VLAN tags) applied when a flow or host table
++ * entry forwards through this nexthop. Unlike the flow and host tables,
++ * this one is addressed directly: one fixed 4-word entry per index, the
++ * same style this driver already uses for its scheduler tables.
++ *
++ * The TYPE bit selects which of two mutually exclusive interpretations
++ * of the same bit range applies: TYPE=0 means the entry egresses into a
++ * VSI (bridge domain), TYPE=1 means it egresses through a physical or
++ * virtual port. This is confirmed against the vendor SDK's own
++ * assignment logic (adpt_hppe_ip_nexthop_set(): "if (entry->type == 0)
++ * ...vsi... else ...port..."), not inferred from field naming -- the
++ * vendor's own union member names (a "port" struct paired with type 0,
++ * a "vsi" struct paired with type 1) suggest the opposite of what the
++ * code actually does, so this needed checking, not guessing.
++ *
++ * The destination MAC address is packed into two hardware fields split
++ * at a 16/32-bit boundary: the low 16 bits of the 48-bit MAC in the top
++ * half of word 1, the high 32 bits in the whole of word 2. Confirmed
++ * against the vendor's own packing (mac_addr_0 = uc[5] | uc[4] << 8;
++ * mac_addr_1 = uc[3] | uc[2] << 8 | uc[1] << 16 | uc[0] << 24), which is
++ * exactly ether_addr_to_u64()'s byte order split at bit 16.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/etherdevice.h>
++#include <linux/regmap.h>
++
++#include "ppe.h"
++#include "ppe_nexthop.h"
++#include "ppe_regs.h"
++
++/**
++ * ppe_nexthop_entry_set() - Write a PPE nexthop table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to write.
++ * @entry: The nexthop entry to write.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_nexthop_entry_set(struct ppe_device *ppe_dev, u32 index,
++			   const struct ppe_nexthop_entry *entry)
++{
++	u32 base, val[4] = {};
++	u64 mac;
++	int ret;
++	int i;
++
++	if (index >= PPE_IN_NEXTHOP_TBL_ENTRIES)
++		return -EINVAL;
++
++	mac = ether_addr_to_u64(entry->dmac);
++
++	val[0] = FIELD_PREP(PPE_IN_NEXTHOP_TBL_TYPE, entry->port_valid ? 1 : 0);
++	if (entry->port_valid)
++		val[0] |= FIELD_PREP(PPE_IN_NEXTHOP_TBL_PORT, entry->port);
++	else
++		val[0] |= FIELD_PREP(PPE_IN_NEXTHOP_TBL_VSI, entry->vsi);
++	val[0] |= FIELD_PREP(PPE_IN_NEXTHOP_TBL_POST_L3_IF, entry->post_l3_if);
++	val[0] |= entry->ip_to_me ? PPE_IN_NEXTHOP_TBL_IP_TO_ME : 0;
++	val[0] |= entry->stag_fmt ? PPE_IN_NEXTHOP_TBL_STAG_FMT : 0;
++	val[0] |= FIELD_PREP(PPE_IN_NEXTHOP_TBL_SVID, entry->svid);
++	val[0] |= entry->ctag_fmt ? PPE_IN_NEXTHOP_TBL_CTAG_FMT : 0;
++
++	val[1] = FIELD_PREP(PPE_IN_NEXTHOP_TBL_CVID, entry->cvid);
++	val[1] |= FIELD_PREP(PPE_IN_NEXTHOP_TBL_PUB_ADDR_INDEX, entry->pub_addr_index);
++	val[1] |= FIELD_PREP(PPE_IN_NEXTHOP_TBL_MAC_ADDR_0, mac & GENMASK(15, 0));
++
++	val[2] = mac >> 16;
++
++	val[3] = be32_to_cpu(entry->dnat_ip);
++
++	base = PPE_IN_NEXTHOP_TBL_ADDR + index * PPE_IN_NEXTHOP_TBL_INC;
++	for (i = 0; i < 4; i++) {
++		ret = regmap_write(ppe_dev->regmap, base + i * 4, val[i]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * ppe_nexthop_entry_get() - Read a PPE nexthop table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to read.
++ * @entry: Where to store the entry read back.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_nexthop_entry_get(struct ppe_device *ppe_dev, u32 index,
++			   struct ppe_nexthop_entry *entry)
++{
++	u32 base, val[4];
++	u64 mac;
++	int ret;
++	int i;
++
++	if (index >= PPE_IN_NEXTHOP_TBL_ENTRIES)
++		return -EINVAL;
++
++	base = PPE_IN_NEXTHOP_TBL_ADDR + index * PPE_IN_NEXTHOP_TBL_INC;
++	for (i = 0; i < 4; i++) {
++		ret = regmap_read(ppe_dev->regmap, base + i * 4, &val[i]);
++		if (ret)
++			return ret;
++	}
++
++	entry->port_valid = FIELD_GET(PPE_IN_NEXTHOP_TBL_TYPE, val[0]);
++	if (entry->port_valid)
++		entry->port = FIELD_GET(PPE_IN_NEXTHOP_TBL_PORT, val[0]);
++	else
++		entry->vsi = FIELD_GET(PPE_IN_NEXTHOP_TBL_VSI, val[0]);
++	entry->post_l3_if = FIELD_GET(PPE_IN_NEXTHOP_TBL_POST_L3_IF, val[0]);
++	entry->ip_to_me = !!(val[0] & PPE_IN_NEXTHOP_TBL_IP_TO_ME);
++	entry->stag_fmt = !!(val[0] & PPE_IN_NEXTHOP_TBL_STAG_FMT);
++	entry->svid = FIELD_GET(PPE_IN_NEXTHOP_TBL_SVID, val[0]);
++	entry->ctag_fmt = !!(val[0] & PPE_IN_NEXTHOP_TBL_CTAG_FMT);
++
++	entry->cvid = FIELD_GET(PPE_IN_NEXTHOP_TBL_CVID, val[1]);
++	entry->pub_addr_index = FIELD_GET(PPE_IN_NEXTHOP_TBL_PUB_ADDR_INDEX, val[1]);
++
++	mac = (u64)val[2] << 16 | FIELD_GET(PPE_IN_NEXTHOP_TBL_MAC_ADDR_0, val[1]);
++	u64_to_ether_addr(mac, entry->dmac);
++
++	entry->dnat_ip = cpu_to_be32(val[3]);
++
++	return 0;
++}
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop.h
+@@ -0,0 +1,53 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_NEXTHOP_H__
++#define __PPE_NEXTHOP_H__
++
++#include <linux/if_ether.h>
++#include <linux/types.h>
++
++#include "ppe.h"
++
++/**
++ * struct ppe_nexthop_entry - PPE nexthop table entry.
++ * @port_valid: True if @port is a physical/virtual port index; false if
++ * @vsi is a VSI (bridge domain) index instead. The two share the same
++ * hardware field and are mutually exclusive.
++ * @port: Egress port index, when @port_valid.
++ * @vsi: Egress VSI index, when !@port_valid.
++ * @post_l3_if: L3 interface index applied after this nexthop.
++ * @ip_to_me: True if traffic hitting this nexthop terminates locally.
++ * @stag_fmt: Whether to insert/rewrite an S-VLAN tag on egress.
++ * @svid: S-VLAN ID, when @stag_fmt.
++ * @ctag_fmt: Whether to insert/rewrite a C-VLAN tag on egress.
++ * @cvid: C-VLAN ID, when @ctag_fmt.
++ * @pub_addr_index: Index into the public-IP-address table to use for
++ * SNAT, when this nexthop is used by an SNAT flow. Unused otherwise.
++ * @dmac: Destination MAC address to rewrite the packet to.
++ * @dnat_ip: Destination IPv4 address to rewrite to, for a DNAT nexthop.
++ * Unused otherwise.
++ */
++struct ppe_nexthop_entry {
++	bool port_valid;
++	u16 port;
++	u16 vsi;
++	u16 post_l3_if;
++	bool ip_to_me;
++	bool stag_fmt;
++	u16 svid;
++	bool ctag_fmt;
++	u16 cvid;
++	u8 pub_addr_index;
++	u8 dmac[ETH_ALEN];
++	__be32 dnat_ip;
++};
++
++int ppe_nexthop_entry_set(struct ppe_device *ppe_dev, u32 index,
++			   const struct ppe_nexthop_entry *entry);
++int ppe_nexthop_entry_get(struct ppe_device *ppe_dev, u32 index,
++			   struct ppe_nexthop_entry *entry);
++
++#endif
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop_pool.c
+@@ -0,0 +1,163 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* Refcounted, deduplicating allocator on top of the nexthop table
++ * primitive (ppe_nexthop.c). See ppe_nexthop_pool.h for why this
++ * needs its own software dedup, unlike the host table pool.
++ */
++
++#include <linux/errno.h>
++#include <linux/list.h>
++#include <linux/refcount.h>
++#include <linux/string.h>
++
++#include "ppe.h"
++#include "ppe_nexthop.h"
++#include "ppe_nexthop_pool.h"
++
++static bool ppe_nexthop_entry_equal(const struct ppe_nexthop_entry *a,
++				     const struct ppe_nexthop_entry *b)
++{
++	if (a->port_valid != b->port_valid)
++		return false;
++	if (a->port_valid ? a->port != b->port : a->vsi != b->vsi)
++		return false;
++
++	return a->post_l3_if == b->post_l3_if &&
++	       a->ip_to_me == b->ip_to_me &&
++	       a->stag_fmt == b->stag_fmt &&
++	       a->svid == b->svid &&
++	       a->ctag_fmt == b->ctag_fmt &&
++	       a->cvid == b->cvid &&
++	       a->pub_addr_index == b->pub_addr_index &&
++	       a->dnat_ip == b->dnat_ip &&
++	       !memcmp(a->dmac, b->dmac, ETH_ALEN);
++}
++
++/**
++ * ppe_nexthop_pool_init() - Initialize a nexthop table pool.
++ * @pool: The pool to initialize.
++ */
++void ppe_nexthop_pool_init(struct ppe_nexthop_pool *pool)
++{
++	unsigned int i;
++
++	INIT_LIST_HEAD(&pool->free);
++	INIT_LIST_HEAD(&pool->active);
++	mutex_init(&pool->lock);
++
++	for (i = 0; i < PPE_IN_NEXTHOP_TBL_ENTRIES; i++) {
++		pool->entry[i].index = i;
++		pool->entry[i].active = false;
++		list_add_tail(&pool->entry[i].list, &pool->free);
++	}
++}
++
++/**
++ * ppe_nexthop_pool_destroy() - Tear down a nexthop table pool.
++ * @ppe_dev: PPE device.
++ * @pool: The pool to tear down.
++ *
++ * Clears every hardware entry the pool is still tracking. Callers are
++ * expected to have already stopped issuing get/deref calls against
++ * this pool.
++ */
++void ppe_nexthop_pool_destroy(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool)
++{
++	struct ppe_nexthop_pool_entry *e, *tmp;
++	struct ppe_nexthop_entry zero = {};
++
++	list_for_each_entry_safe(e, tmp, &pool->active, list)
++		ppe_nexthop_entry_set(ppe_dev, e->index, &zero);
++}
++
++/**
++ * ppe_nexthop_pool_get_and_ref() - Add a nexthop entry, or ref a matching one.
++ * @ppe_dev: PPE device.
++ * @pool: The pool to allocate from.
++ * @key: The nexthop entry to write, or match against an already-active one.
++ * @index: On success, the entry's hardware index (new or reused).
++ *
++ * Return: 0 on success, a negative error code on failure (-ENOSPC if
++ * the table is full).
++ */
++int ppe_nexthop_pool_get_and_ref(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool,
++				  const struct ppe_nexthop_entry *key, u32 *index)
++{
++	struct ppe_nexthop_pool_entry *e;
++	int ret;
++
++	mutex_lock(&pool->lock);
++
++	list_for_each_entry(e, &pool->active, list) {
++		if (ppe_nexthop_entry_equal(&e->key, key)) {
++			refcount_inc(&e->ref);
++			mutex_unlock(&pool->lock);
++			*index = e->index;
++			return 0;
++		}
++	}
++
++	e = list_first_entry_or_null(&pool->free, struct ppe_nexthop_pool_entry, list);
++	if (!e) {
++		mutex_unlock(&pool->lock);
++		return -ENOSPC;
++	}
++
++	ret = ppe_nexthop_entry_set(ppe_dev, e->index, key);
++	if (ret) {
++		mutex_unlock(&pool->lock);
++		return ret;
++	}
++
++	e->key = *key;
++	e->active = true;
++	refcount_set(&e->ref, 1);
++	list_move_tail(&e->list, &pool->active);
++
++	mutex_unlock(&pool->lock);
++	*index = e->index;
++
++	return 0;
++}
++
++/**
++ * ppe_nexthop_pool_deref() - Drop a reference on a pooled nexthop entry.
++ * @ppe_dev: PPE device.
++ * @pool: The pool @index was allocated from.
++ * @index: The entry index, as returned by ppe_nexthop_pool_get_and_ref().
++ *
++ * Clears the underlying hardware entry once its last reference is
++ * dropped.
++ */
++void ppe_nexthop_pool_deref(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool, u32 index)
++{
++	struct ppe_nexthop_entry zero = {};
++	struct ppe_nexthop_pool_entry *e;
++
++	if (index >= PPE_IN_NEXTHOP_TBL_ENTRIES)
++		return;
++
++	mutex_lock(&pool->lock);
++
++	e = &pool->entry[index];
++	if (!e->active) {
++		mutex_unlock(&pool->lock);
++		return;
++	}
++
++	if (!refcount_dec_and_test(&e->ref)) {
++		mutex_unlock(&pool->lock);
++		return;
++	}
++
++	e->active = false;
++	memset(&e->key, 0, sizeof(e->key));
++	list_move_tail(&e->list, &pool->free);
++
++	mutex_unlock(&pool->lock);
++
++	ppe_nexthop_entry_set(ppe_dev, index, &zero);
++}
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop_pool.h
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_NEXTHOP_POOL_H__
++#define __PPE_NEXTHOP_POOL_H__
++
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/refcount.h>
++#include <linux/types.h>
++
++#include "ppe.h"
++#include "ppe_nexthop.h"
++#include "ppe_regs.h"
++
++struct ppe_nexthop_pool_entry {
++	struct list_head list;
++	refcount_t ref;
++	u32 index;
++	bool active;
++	struct ppe_nexthop_entry key;
++};
++
++/**
++ * struct ppe_nexthop_pool - Deduplicating, refcounted nexthop table allocator.
++ * @entry: One entry per hardware index, threaded onto @free or @active.
++ * @free: Indices not currently programmed into hardware.
++ * @active: Indices currently programmed, each holding a copy of the
++ * entry it was programmed with in @entry[i].key, for matching future
++ * requests against.
++ * @lock: Serializes get/deref against concurrent callers.
++ *
++ * Unlike the host table, the nexthop table is direct-addressed with no
++ * hardware-side dedup: two identical entries programmed at different
++ * indices are simply two separate, independent hardware entries. This
++ * pool does the same linear-search-then-allocate-or-reuse dedup the
++ * vendor SDK's ppe_drv_nexthop_v4_get_and_ref()/ppe_drv_nexthop_v4_match()
++ * do in software, backed by a fixed array sized to the hardware table
++ * instead of a kzalloc-per-entry list, since the table's size
++ * (PPE_IN_NEXTHOP_TBL_ENTRIES) is fixed and known up front.
++ */
++struct ppe_nexthop_pool {
++	struct ppe_nexthop_pool_entry entry[PPE_IN_NEXTHOP_TBL_ENTRIES];
++	struct list_head free;
++	struct list_head active;
++	struct mutex lock;
++};
++
++void ppe_nexthop_pool_init(struct ppe_nexthop_pool *pool);
++void ppe_nexthop_pool_destroy(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool);
++
++int ppe_nexthop_pool_get_and_ref(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool,
++				  const struct ppe_nexthop_entry *key, u32 *index);
++void ppe_nexthop_pool_deref(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool, u32 index);
++
++#endif
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_pub_ip.c
+@@ -0,0 +1,62 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* PPE public IP address table -- direct-addressed, one whole-word IPv4
++ * address per entry. See ppe_regs.h for the register layout and its
++ * verification notes.
++ */
++
++#include <linux/regmap.h>
++
++#include "ppe.h"
++#include "ppe_pub_ip.h"
++#include "ppe_regs.h"
++
++/**
++ * ppe_pub_ip_entry_set() - Write a PPE public IP address table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to write.
++ * @ip_addr: The IPv4 address to write (network byte order).
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_pub_ip_entry_set(struct ppe_device *ppe_dev, u32 index, __be32 ip_addr)
++{
++	u32 base;
++
++	if (index >= PPE_PUB_IP_ADDR_TBL_ENTRIES)
++		return -EINVAL;
++
++	base = PPE_PUB_IP_ADDR_TBL_ADDR + index * PPE_PUB_IP_ADDR_TBL_INC;
++
++	return regmap_write(ppe_dev->regmap, base, be32_to_cpu(ip_addr));
++}
++
++/**
++ * ppe_pub_ip_entry_get() - Read a PPE public IP address table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to read.
++ * @ip_addr: Where to store the IPv4 address read back (network byte order).
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_pub_ip_entry_get(struct ppe_device *ppe_dev, u32 index, __be32 *ip_addr)
++{
++	u32 base, val;
++	int ret;
++
++	if (index >= PPE_PUB_IP_ADDR_TBL_ENTRIES)
++		return -EINVAL;
++
++	base = PPE_PUB_IP_ADDR_TBL_ADDR + index * PPE_PUB_IP_ADDR_TBL_INC;
++
++	ret = regmap_read(ppe_dev->regmap, base, &val);
++	if (ret)
++		return ret;
++
++	*ip_addr = cpu_to_be32(val);
++
++	return 0;
++}
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_pub_ip.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_PUB_IP_H__
++#define __PPE_PUB_IP_H__
++
++#include <linux/types.h>
++
++#include "ppe.h"
++
++int ppe_pub_ip_entry_set(struct ppe_device *ppe_dev, u32 index, __be32 ip_addr);
++int ppe_pub_ip_entry_get(struct ppe_device *ppe_dev, u32 index, __be32 *ip_addr);
++
++#endif
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_pub_ip_pool.c
+@@ -0,0 +1,141 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++/* Refcounted, deduplicating allocator on top of the public IP address
++ * table primitive (ppe_pub_ip.c). See ppe_pub_ip_pool.h for why this
++ * needs its own software dedup, same reasoning as ppe_nexthop_pool.c.
++ */
++
++#include <linux/errno.h>
++#include <linux/list.h>
++#include <linux/refcount.h>
++
++#include "ppe.h"
++#include "ppe_pub_ip.h"
++#include "ppe_pub_ip_pool.h"
++
++/**
++ * ppe_pub_ip_pool_init() - Initialize a public IP table pool.
++ * @pool: The pool to initialize.
++ */
++void ppe_pub_ip_pool_init(struct ppe_pub_ip_pool *pool)
++{
++	unsigned int i;
++
++	INIT_LIST_HEAD(&pool->free);
++	INIT_LIST_HEAD(&pool->active);
++	mutex_init(&pool->lock);
++
++	for (i = 0; i < PPE_PUB_IP_ADDR_TBL_ENTRIES; i++) {
++		pool->entry[i].index = i;
++		pool->entry[i].active = false;
++		list_add_tail(&pool->entry[i].list, &pool->free);
++	}
++}
++
++/**
++ * ppe_pub_ip_pool_destroy() - Tear down a public IP table pool.
++ * @ppe_dev: PPE device.
++ * @pool: The pool to tear down.
++ *
++ * Clears every hardware entry the pool is still tracking. Callers are
++ * expected to have already stopped issuing get/deref calls against
++ * this pool.
++ */
++void ppe_pub_ip_pool_destroy(struct ppe_device *ppe_dev, struct ppe_pub_ip_pool *pool)
++{
++	struct ppe_pub_ip_pool_entry *e, *tmp;
++
++	list_for_each_entry_safe(e, tmp, &pool->active, list)
++		ppe_pub_ip_entry_set(ppe_dev, e->index, 0);
++}
++
++/**
++ * ppe_pub_ip_pool_get_and_ref() - Add a public IP entry, or ref a matching one.
++ * @ppe_dev: PPE device.
++ * @pool: The pool to allocate from.
++ * @ip_addr: The IPv4 address to write, or match against an already-active one.
++ * @index: On success, the entry's hardware index (new or reused).
++ *
++ * Return: 0 on success, a negative error code on failure (-ENOSPC if
++ * the table is full).
++ */
++int ppe_pub_ip_pool_get_and_ref(struct ppe_device *ppe_dev, struct ppe_pub_ip_pool *pool,
++				 __be32 ip_addr, u32 *index)
++{
++	struct ppe_pub_ip_pool_entry *e;
++	int ret;
++
++	mutex_lock(&pool->lock);
++
++	list_for_each_entry(e, &pool->active, list) {
++		if (e->ip_addr == ip_addr) {
++			refcount_inc(&e->ref);
++			mutex_unlock(&pool->lock);
++			*index = e->index;
++			return 0;
++		}
++	}
++
++	e = list_first_entry_or_null(&pool->free, struct ppe_pub_ip_pool_entry, list);
++	if (!e) {
++		mutex_unlock(&pool->lock);
++		return -ENOSPC;
++	}
++
++	ret = ppe_pub_ip_entry_set(ppe_dev, e->index, ip_addr);
++	if (ret) {
++		mutex_unlock(&pool->lock);
++		return ret;
++	}
++
++	e->ip_addr = ip_addr;
++	e->active = true;
++	refcount_set(&e->ref, 1);
++	list_move_tail(&e->list, &pool->active);
++
++	mutex_unlock(&pool->lock);
++	*index = e->index;
++
++	return 0;
++}
++
++/**
++ * ppe_pub_ip_pool_deref() - Drop a reference on a pooled public IP entry.
++ * @ppe_dev: PPE device.
++ * @pool: The pool @index was allocated from.
++ * @index: The entry index, as returned by ppe_pub_ip_pool_get_and_ref().
++ *
++ * Clears the underlying hardware entry once its last reference is
++ * dropped.
++ */
++void ppe_pub_ip_pool_deref(struct ppe_device *ppe_dev, struct ppe_pub_ip_pool *pool, u32 index)
++{
++	struct ppe_pub_ip_pool_entry *e;
++
++	if (index >= PPE_PUB_IP_ADDR_TBL_ENTRIES)
++		return;
++
++	mutex_lock(&pool->lock);
++
++	e = &pool->entry[index];
++	if (!e->active) {
++		mutex_unlock(&pool->lock);
++		return;
++	}
++
++	if (!refcount_dec_and_test(&e->ref)) {
++		mutex_unlock(&pool->lock);
++		return;
++	}
++
++	e->active = false;
++	e->ip_addr = 0;
++	list_move_tail(&e->list, &pool->free);
++
++	mutex_unlock(&pool->lock);
++
++	ppe_pub_ip_entry_set(ppe_dev, index, 0);
++}
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_pub_ip_pool.h
+@@ -0,0 +1,54 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef __PPE_PUB_IP_POOL_H__
++#define __PPE_PUB_IP_POOL_H__
++
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/refcount.h>
++#include <linux/types.h>
++
++#include "ppe.h"
++#include "ppe_regs.h"
++
++struct ppe_pub_ip_pool_entry {
++	struct list_head list;
++	refcount_t ref;
++	u32 index;
++	bool active;
++	__be32 ip_addr;
++};
++
++/**
++ * struct ppe_pub_ip_pool - Deduplicating, refcounted public IP table allocator.
++ * @entry: One entry per hardware index, threaded onto @free or @active.
++ * @free: Indices not currently programmed into hardware.
++ * @active: Indices currently programmed, each holding the IP address it
++ * was programmed with in @entry[i].ip_addr, for matching future requests.
++ * @lock: Serializes get/deref against concurrent callers.
++ *
++ * Like the nexthop table, the public IP table is direct-addressed with
++ * no hardware dedup, so this does the same linear-search-then-allocate
++ * dedup the vendor SDK's ppe_drv_pub_ip_get_and_ref() does in software.
++ * Only PPE_PUB_IP_ADDR_TBL_ENTRIES (16) exist -- typically just the
++ * router's own WAN address or two, but real exhaustion is possible on
++ * a multi-WAN setup and callers must handle -ENOSPC.
++ */
++struct ppe_pub_ip_pool {
++	struct ppe_pub_ip_pool_entry entry[PPE_PUB_IP_ADDR_TBL_ENTRIES];
++	struct list_head free;
++	struct list_head active;
++	struct mutex lock;
++};
++
++void ppe_pub_ip_pool_init(struct ppe_pub_ip_pool *pool);
++void ppe_pub_ip_pool_destroy(struct ppe_device *ppe_dev, struct ppe_pub_ip_pool *pool);
++
++int ppe_pub_ip_pool_get_and_ref(struct ppe_device *ppe_dev, struct ppe_pub_ip_pool *pool,
++				 __be32 ip_addr, u32 *index);
++void ppe_pub_ip_pool_deref(struct ppe_device *ppe_dev, struct ppe_pub_ip_pool *pool, u32 index);
++
++#endif
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -1109,4 +1109,310 @@
+ 
+ #define PPE_P1_MULTICAST_DROP_CNT_TBL_ADDR	\
+ 	(PPE_P0_MULTICAST_DROP_CNT_TBL_ADDR + PPE_MULTICAST_QUEUE_PORT_ADDR_INC)
++
++/* IPv4/IPv6 flow entry table, accessed indirectly: write the entry words to
++ * PPE_IN_FLOW_TBL_OP_DATA, write a command to PPE_IN_FLOW_TBL_OP to trigger
++ * the operation, then poll PPE_IN_FLOW_TBL_OP_RSLT until VALID_CNT is set.
++ * Register offsets include the 0x200000 base of the flow-table sub-block
++ * (named IPE_L3 in the vendor SDK) within the PPE's MMIO window.
++ *
++ * IPQ5332 is an APPE/MPPE part: the vendor SDK is built with -DAPPE
++ * -DMPPE for it, so every IPE_L3 table below uses the vendor headers'
++ * "#if defined(APPE)" addresses, strides and entry layouts, not the
++ * IPQ807x (HPPE) "#else" ones. On APPE, 0x2004bc (the HPPE host op
++ * address) is FLOW_CTRL1 instead.
++ */
++#define PPE_IN_FLOW_TBL_ENTRIES			2048
++
++/* Per-flow hit counters, indexed by the flow table entry index.
++ *
++ * Address is INGRESS_POLICER_BASE_ADDR (0x100000) + IN_FLOW_CNT_TBL_ADDRESS
++ * (0x20000), stride IN_FLOW_CNT_TBL_INC (0x10), per the vendor SDK
++ * (hppe_flow.c: hppe_in_flow_cnt_tbl_get, hppe_reg_access.h, hppe_flow_reg.h).
++ * Both the base and the table offset are defined unconditionally there -- they
++ * are NOT inside an "#if defined(APPE)" branch, unlike the IPE_L3 tables that
++ * caused the HPPE/APPE address mix-up.
++ *
++ * The counters are cumulative and NOT clear-on-read, so callers must keep the
++ * previous value and report deltas.
++ */
++#define PPE_IN_FLOW_CNT_TBL_ADDR		0x120000
++#define PPE_IN_FLOW_CNT_TBL_INC			0x10
++#define PPE_IN_FLOW_CNT_TBL_ENTRIES		4096
++/* word 0: packets (32 bits); word 1 + low 8 bits of word 2: bytes (40 bits) */
++#define PPE_IN_FLOW_CNT_TBL_WORDS		3
++#define PPE_IN_FLOW_CNT_TBL_BYTE_HI		GENMASK(7, 0)
++#define PPE_IN_FLOW_CNT_TBL_PKT_MAX		GENMASK_ULL(31, 0)
++#define PPE_IN_FLOW_CNT_TBL_BYTE_MAX		GENMASK_ULL(39, 0)
++
++#define PPE_IN_FLOW_TBL_OP_ADDR			0x200528
++#define PPE_IN_FLOW_TBL_OP_CMD_ID		GENMASK(3, 0)
++#define PPE_IN_FLOW_TBL_OP_BYP_RSLT_EN		BIT(4)
++#define PPE_IN_FLOW_TBL_OP_OP_TYPE		GENMASK(7, 5)
++#define PPE_IN_FLOW_TBL_OP_HASH_BLOCK_BITMAP	GENMASK(9, 8)
++#define PPE_IN_FLOW_TBL_OP_OP_MODE		BIT(10)
++#define PPE_IN_FLOW_TBL_OP_OP_HOST_EN		BIT(11)
++#define PPE_IN_FLOW_TBL_OP_ENTRY_INDEX		GENMASK(23, 12)
++
++#define PPE_IN_FLOW_TBL_OP_DATA_ADDR		0x200550
++#define PPE_IN_FLOW_TBL_OP_DATA_ENTRIES		11
++#define PPE_IN_FLOW_TBL_OP_DATA_INC		0x4
++
++#define PPE_IN_FLOW_TBL_OP_RSLT_ADDR		0x2005c4
++#define PPE_IN_FLOW_TBL_OP_RSLT_CMD_ID		GENMASK(3, 0)
++#define PPE_IN_FLOW_TBL_OP_RSLT_OP_RSLT		BIT(4)
++#define PPE_IN_FLOW_TBL_OP_RSLT_ENTRY_INDEX	GENMASK(16, 5)
++#define PPE_IN_FLOW_TBL_OP_RSLT_VALID_CNT	GENMASK(20, 17)
++
++/* IPv4/IPv6 host table (IP address -> nexthop binding), accessed
++ * indirectly with the same command/data/result sequence as the flow
++ * table above, but with its own register addresses and bitfield widths.
++ */
++#define PPE_HOST_TBL_OP_ADDR			0x200724
++#define PPE_HOST_TBL_OP_CMD_ID			GENMASK(3, 0)
++#define PPE_HOST_TBL_OP_BYP_RSLT_EN		BIT(4)
++#define PPE_HOST_TBL_OP_OP_TYPE			GENMASK(7, 5)
++#define PPE_HOST_TBL_OP_HASH_BLOCK_BITMAP	GENMASK(9, 8)
++#define PPE_HOST_TBL_OP_OP_MODE			BIT(10)
++#define PPE_HOST_TBL_OP_ENTRY_INDEX		GENMASK(23, 11)
++
++#define PPE_HOST_TBL_OP_DATA_ADDR		0x200738
++#define PPE_HOST_TBL_OP_DATA_ENTRIES		10
++#define PPE_HOST_TBL_OP_DATA_INC		0x4
++
++#define PPE_HOST_TBL_OP_RSLT_ADDR		0x200770
++#define PPE_HOST_TBL_OP_RSLT_CMD_ID		GENMASK(3, 0)
++#define PPE_HOST_TBL_OP_RSLT_OP_RSLT		BIT(4)
++#define PPE_HOST_TBL_OP_RSLT_ENTRY_INDEX	GENMASK(17, 5)
++#define PPE_HOST_TBL_OP_RSLT_VALID_CNT		GENMASK(21, 18)
++
++/* Field layout of an IPv4 host table entry (PPE_HOST_TBL_IPV4_ENTRY_WORDS
++ * words, written/read through ppe_host_entry_add/del() -- see
++ * ppe_host.c). Confirmed against the vendor SDK's
++ * struct host_tbl, identical on APPE and non-APPE (include/hsl/hppe/hppe_ip_reg.h) and its actual
++ * assignment code (adpt_hppe_ip_host_add(), ppe_drv_host_v4_add()).
++ */
++
++/* Word 0. */
++#define PPE_HOST_TBL_VALID			BIT(0)
++#define PPE_HOST_TBL_KEY_TYPE			GENMASK(2, 1)
++#define PPE_HOST_TBL_FWD_CMD			GENMASK(4, 3)
++#define PPE_HOST_TBL_SYN_TOGGLE			BIT(5)
++#define PPE_HOST_TBL_DST_INFO			GENMASK(19, 6)
++#define PPE_HOST_TBL_LAN_WAN			BIT(20)
++
++/* KEY_TYPE values: the plain unicast IPv4 and IPv6 entry variants
++ * (vendor adpt_hppe_ip_host_add(): 0 and 2; 1 and 3 are the multicast
++ * variants).
++ */
++#define PPE_HOST_TBL_KEY_TYPE_IPV4		0
++#define PPE_HOST_TBL_KEY_TYPE_IPV6		2
++
++/* Word 1 (IP_ADDR) is a single whole-word value, no bitfield mask. */
++
++/* Nexthop table, unlike the flow and host tables above, is addressed
++ * directly: one fixed-size (4-word, 0x20-strided on APPE) entry per index, no indirect
++ * command/data/result sequence. Each entry rewrites a packet's
++ * destination MAC (and, for a DNAT nexthop, its destination IP) before
++ * it egresses through a physical/virtual port or into a VSI.
++ */
++#define PPE_IN_NEXTHOP_TBL_ADDR			0x260000
++#define PPE_IN_NEXTHOP_TBL_ENTRIES		768
++#define PPE_IN_NEXTHOP_TBL_INC			0x20
++
++/* Word 0. */
++#define PPE_IN_NEXTHOP_TBL_TYPE			BIT(0)
++#define PPE_IN_NEXTHOP_TBL_PORT			GENMASK(8, 1)
++#define PPE_IN_NEXTHOP_TBL_VSI			GENMASK(6, 1)
++#define PPE_IN_NEXTHOP_TBL_POST_L3_IF		GENMASK(16, 9)
++#define PPE_IN_NEXTHOP_TBL_IP_TO_ME		BIT(17)
++#define PPE_IN_NEXTHOP_TBL_STAG_FMT		BIT(18)
++#define PPE_IN_NEXTHOP_TBL_SVID			GENMASK(30, 19)
++#define PPE_IN_NEXTHOP_TBL_CTAG_FMT		BIT(31)
++
++/* Word 1. */
++#define PPE_IN_NEXTHOP_TBL_CVID			GENMASK(11, 0)
++#define PPE_IN_NEXTHOP_TBL_PUB_ADDR_INDEX	GENMASK(15, 12)
++#define PPE_IN_NEXTHOP_TBL_MAC_ADDR_0		GENMASK(31, 16)
++
++/* Word 2 (MAC_ADDR_1) and word 3 (IP_ADDR_DNAT) are each a single
++ * whole-word value, so need no bitfield mask.
++ */
++
++/* MY_MAC table: the MAC addresses the PPE treats as its own. Hardware
++ * only routes a frame whose destination MAC matches an entry here that
++ * the ingress L3 interface selects through its MAC_BITMAP -- an
++ * unmatched frame is never routed, so a flow entry alone is not enough.
++ * Addressed directly, two words per entry, at IPE_L3_BASE_ADDR + 0x0
++ * (vendor MY_MAC_TBL, struct my_mac_tbl). The MAC is split the same
++ * way as PPE_EG_L3_IF_TBL's: low 32 bits in word 0, high 16 bits in
++ * word 1 -- confirmed against the vendor's own MY_MAC programming
++ * (adpt_hppe_ip.c), which copies both halves straight from the egress
++ * L3 interface entry it just built.
++ */
++#define PPE_MY_MAC_TBL_ADDR			0x200000
++#define PPE_MY_MAC_TBL_ENTRIES			8
++#define PPE_MY_MAC_TBL_INC			0x8
++
++/* Word 0 (MAC_DA_0) is a single whole-word value, no bitfield mask. */
++
++/* Word 1. */
++#define PPE_MY_MAC_TBL_MAC_DA_1			GENMASK(15, 0)
++#define PPE_MY_MAC_TBL_VALID			BIT(16)
++
++/* L3 virtual-port table: binds an ingress port to the L3 interface
++ * entry consulted for frames arriving on it. Only the L3 interface
++ * binding is touched here; the rest of the entry holds unrelated
++ * source-guard configuration, so it is updated read-modify-write.
++ */
++#define PPE_L3_VP_PORT_TBL_ADDR			0x204000
++#define PPE_L3_VP_PORT_TBL_ENTRIES		256
++#define PPE_L3_VP_PORT_TBL_INC			0x10
++#define PPE_L3_VP_PORT_TBL_WORDS		4
++
++/* Word 0. */
++#define PPE_L3_VP_PORT_TBL_L3_IF_VALID		BIT(0)
++#define PPE_L3_VP_PORT_TBL_L3_IF_INDEX		GENMASK(8, 1)
++
++/* Ingress L3 interface table: per-L3-interface MTU/MRU/route-enable
++ * config, referenced by a flow entry's SRC_L3_IF and consulted on
++ * ingress. Addressed directly, three words per entry on APPE (the
++ * vendor SDK's APPE union in_l3_if_tbl_u, which adds separate IPv6
++ * MRU/MTU fields). Final address is IPE_L3_BASE_ADDR (0x200000) +
++ * IN_L3_IF_TBL_ADDRESS (0x6000, APPE), within this driver's
++ * already-mapped "IPE L3" regmap range (0x200000-0x2fffff).
++ */
++#define PPE_IN_L3_IF_TBL_ADDR			0x206000
++#define PPE_IN_L3_IF_TBL_ENTRIES		256
++#define PPE_IN_L3_IF_TBL_INC			0x10
++#define PPE_IN_L3_IF_TBL_WORDS			3
++
++/* Word 0. */
++#define PPE_IN_L3_IF_TBL_MRU			GENMASK(13, 0)
++#define PPE_IN_L3_IF_TBL_MTU			GENMASK(27, 14)
++#define PPE_IN_L3_IF_TBL_TTL_DEC_BYPASS		BIT(28)
++#define PPE_IN_L3_IF_TBL_IPV4_UC_ROUTE_EN	BIT(29)
++#define PPE_IN_L3_IF_TBL_IPV6_UC_ROUTE_EN	BIT(30)
++#define PPE_IN_L3_IF_TBL_ICMP_TRIGGER_EN	BIT(31)
++
++/* Word 1. */
++#define PPE_IN_L3_IF_TBL_TTL_EXCEED_CMD		GENMASK(1, 0)
++#define PPE_IN_L3_IF_TBL_TTL_EXCEED_DE_ACCE	BIT(2)
++#define PPE_IN_L3_IF_TBL_MAC_BITMAP		GENMASK(10, 3)
++#define PPE_IN_L3_IF_TBL_PPPOE_EN		BIT(11)
++#define PPE_IN_L3_IF_TBL_DMAC_CHECK_DIS		BIT(12)
++#define PPE_IN_L3_IF_TBL_VPN_ID			GENMASK(17, 13)
++#define PPE_IN_L3_IF_TBL_MRU_IPV6		GENMASK(31, 18)
++
++/* Word 2. */
++#define PPE_IN_L3_IF_TBL_MTU_IPV6		GENMASK(13, 0)
++#define PPE_IN_L3_IF_TBL_UDP_CSM0_CMD		GENMASK(15, 14)
++
++/* Egress L3 interface table: per-L3-interface source MAC (and, when
++ * PPPoE-encapsulating, session ID) applied on egress. Referenced by a
++ * nexthop entry's POST_L3_IF and unconditionally required by every
++ * nexthop, not just tunnel/PPPoE ones -- confirmed via
++ * ppe_drv_nexthop_v4_get_and_ref() unconditionally setting
++ * fal_nh.if_index. Addressed directly, three words per entry (the
++ * vendor SDK's APPE union eg_l3_if_tbl_u; its extra tunnel fields in
++ * word 2 are left zero). Final address is NSS_PTX_CSR_BASE_ADDR
++ * (0x020000) + EG_L3_IF_TBL_ADDRESS (0x3000, APPE), within this
++ * driver's already-mapped "PTX CSR" regmap range (0x20000-0x5ffff).
++ *
++ * MAC address byte-order confirmed against the vendor's own packing
++ * (adpt_hppe_ip.c: mac_addr_0 = uc[5] | uc[4] << 8 | uc[3] << 16 |
++ * uc[2] << 24; mac_addr_1 = uc[1] | uc[0] << 8) -- this is
++ * ether_addr_to_u64()'s low 32 bits in word 0 and high 16 bits in the
++ * low half of word 1, the mirror image of PPE_IN_NEXTHOP_TBL's split.
++ */
++#define PPE_EG_L3_IF_TBL_ADDR			0x023000
++#define PPE_EG_L3_IF_TBL_ENTRIES		256
++#define PPE_EG_L3_IF_TBL_INC			0x10
++
++/* Word 0 (MAC_ADDR_0) is a single whole-word value, no bitfield mask. */
++
++/* Word 1. */
++#define PPE_EG_L3_IF_TBL_MAC_ADDR_1		GENMASK(15, 0)
++#define PPE_EG_L3_IF_TBL_SESSION_ID		GENMASK(31, 16)
++
++/* Word 2. */
++#define PPE_EG_L3_IF_TBL_PPPOE_EN		BIT(0)
++
++/* Public IP address table: holds the translated (post-SNAT) source
++ * IPv4 address for a SNAT nexthop, referenced by a nexthop entry's
++ * PUB_ADDR_INDEX. Small (16 entries) and direct-addressed, a single
++ * whole-word IP value per entry -- confirmed against
++ * hppe_in_pub_ip_addr_tbl_get/set()'s own address computation:
++ * IPE_L3_BASE_ADDR (0x200000) + IN_PUB_IP_ADDR_TBL_ADDRESS (0x4d8,
++ * APPE), within this driver's already-mapped "IPE L3" range.
++ */
++#define PPE_PUB_IP_ADDR_TBL_ADDR		0x2004d8
++#define PPE_PUB_IP_ADDR_TBL_ENTRIES		16
++#define PPE_PUB_IP_ADDR_TBL_INC		0x4
++
++/* Field layout of an IPv4 5-tuple flow entry (PPE_FLOW_TBL_IPV4_ENTRY_WORDS
++ * words, written through PPE_IN_FLOW_TBL_OP_DATA / read back through
++ * PPE_IN_FLOW_TBL_OP_RSLT -- see ppe_flow.h/.c). This is the
++ * SNAT-variant field layout (union in_flow_tbl_u's bf0 in the vendor
++ * SDK); the DNAT overlay is bit-for-bit the same, while ROUTE and BRIDGE
++ * reuse the word 1 bit range 12-31 for different fields and would need
++ * their own layout.
++ */
++
++/* Word 0. */
++/* The flow table itself, as hardware lays it out in the IPE L3 block:
++ * vendor IPE_L3_BASE_ADDR (0x200000) + IN_FLOW_TBL_ADDRESS (0x40000), one
++ * 0x20-byte slot per index; a two-slot IPv6 entry starts at an even index.
++ * Written through the table op only.
++ */
++#define PPE_IN_FLOW_TBL_ADDR			0x240000
++#define PPE_IN_FLOW_TBL_INC			0x20
++
++#define PPE_FLOW_TBL_VALID			BIT(0)
++#define PPE_FLOW_TBL_ENTRY_TYPE			BIT(1)
++#define PPE_FLOW_TBL_HOST_ADDR_INDEX_TYPE	BIT(2)
++#define PPE_FLOW_TBL_HOST_ADDR_INDEX		GENMASK(15, 3)
++#define PPE_FLOW_TBL_PROTOCOL_TYPE		GENMASK(17, 16)
++#define PPE_FLOW_TBL_AGE			GENMASK(19, 18)
++#define PPE_FLOW_TBL_SRC_L3_IF_VALID		BIT(20)
++#define PPE_FLOW_TBL_SRC_L3_IF			GENMASK(28, 21)
++#define PPE_FLOW_TBL_FWD_TYPE			GENMASK(31, 29)
++
++/* Word 1 (SNAT variant: next-hop index + rewritten source port). */
++#define PPE_FLOW_TBL_SNAT_NEXT_HOP		GENMASK(11, 0)
++#define PPE_FLOW_TBL_SNAT_L4_PORT		GENMASK(27, 12)
++#define PPE_FLOW_TBL_DE_ACCE			BIT(28)
++#define PPE_FLOW_TBL_COPY_TO_CPU_EN		BIT(29)
++#define PPE_FLOW_TBL_SYN_TOGGLE			BIT(30)
++#define PPE_FLOW_TBL_PRI_PROFILE_0		BIT(31)
++
++/* Word 2. */
++#define PPE_FLOW_TBL_PRI_PROFILE_1		GENMASK(3, 0)
++#define PPE_FLOW_TBL_SERVICE_CODE		GENMASK(11, 4)
++#define PPE_FLOW_TBL_IP_ADDR_0			GENMASK(31, 12)
++
++/* Word 3. */
++#define PPE_FLOW_TBL_IP_ADDR_1			GENMASK(11, 0)
++#define PPE_FLOW_TBL_L4_SPORT			GENMASK(27, 12)
++#define PPE_FLOW_TBL_L4_DPORT_0			GENMASK(31, 28)
++
++/* Word 4. */
++#define PPE_FLOW_TBL_L4_DPORT_1			GENMASK(11, 0)
++#define PPE_FLOW_TBL_VPN_ID			GENMASK(19, 12)
++#define PPE_FLOW_TBL_PMTU_CHECK_TYPE		BIT(20)
++#define PPE_FLOW_TBL_PMTU_0			GENMASK(31, 21)
++
++/* Word 5. */
++#define PPE_FLOW_TBL_PMTU_1			GENMASK(2, 0)
++
++/* Word 1, ROUTE overlay (fwd_type PPE_FLOW_FWD_ROUTE): the vendor's struct
++ * in_flow_tbl_2 and adpt_hppe_flow_entry_host_op_add()'s FAL_FLOW_ROUTE
++ * assignments; not encoded by this driver. The egress comes from the
++ * nexthop unless PORT_VP_VALID names a port outright. The flags (DE_ACCE
++ * onwards) sit where the NAT overlays have them.
++ */
++#define PPE_FLOW_TBL_ROUTE_NEXT_HOP		GENMASK(11, 0)
++#define PPE_FLOW_TBL_ROUTE_PORT_VP_VALID	BIT(12)
++#define PPE_FLOW_TBL_ROUTE_PORT_VP		GENMASK(20, 13)
++
+ #endif
