@@ -278,13 +278,14 @@ config bridge-vlan
   (the SDK-based driver read the switch MIB).
 - No PPE flow offload in this tree: routed traffic always crosses the CPU.
 - The PPE parser does not walk past the 8-byte rtl8_4 tag: frames from the
-  LAN ports probably all hash to one EDMA Rx ring and CPU (RPS still spreads
-  the protocol work) and get no Rx checksum offload; frames to them get no
-  Tx checksum offload or TSO (0431). perceival's parser alias (0445 in his
-  tree, built on his PPE offload series) reprograms the chip-wide TPIDs
-  (ingress C-TPID 0x0000) and the CPU port's egress VLAN mode; a tagged WAN
-  was checked there for connectivity only, so whether a VLAN WAN keeps its
-  RSS spread and Rx checksum offload under it is unverified. Not carried.
+  LAN ports nearly all land on one EDMA Rx ring and CPU (95% on one PPE queue
+  in 1.3; RPS still spreads the protocol work) and get no Rx checksum offload
+  (Linux checks it, 1.8); frames to them get no Tx checksum offload or TSO
+  (0431). perceival's parser alias (0445 in his tree, built on his PPE
+  offload series) reprograms the chip-wide TPIDs (ingress C-TPID 0x0000) and
+  the CPU port's egress VLAN mode; a tagged WAN was checked there for
+  connectivity only, so whether a VLAN WAN keeps its RSS spread and Rx
+  checksum offload under it is unverified. Not carried.
 - In a VLAN-unaware offloaded bridge, unicast tagged with a VID other than 1
   towards the router floods to the bridge ports: use a VLAN-aware br-lan for
   VLANs that end on the router.
@@ -308,7 +309,8 @@ config bridge-vlan
 - `bridge fdb replace` of a host address onto a LAN port: once deleted there
   it floods; replaced back onto Wi-Fi, the entry stays on the LAN port.
 - Link-local traps need 0432; 01:80:c2:00:00:10-2f, CDP, SSTP and PTP keep
-  their reset actions. A VLAN-aware port without a PVID is TAG_ONLY, never
-  run on this chip.
+  their reset actions. A VLAN-aware port without a PVID admits tagged frames
+  only (TAG_ONLY; the bench's lan4 dropped untagged frames); whether untagged
+  link-local frames still reach the CPU on such a port is untested (3.3).
 - VID 1 and priority-tagged frames reach Linux tagged: a host tagging VID 1
   needs a VLAN-aware br-lan with VID 1 untagged PVID, or a `lanN.1` upper.
