@@ -1,0 +1,621 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: emulate the rtl8_4 head tag 
+ with egress-only TPIDs
+
+The nexthop of a flow towards a DSA user port inserts an S-tag (TCI
+0x0400) and a C-tag (TCI BIT(port)), which reproduce the RTL8372N's
+head tag only when the chip-wide egress S-TPID is 0x8899 and the conduit
+is an S-VLAN egress port. Kamil Bienkiewicz's parser alias (his 0445 and
+0449) does that and also reprograms the ingress TPIDs, under which a
+tagged WAN is no longer parsed (measured by him: its flows never hit).
+
+Set only the egress half, profile E: EG_VLAN_TPID's S-TPID to 0x8899,
+its C-TPID checked at 0x8100, and the conduit's PORT_EG_VLAN to S-VLAN
+type with PCP and DEI propagation off (nothing of the WAN's tag may land
+in the head tag's protocol byte or port mask). Ingress TPIDs and port
+roles stay at reset, so every port keeps its RSS and receive checksum;
+uploads stay in software. By the reading of ppe_servcode_init(), CPU
+transmits bypass egress VLAN editing, so the software path does not see
+the S-TPID (gate HE1).
+
+Flows from the switch are now declined: with the reset ingress TPIDs the
+parser stops at the head tag, so the entries the previous patch
+programmed for them never hit. A flow towards a DSA port is accepted
+only when the switch bridges that port in the Linux bridge it is in
+(dsa_port_bridge_dev_get() is that bridge): a port the switch driver
+leaves to software bridging (a refused join, a VLAN upper) is standalone
+in hardware. The FDB follower applies the same test to the port it
+re-points to. The bridge's MTU caps the flow's PMTU, the packets being
+routed through it.
+
+E is applied at enable when an rtl8_4 conduit exists, otherwise on the
+first flow towards one, saved and read back first; a failure keeps flows
+towards the switch declined until disable. It is left only by disable,
+after every flow entry is confirmed deleted.
+
+The head tag adds 8 bytes on the conduit at zero margin; the port's MTU
+failure action is already redirect to the CPU while offload is on.
+
+The comment in edma_port_feature_check() (from 0431) that no TPID
+register is programmed now says that the parser's are not, and the
+head-tag comment above PPE_OFFLOAD_RTL8_4_STAG_TCI (from 0434) points at
+the propagation bits E turns off.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/net/ethernet/qualcomm/ppe/edma_port.c |  11 +-
+ .../net/ethernet/qualcomm/ppe/ppe_offload.c   | 302 +++++++++++++++---
+ drivers/net/ethernet/qualcomm/ppe/ppe_regs.h  |   9 +
+ 3 files changed, 269 insertions(+), 53 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
+@@ -235,11 +235,12 @@ static netdev_features_t edma_port_feature_check(struct sk_buff *skb,
+ 
+ 	l3_off = skb_network_offset(skb);
+ 
+-	/* Only an 802.1Q tag is assumed to be one the parser follows. No
+-	 * TPID register is ever programmed, so whether it also recognises
+-	 * 802.1ad is unknown, and assuming it does would keep offload on a
+-	 * frame whose L3 the parser never reaches; assuming it does not
+-	 * merely costs offload.
++	/* Only an 802.1Q tag is assumed to be one the parser follows. The
++	 * parser's TPIDs are never programmed (flow offload changes the
++	 * egress S-TPID only, which tag inserts use), so whether it also
++	 * recognises 802.1ad is unknown, and assuming it does would keep
++	 * offload on a frame whose L3 the parser never reaches; assuming it
++	 * does not merely costs offload.
+ 	 *
+ 	 * With a head-inserted tag in front these two bytes lie inside that
+ 	 * tag rather than being an ethertype, so the test can match on
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -60,10 +60,11 @@
+  *   and the switch is told which port the frame is for through the
+  *   nexthop's tag inserts, since hardware cannot run the tagger:
+  *   see ppe_offload_dsa_egress(). The port is taken from the DSA
+- *   structures of the redirect target only; a port of a VLAN-aware
+- *   bridge, a port behind a LAG conduit, a VLAN push on top of a DSA
+- *   port, a tagger other than rtl8_4, and a conduit whose egress
+- *   TPIDs are not set up for the emulated head tag are all declined.
++ *   structures of the redirect target only; a port in a bridge the
++ *   switch does not offload for it, a port of a VLAN-aware bridge, a
++ *   port behind a LAG conduit, a VLAN push on top of a DSA port, a
++ *   tagger other than rtl8_4, and a conduit whose egress TPIDs are not
++ *   set up for the emulated head tag are all declined.
+  *   Where the inserts name the port outright (rtl8_4), a client that
+  *   its own VLAN-unaware bridge later learns on another of its ports
+  *   has its flows re-pointed there, see ppe_offload_fdb_event().
+@@ -119,9 +120,9 @@
+  *   driver can validate away.
+  *
+  * Flows entering on the WAN port hit in hardware (measured by Kamil
+- * Bienkiewicz). Flows entering on an rtl8_4 conduit do not: with the
+- * reset TPIDs the parser stops at the 0x8899 head tag, so their entries
+- * never hit.
++ * Bienkiewicz). Flows entering on an rtl8_4 conduit cannot: with the
++ * reset TPIDs the parser stops at the 0x8899 head tag, so they are
++ * declined (ppe_offload_flow_replace()) and uploads stay in software.
+  *
+  * Ported from Kamil Bienkiewicz's flow-offload series for the GL-BE9300
+  * (perceival/openwrt-flint3); IPv6 routing, the tag_8021q encapsulation
+@@ -138,11 +139,14 @@
+  * read back restores the saved values and leaves offload off; an exception
+  * group that does not read back leaves it on with the flows that need it
+  * declined (TCP flows for the TCP flag exceptions, every flow for the header
+- * ones), its registers written back on disable. Disabling, at runtime or on
+- * unbind, stops accepting flows, deletes every hardware entry this code owns
+- * and writes the saved values back. The flows the kernel still believes
+- * offloaded are then forwarded by the software flowtable, and declined when it
+- * offers them again.
++ * ones), its registers written back on disable. Profile E's two registers
++ * (ppe_offload_egress_apply()) are saved, written and read back at enable when
++ * an rtl8_4 conduit exists, or else on the first flow towards one; a failure
++ * there restores those two and declines only the flows into the switch.
++ * Disabling, at runtime or on unbind, stops accepting flows, deletes every
++ * hardware entry this code owns and writes the saved values back. The flows
++ * the kernel still believes offloaded are then forwarded by the software
++ * flowtable, and declined when it offers them again.
+  */
+ 
+ #include <linux/atomic.h>
+@@ -404,6 +408,10 @@ struct ppe_offload_counters {
+  * knows (a hash-mode add whose result never came, ppe_flow_entry_add()).
+  * No delete reaches them, so disabling never writes back what they rely
+  * on. Under @lock.
++ * @egress_port: PPE port of the conduit egress profile E is applied for,
++ * 0 for none (ppe_offload_egress_apply()). Written under @lock.
++ * @egress_failed: Applying profile E failed; conduits stay declined until
++ * offload is disabled. Written under @lock.
+  * @flows_dentry: The debugfs listing of what is tracked.
+  * @flows_hw_dentry: The debugfs listing of the tracked flows' entries as
+  * hardware has them.
+@@ -441,6 +449,8 @@ struct ppe_offload_priv {
+ 	unsigned int snap_num;
+ 	bool degraded;
+ 	unsigned int flows_lost;
++	u32 egress_port;
++	bool egress_failed;
+ 	struct dentry *flows_dentry;
+ 	struct dentry *flows_hw_dentry;
+ 	struct list_head binds;
+@@ -462,6 +472,7 @@ static void ppe_offload_trip_work(struct work_struct *work);
+ static int ppe_offload_flow_hw_del(struct ppe_offload_priv *priv,
+ 				   struct ppe_offload_flow_entry *entry);
+ static int ppe_offload_index_del(struct ppe_offload_priv *priv, u32 index);
++static void ppe_offload_snap_restore(struct ppe_offload_priv *priv, unsigned int mark);
+ 
+ /* Local, zero-seeded accumulator for a FLOW_ACTION_MANGLE targeting
+  * the Ethernet header: the kernel emits up to three 4-byte masked
+@@ -602,6 +613,8 @@ static bool ppe_offload_rule_has_vlan_key(const struct flow_rule *rule,
+  * @dsa: Whether the egress is a DSA user port at all.
+  * @dsa_fixed: Whether the tag inserts name that port outright (rather than
+  * leaving the choice to the switch's own FDB), see ppe_offload_dsa_egress().
++ * @mtu_cap: MTU of the bridge that port is in, which caps the
++ * flow's PMTU; 0 if none.
+  */
+ struct ppe_offload_egress {
+ 	struct net_device *dev;
+@@ -615,8 +628,89 @@ struct ppe_offload_egress {
+ 	int bridge_ifindex;
+ 	bool dsa;
+ 	bool dsa_fixed;
++	unsigned int mtu_cap;
+ };
+ 
++/* Apply profile E for the conduit on PPE port @port. Under priv->lock.
++ *
++ * Return: 0 once it is in place and read back, a negative error code
++ * otherwise (with the registers as they were before).
++ */
++static int ppe_offload_egress_apply(struct ppe_offload_priv *priv, u32 port)
++{
++	struct regmap *regmap = priv->ppe_dev->regmap;
++	unsigned int mark = priv->snap_num;
++	u32 tpid, eg_vlan, want_tpid, want_vlan;
++	int ret;
++
++	lockdep_assert_held(&priv->lock);
++
++	if (priv->egress_port == port)
++		return 0;
++	if (priv->egress_failed || priv->egress_port ||
++	    port >= PPE_PORT_EG_VLAN_TBL_ENTRIES)
++		return -EBUSY;
++
++	ret = ppe_offload_snap_save(priv, PPE_EG_VLAN_TPID_ADDR, 1);
++	if (!ret)
++		ret = ppe_offload_snap_save(priv, PPE_PORT_EG_VLAN_TBL_ADDR +
++					    port * PPE_PORT_EG_VLAN_TBL_INC, 1);
++	if (ret)
++		goto fail;
++
++	tpid = priv->snap[mark].val[0];
++	eg_vlan = priv->snap[mark + 1].val[0];
++
++	/* The third word of the emulated tag, and every C-tag insert. */
++	if (FIELD_GET(PPE_EG_VLAN_TPID_CTPID, tpid) != ETH_P_8021Q) {
++		pr_err("ppe_offload: egress C-TPID is %#lx, not 0x8100: no rtl8_4 egress\n",
++		       FIELD_GET(PPE_EG_VLAN_TPID_CTPID, tpid));
++		ret = -EIO;
++		goto fail;
++	}
++
++	want_tpid = (tpid & ~PPE_EG_VLAN_TPID_STPID) |
++		    FIELD_PREP(PPE_EG_VLAN_TPID_STPID, ETH_P_REALTEK);
++	/* PCP and DEI of the inserts are the protocol byte's top bits in
++	 * the head tag's first word and ALLOW plus mask bits in its last:
++	 * nothing from the ingress tag may be propagated into them (both
++	 * are clear at reset; whether hardware then writes zero is for the
++	 * bench, with PCP and DEI set on the WAN frames).
++	 */
++	want_vlan = (eg_vlan | PPE_PORT_EG_VLAN_TBL_VLAN_TYPE) &
++		    ~(PPE_PORT_EG_VLAN_TBL_PCP_PROP_CMD | PPE_PORT_EG_VLAN_TBL_DEI_PROP_CMD);
++
++	ret = regmap_write(regmap, PPE_EG_VLAN_TPID_ADDR, want_tpid);
++	if (!ret)
++		ret = regmap_write(regmap, PPE_PORT_EG_VLAN_TBL_ADDR +
++				   port * PPE_PORT_EG_VLAN_TBL_INC, want_vlan);
++	if (!ret)
++		ret = regmap_read(regmap, PPE_EG_VLAN_TPID_ADDR, &tpid);
++	if (!ret)
++		ret = regmap_read(regmap, PPE_PORT_EG_VLAN_TBL_ADDR +
++				  port * PPE_PORT_EG_VLAN_TBL_INC, &eg_vlan);
++	if (!ret && (tpid != want_tpid || eg_vlan != want_vlan)) {
++		pr_err("ppe_offload: egress TPID/VLAN type read back %#x/%#x, wrote %#x/%#x\n",
++		       tpid, eg_vlan, want_tpid, want_vlan);
++		ret = -EIO;
++	}
++	if (ret)
++		goto fail;
++
++	WRITE_ONCE(priv->egress_port, port);
++	pr_info("ppe_offload: rtl8_4 head tag emulation on PPE port %u: egress TPIDs %#x, port egress VLAN %#x\n",
++		port, tpid, eg_vlan);
++
++	return 0;
++
++fail:
++	ppe_offload_snap_restore(priv, mark);
++	WRITE_ONCE(priv->egress_failed, true);
++	pr_err("ppe_offload: rtl8_4 egress not set up (%d), flows towards the switch stay in software\n",
++	       ret);
++	return ret;
++}
++
+ #if IS_ENABLED(CONFIG_NET_DSA)
+ /* rtl8_4 head tag words as the nexthop's S-tag and C-tag inserts see them.
+  *
+@@ -633,11 +727,12 @@ struct ppe_offload_egress {
+  * matter to the egress decision; LEARN_DIS=0 lets the switch learn the
+  * conduit's MAC on its CPU port from these frames, which is where that
+  * address lives anyway. Both TCIs are written to the 12-bit VID fields
+- * with PCP and DEI zero; the egress stage must not remark a PCP into
+- * them (it would corrupt the protocol byte and set ALLOW) -- the nexthop
+- * entry has no PCP field, so this is a hardware property the bench has to
+- * confirm (a corrupted tag is a dropped frame, a visible failure), not
+- * something this code controls. Measured on a GL-BE9300: the switch
++ * with PCP and DEI zero, and nothing may put a PCP or DEI into them (it
++ * would corrupt the protocol byte, or set ALLOW). The nexthop entry has
++ * no PCP field; profile E turns PCP and DEI propagation off on the
++ * conduit (ppe_offload_egress_apply()), and whether hardware then writes
++ * zero is gate HE2b. What the switch does with a corrupted tag is not
++ * known: it may drop it, or take it as data from its CPU port. Measured on a GL-BE9300: the switch
+  * accepts the pair as programmed here -- 2353 Mbit/s delivered to the
+  * port at 99.3% CPU idle from a cold boot on the default tagger -- once
+  * the conduit is an S-VLAN egress port; left a C-VLAN port, the S-tag
+@@ -655,13 +750,44 @@ struct ppe_offload_egress {
+ /* Width of the tag's RX (forwarding port mask) field. */
+ #define PPE_OFFLOAD_RTL8_4_RX_BITS	11
+ 
+-/* Whether the chip-wide egress TPIDs and the egress VLAN type of @conduit
+- * are set up for the emulated head tag. Nothing sets them up yet, so the
+- * conduit is never offered as an egress.
++/* Egress profile E: the chip-wide egress S-TPID set to the rtl8_4 head
++ * tag's EtherType and the conduit made an S-VLAN egress port, so that the
++ * nexthop's S-tag and C-tag inserts reproduce the head tag (above). This
++ * is the egress half of the parser alias in Kamil Bienkiewicz's series
++ * (his 0445/0449), without its ingress half: the ingress TPIDs and port
++ * roles stay at reset, so the WAN's 802.1Q tag keeps being parsed (with
++ * his ingress alias, flows entering through a tagged WAN never hit,
++ * measured by him on a GL-BE9300) and every port keeps today's RSS and
++ * receive checksum. The flows this enables are downloads towards the
++ * switch; uploads from it stay in software, as the parser cannot see past
++ * the head tag on ingress.
++ *
++ * The egress C-TPID is left at 0x8100: it is the third word of the
++ * emulated tag and the TPID of every C-tag insert, such as a tagged WAN's.
++ * The egress S-TPID only reaches frames that leave with an S-tag, which
++ * on this tree are these flows' alone: the CPU's own frames carry the
++ * EDMA service code whose egress bypass covers VLAN translation, tag
++ * format control and L2 editing (ppe_servcode_init()), and the PPE
++ * bridges nothing between ports. That is the reading of the code; the
++ * bench checks it before trusting it.
++ *
++ * Applied for one conduit when offload is enabled with an rtl8_4 conduit
++ * among the EDMA ports, or else the first time a flow towards one is
++ * accepted (the switch driver may come up after this one), under
++ * priv->lock: both registers are saved first, written, and read back; any
++ * mismatch restores them and keeps the conduit declined until offload is
++ * disabled. Disabling restores them with the rest. Enabled with no flow
++ * offered (fw4's hardware offload off), this is the state in which the
++ * bench checks that E alone leaves the software path as it was.
+  */
+-static bool ppe_offload_rtl8_4_egress_ready(const struct net_device *conduit)
++static bool ppe_offload_rtl8_4_egress_ready(struct ppe_offload_priv *priv,
++					    const struct net_device *conduit)
+ {
+-	return false;
++	struct edma_port_priv *port_priv = netdev_priv(conduit);
++	u32 port = port_priv->ppe_port->port_id;
++	u32 owner = READ_ONCE(priv->egress_port);
++
++	return !READ_ONCE(priv->egress_failed) && (!owner || owner == port);
+ }
+ 
+ /* Resolve a redirect to a DSA user port into the conduit's PPE port plus
+@@ -674,10 +800,11 @@ static bool ppe_offload_rtl8_4_egress_ready(const struct net_device *conduit)
+  * port's forwarding mask (see PPE_OFFLOAD_RTL8_4_STAG_TCI).
+  *
+  * Only the DSA structures of the redirect target decide the port; the
+- * switch's FDB is never read. Declined: a port of a VLAN-aware bridge
+- * (its frames would need the bridge VLAN as a further tag), a conduit in
+- * a LAG, a VLAN push on top of the port, any other tagger, and a conduit
+- * whose egress TPIDs are not set up for the emulated head tag.
++ * switch's FDB is never read. Declined: a port in a bridge the switch does
++ * not offload for it, a port of a VLAN-aware bridge (its frames would
++ * need the bridge VLAN as a further tag), a conduit in a LAG, a VLAN push
++ * on top of the port, any other tagger, and a conduit whose egress TPIDs
++ * are not set up for the emulated head tag.
+  *
+  * Runs on the flowtable's offload workqueue, which holds neither RTNL
+  * nor RCU by itself (and must not take RTNL: the flowtable flushes this
+@@ -695,13 +822,15 @@ static bool ppe_offload_rtl8_4_egress_ready(const struct net_device *conduit)
+  *
+  * Return: 0 with @egress filled in, a negative error code to decline.
+  */
+-static int ppe_offload_dsa_egress(struct net_device *odev, struct dsa_port *dp,
+-				  bool vlan_push_seen, struct ppe_offload_egress *egress)
++static int ppe_offload_dsa_egress(struct ppe_offload_priv *priv, struct net_device *odev,
++				  struct dsa_port *dp, bool vlan_push_seen,
++				  struct ppe_offload_egress *egress)
+ {
+ 	const struct dsa_device_ops *tag_ops = dp->cpu_dp->tag_ops;
+ 	struct net_device *bridge;
+ 	struct net_device *conduit;
+ 	bool vlan_aware = false;
++	int ret = 0;
+ 
+ 	if (vlan_push_seen)
+ 		return ppe_offload_decline("odev=%s vlan push on a dsa port unsupported",
+@@ -725,9 +854,24 @@ static int ppe_offload_dsa_egress(struct net_device *odev, struct dsa_port *dp,
+ 	if (bridge) {
+ 		vlan_aware = br_vlan_enabled(bridge);
+ 		egress->bridge_ifindex = bridge->ifindex;
++		/* Routed through the bridge: its MTU is the one the packets
++		 * have to fit, not only the port's.
++		 */
++		egress->mtu_cap = READ_ONCE(bridge->mtu);
++		/* The switch must bridge the port itself: one it leaves to
++		 * software bridging (it refused the join, or the port has a
++		 * VLAN upper) is a standalone port in hardware, and DSA does
++		 * not track its STP state either.
++		 */
++		if (dsa_port_bridge_dev_get(dp) != bridge)
++			ret = ppe_offload_decline("odev=%s bridge not offloaded by the switch",
++						   netdev_name(odev));
+ 	}
+ 	rcu_read_unlock();
+ 
++	if (ret)
++		return ret;
++
+ 	if (vlan_aware)
+ 		return ppe_offload_decline("odev=%s is a port of a vlan-aware bridge",
+ 					    netdev_name(odev));
+@@ -735,7 +879,7 @@ static int ppe_offload_dsa_egress(struct net_device *odev, struct dsa_port *dp,
+ 	if (tag_ops->proto != DSA_TAG_PROTO_RTL8_4)
+ 		return ppe_offload_decline("odev=%s tagger %d unsupported", netdev_name(odev),
+ 					    tag_ops->proto);
+-	if (!ppe_offload_rtl8_4_egress_ready(conduit))
++	if (!ppe_offload_rtl8_4_egress_ready(priv, conduit))
+ 		return ppe_offload_decline("odev=%s egress tpids not set up for rtl8_4",
+ 					    netdev_name(odev));
+ 	if (dp->index >= PPE_OFFLOAD_RTL8_4_RX_BITS)
+@@ -1108,6 +1252,7 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	bool ingress_vlan_bad = false;
+ 	bool dst_on_ingress = false;
+ 	bool flow_full = false;
++	bool ingress_unparsed = false;
+ 	bool pub_ip = false;
+ 	unsigned int vlan_pops = 0;
+ 	u16 ingress_vlan_vid = 0;
+@@ -1317,10 +1462,27 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	}
+ 	if (idev)
+ 		idev = ppe_offload_ingress_edma_dev(idev);
+-	if (idev)
++	if (idev) {
+ 		ingress_l3_if = ((struct edma_port_priv *)netdev_priv(idev))->l3_if_index;
++#if IS_ENABLED(CONFIG_NET_DSA)
++		/* The ingress parser stops at the rtl8_4 head tag, so an
++		 * entry for frames from the switch would never hit: it
++		 * would hold a slot, and every refresh would read it back
++		 * and get -EEXIST, a valid entry never being stale.
++		 */
++		if (netdev_uses_dsa(idev)) {
++			const struct dsa_device_ops *ops = idev->dsa_ptr->tag_ops;
++
++			ingress_unparsed = !ops || ops->proto == DSA_TAG_PROTO_RTL8_4;
++		}
++#endif
++	}
+ 	rcu_read_unlock();
+ 
++	if (ingress_unparsed)
++		return ppe_offload_decline("ingress ifindex %d: the parser cannot see past the rtl8_4 tag",
++					    meta.key->ingress_ifindex);
++
+ 	if (ingress_vlan_bad)
+ 		return ppe_offload_decline("ingress ifindex %d has no vlan %u upper",
+ 					    meta.key->ingress_ifindex, ingress_vlan_vid);
+@@ -1469,9 +1631,11 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		struct dsa_port *dp = dsa_port_from_netdev(odev);
+ 
+ 		if (!IS_ERR(dp)) {
+-			ret = ppe_offload_dsa_egress(odev, dp, vlan_push_seen, &egress);
++			ret = ppe_offload_dsa_egress(priv, odev, dp, vlan_push_seen, &egress);
+ 			if (ret)
+ 				return ret;
++			if (egress.mtu_cap)
++				pmtu = min(pmtu, egress.mtu_cap);
+ 		}
+ 	}
+ #endif
+@@ -1583,6 +1747,14 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		}
+ 	}
+ 
++	if (egress.dsa) {
++		ret = ppe_offload_egress_apply(priv, port_priv->ppe_port->port_id);
++		if (ret) {
++			stage = "egress";
++			goto unlock;
++		}
++	}
++
+ 	/* Public IP entry for the translated (post-SNAT) source address.
+ 	 * DNAT carries its new destination in the nexthop entry instead.
+ 	 */
+@@ -2019,6 +2191,9 @@ static void ppe_offload_fdb_move_work(struct work_struct *work)
+ 	bridge = dsa_port_bridge_dev_get(dp);
+ 	if (!bridge || br_vlan_enabled(bridge))
+ 		goto out;
++	/* What ppe_offload_dsa_egress() asks of a bridged port. */
++	if (netdev_master_upper_dev_get(move->dev) != bridge)
++		goto out;
+ 
+ 	/* The bridge learns on a port before it forwards to it; a port it
+ 	 * would not deliver to is no destination for hardware either.
+@@ -2035,17 +2210,18 @@ static void ppe_offload_fdb_move_work(struct work_struct *work)
+ 	conduit = dp->cpu_dp->conduit;
+ 	if (!conduit || !edma_port_is_edma_netdev(conduit))
+ 		goto out;
+-	if (!ppe_offload_rtl8_4_egress_ready(conduit))
++	if (!ppe_offload_rtl8_4_egress_ready(priv, conduit))
+ 		goto out;
+ 	port_priv = netdev_priv(conduit);
+ 
+ 	mutex_lock(&priv->lock);
+ 
+-	/* Disabled meanwhile: the flows are gone. */
+-	if (!priv->enabled) {
++	/* Disabled meanwhile: the flows and the egress profile are gone. */
++	if (!priv->enabled || priv->egress_port != port_priv->ppe_port->port_id) {
+ 		mutex_unlock(&priv->lock);
+ 		goto out;
+ 	}
++
+ 	/* @lock keeps the entries alive; a failed re-point drops its entry. */
+ 	hash_for_each_possible_safe(priv->dsa_fixed_ht, entry, tmp, dsa_fixed_hnode,
+ 				    ether_addr_to_u64(move->addr)) {
+@@ -2963,18 +3139,17 @@ static int ppe_offload_snap_save_masked(struct ppe_offload_priv *priv, u32 addr,
+ 	return 0;
+ }
+ 
+-/* Write every saved register back, the last saved first, each entry's
+- * words in their own order, the bits not saved as they are now, and read
+- * them back. A register that does not read back as saved latches
+- * priv->degraded. Under priv->lock.
++/* Write the registers saved since @mark back, the last saved first, each
++ * entry's words in their own order, and read them back. A register that
++ * does not read back as saved latches priv->degraded. Under priv->lock.
+  */
+-static void ppe_offload_snap_restore(struct ppe_offload_priv *priv)
++static void ppe_offload_snap_restore(struct ppe_offload_priv *priv, unsigned int mark)
+ {
+ 	struct regmap *regmap = priv->ppe_dev->regmap;
+ 	u32 back[PPE_OFFLOAD_SNAP_WORDS];
+ 	unsigned int bad = 0;
+ 
+-	while (priv->snap_num) {
++	while (priv->snap_num > mark) {
+ 		struct ppe_offload_snap *snap = &priv->snap[--priv->snap_num];
+ 		u32 want[PPE_OFFLOAD_SNAP_WORDS];
+ 		unsigned int i;
+@@ -3133,6 +3308,21 @@ static int ppe_offload_program_port(struct net_device *netdev, void *arg)
+ 	return ret;
+ }
+ 
++#if IS_ENABLED(CONFIG_NET_DSA)
++/* Note the PPE port of an EDMA port that is an rtl8_4 conduit. Under RTNL. */
++static int ppe_offload_find_rtl8_4_conduit(struct net_device *netdev, void *arg)
++{
++	struct edma_port_priv *port_priv = netdev_priv(netdev);
++	u32 *port = arg;
++
++	if (!*port && netdev_uses_dsa(netdev) && netdev->dsa_ptr->tag_ops &&
++	    netdev->dsa_ptr->tag_ops->proto == DSA_TAG_PROTO_RTL8_4)
++		*port = port_priv->ppe_port->port_id;
++
++	return 0;
++}
++#endif
++
+ /* Delete the hardware entry at @index and check that its slot reads back
+  * invalid (the table is readable at its own address, as the vendor's
+  * IN_FLOW_TBL; measured on a GL-BE9300 by Kamil Bienkiewicz's IPv6
+@@ -3286,11 +3476,11 @@ static int ppe_offload_enable(struct ppe_offload_priv *priv)
+ 	}
+ 
+ 	/* Every entry enabling may save: the TCP flag parser words, four
+-	 * words per exception code, and five per port.
++	 * words per exception code, profile E's two, and five per port.
+ 	 */
+ 	BUILD_BUG_ON(DIV_ROUND_UP(ARRAY_SIZE(ppe_offload_tcp_exception_flags), 2) +
+ 		     4 * (ARRAY_SIZE(ppe_offload_tcp_exception_flags) +
+-			  ARRAY_SIZE(ppe_offload_hdr_exception_codes)) +
++			  ARRAY_SIZE(ppe_offload_hdr_exception_codes)) + 2 +
+ 		     5 * PPE_OFFLOAD_PORTS_MAX > PPE_OFFLOAD_SNAP_MAX);
+ 
+ 	priv->snap_num = 0;
+@@ -3310,7 +3500,7 @@ static int ppe_offload_enable(struct ppe_offload_priv *priv)
+ 
+ 	ret = edma_port_for_each_netdev(ppe_offload_program_port, NULL);
+ 	if (ret) {
+-		ppe_offload_snap_restore(priv);
++		ppe_offload_snap_restore(priv, 0);
+ 		priv->tcp_exceptions_ok = false;
+ 		priv->hdr_exceptions_ok = false;
+ 		pr_err("ppe_offload: not enabled: programming the port L3 interfaces failed: %d\n",
+@@ -3318,12 +3508,25 @@ static int ppe_offload_enable(struct ppe_offload_priv *priv)
+ 		goto unlock;
+ 	}
+ 
++#if IS_ENABLED(CONFIG_NET_DSA)
++	{
++		u32 conduit_port = 0;
++
++		/* Failing leaves the conduit declined, and is said. */
++		edma_port_for_each_netdev(ppe_offload_find_rtl8_4_conduit, &conduit_port);
++		if (conduit_port)
++			ppe_offload_egress_apply(priv, conduit_port);
++	}
++#endif
++
+ 	priv->tripped = false;
+ 	priv->rearm_count = 0;
+ 	WRITE_ONCE(priv->enabled, true);
+-	pr_info("ppe_offload: enabled: TCP exceptions %s, header exceptions %s\n",
++	pr_info("ppe_offload: enabled: TCP exceptions %s, header exceptions %s, profile E %s (port %u)\n",
+ 		priv->tcp_exceptions_ok ? "ok" : "FAILED (TCP declined)",
+-		priv->hdr_exceptions_ok ? "ok" : "FAILED (all flows declined)");
++		priv->hdr_exceptions_ok ? "ok" : "FAILED (all flows declined)",
++		priv->egress_failed ? "FAILED (switch declined)" :
++		priv->egress_port ? "ok" : "not yet (no rtl8_4 conduit)", priv->egress_port);
+ 
+ unlock:
+ 	mutex_unlock(&priv->lock);
+@@ -3359,9 +3562,11 @@ static void ppe_offload_disable(struct ppe_offload_priv *priv)
+ 		       stuck, stuck == 1 ? "y" : "ies");
+ 		return;
+ 	}
+-	ppe_offload_snap_restore(priv);
++	ppe_offload_snap_restore(priv, 0);
+ 	priv->tcp_exceptions_ok = false;
+ 	priv->hdr_exceptions_ok = false;
++	WRITE_ONCE(priv->egress_port, 0);
++	WRITE_ONCE(priv->egress_failed, false);
+ 
+ 	mutex_unlock(&priv->lock);
+ 
+@@ -3380,8 +3585,9 @@ static int ppe_offload_flows_show(struct seq_file *m, void *v)
+ 
+ 	mutex_lock(&priv->lock);
+ 
+-	seq_printf(m, "enabled %d degraded %d tripped %d\n",
+-		   priv->enabled, priv->degraded, priv->tripped);
++	seq_printf(m, "enabled %d degraded %d tripped %d egress_port %u egress_failed %d\n",
++		   priv->enabled, priv->degraded, priv->tripped, priv->egress_port,
++		   priv->egress_failed);
+ 	seq_printf(m, "accepted %ld declined %ld rearmed_superseded %ld rearmed_invalid %ld rearmed_deacce %ld withdrawn %ld unbound %ld stuck %ld\n",
+ 		   atomic_long_read(&priv->counters.accepted),
+ 		   atomic_long_read(&priv->counters.declined),
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -133,6 +133,15 @@
+ #define PPE_PORT_EG_VLAN_TBL_DEI_PROP_CMD	BIT(7)
+ #define PPE_PORT_EG_VLAN_TBL_TX_COUNTING_EN	BIT(8)
+ 
++/* TPIDs the egress VLAN engine uses when it inserts or rebuilds tags (vendor
++ * EG_VLAN_TPID, NSS_PTX_CSR_BASE_ADDR 0x020000 + 0x40 on APPE; reset
++ * 0x810088a8). One register for the whole chip; the field order is the
++ * reverse of the ingress parser's TPID registers.
++ */
++#define PPE_EG_VLAN_TPID_ADDR			0x20040
++#define PPE_EG_VLAN_TPID_STPID			GENMASK(15, 0)
++#define PPE_EG_VLAN_TPID_CTPID			GENMASK(31, 16)
++
+ /* PPE queue counters enable/disable control. */
+ #define PPE_EG_BRIDGE_CONFIG_ADDR		0x20044
+ #define PPE_EG_BRIDGE_CONFIG_QUEUE_CNT_EN	BIT(2)
