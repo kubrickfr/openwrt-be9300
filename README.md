@@ -64,7 +64,7 @@ profiles of the trees it grew from are not carried.
 | Boot / procd / SSH | working |
 | LAN (RTL8372N via DSA + EDMA/PPE) | working with the new driver, one bridge switched in hardware (bench results in `package/kernel/rtl8372n/TESTING.md`) |
 | WAN (2.5G) | working at 2.5 Gbps; 1G/100M link rates untested |
-| VLANs (bridge-vlan on DSA) | working: one VLAN-aware bridge offloaded, access and trunk ports, tagged-only ports (some checks still need more hosts, see `TESTING.md`) |
+| VLANs (bridge-vlan on DSA) | working: one VLAN-aware bridge offloaded, access and trunk ports, tagged-only ports; checked with traffic between two LAN ports (open checks in `TESTING.md`) |
 | Flow offloading | software flowtable only; no PPE hardware flow offload (see below) |
 | Wi-Fi 7, all three bands | working |
 | MLO (AP MLD across 2.4/5/6 GHz) | working |
