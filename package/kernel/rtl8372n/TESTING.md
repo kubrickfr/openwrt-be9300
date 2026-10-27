@@ -301,7 +301,10 @@ config bridge-vlan
   with 802.1Q rules until they are taken out and added back. Set the
   protocol before adding the ports.
 - Only learning, flood, mcast_flood and bcast_flood are offloaded; other
-  bridge port flags are refused on offloaded ports. No MDB: multicast floods
+  bridge port flags (isolated, hairpin, locked, MAB, multicast-to-unicast)
+  are refused on offloaded ports ("Only learning and flood flags are
+  offloaded"), since the switch would forward around them. With
+  `offload=0` the software bridge applies them. No MDB: multicast floods
   per `mcast_flood` whatever IGMP snooping decides. No LAG, MST, rate
   limiting, MIB counters or GPIO; EEE off.
 - Ageing is clamped to 14-800 s; `ip -d link show br-lan` shows the value set.
