@@ -1,21 +1,88 @@
 # PPE flow offload for the GL-BE9300: bench plan
 
 Bench test of the PPE flowtable offload with PPPoE: qualcommbe patches
-0433-0439 and 0441, generic pending-6.18/714. The gates are DESIGN.md
-section 9. Order is fixed: the fake-ISP rig first (section 5), the live line
-only after every rig phase passed (section 6). The owner runs every step
-that changes state; an assistant only reads. On any stop line (section 2):
-stop, recover (section 1.3), capture (section 7). Nothing here has run yet.
+0433-0439, 0441 and 0442, generic pending-6.18/714. The gates are DESIGN.md
+section 9. The planned order was the fake-ISP rig first (section 5), then
+the live line (section 6). The owner runs every step that changes state; an
+assistant only reads. On any stop line (section 2): stop, recover (section
+1.3), capture (section 7).
+
+The owner skipped the rig and ran the live phases from 2026-10-22:
+
+- L1 and L2 within the safety envelope of section 1;
+- the first night and the L4 runs on r37585 under a guard script;
+- the soak, the L4 runs on r37586 and the lifecycle tests (section 6.6)
+  with no rollback armed.
+
+Section 0 records what ran; the checks
+that need the rig are still open.
 
 Names: PPE port 1 is the conduit `lan` (to the RTL8372N), port 2 is `wan`;
-the session is `pppoe-wan` on `wan.<vid>`, `<vid>` being the ISP's WAN VLAN ID. br-lan is VLAN-aware; on this
-gateway lan1 and lan4 are tagged members of VLAN 1, lan2 and lan3 carry
-VLANs 10/20 only, and br-lan's MAC differs from the conduit's (read-only
-check, 2026-10-22).
+the session is `pppoe-wan` on `wan.<vid>`, `<vid>` being the ISP's WAN VLAN ID. br-lan is VLAN-aware.
+
+- The 2026-10-22 read-only check found: lan1 and lan4 tagged members of
+  VLAN 1, lan2 and lan3 on VLANs 10/20 only, and br-lan's MAC different
+  from the conduit's.
+- The live bench ran on a different layout, read on 2026-10-26:
+  - lan1 is a trunk (VLAN 1 tagged and PVID, plus 10 and 20) to a managed
+    switch, with every wired client behind it;
+  - lan2 to lan4 are untagged VLAN 1 ports and unused;
+  - br-lan's MAC is the conduit's.
 
 ## 0. Bench record
 
-(none yet)
+**Setup:**
+- **Gateway:** the live one, on an FTTH line: PPPoE over the ISP's WAN
+  VLAN, 2.2/0.8 Gbit/s.
+- **Images:** r37585-0e253b519f, flashed 2026-10-22. Then
+  r37586-b82b97e5be from 2026-10-23 13:30, which adds the generic
+  backports 651-01/02.
+- **Client:** a PC behind the managed switch on lan1, on a 2.5G USB
+  adapter.
+- **Rig:** not built.
+- **How offload was switched on:** at runtime in every phase. Both
+  parameters were written, and fw4's `flow_offloading_hw` set without a
+  commit. Nothing was persisted.
+- **Boot with `0442`'s defaults:** not yet run (section 6.5).
+
+| Date | Phase | What ran | Result |
+| --- | --- | --- | --- |
+| 2026-10-22 | L1 (HE1) | Profile E alone, fw4 hardware offload off, `l1` timer and dead-man. Enable and disable twice; LAN, DHCP, a redial, 1472-byte pings, 8 streams down and up | Pass. `port egress VLAN 0x135` (S-VLAN, PCP/DEI propagation off). EDMA Rx steering unchanged. The ISP's WAN frames carry PCP 0, so HE2b was not exercised |
+| 2026-10-22 | L2 part 1 (HS1) | The session pinned in hardware with no flow for 300 s (`offload_pppoe_pin`) | Pass: session entry 0, L3 interface 16. No redial; new connections and the WAN port forward worked; pin released on time |
+| 2026-10-22 | L2 part 2 (HP0) | fw4 hardware offload on, `pppoe_offload=1`; 6 × 50 MB download | Pass: `ethtool -S wan` rx_packets +6211 against about 205k download packets (household traffic included); BusyBox top 92-100% idle (a four-core average that overstates idle, section 6.4). Teardown: `31 flow(s) back to software, 0 stuck` |
+| 2026-10-22/23 | Overnight, unattended | Offload on for 10 h under a guard: stop lines every 5 s, driver state every 60 s, automatic revert | No stop, no redial, the session in hardware for 9.8 h. A probe download from the PC every 10 min succeeded 60 times out of 60 |
+| 2026-10-23 | L4, image r37585 | Ookla multi-stream (a nearby server) and one OVH stream. Router `/proc/stat` sampled every second; governor schedutil; under the guard | Fail on CPU by section 6.4's measure: Ookla's download at 2172 Mbit/s kept cpu0 56% busy (cpu1 33%). One stream, 1996 Mbit/s over 20 s: cpu0 43%. Recorded as a pass on the day from the tick-sampled shares (43.2% and 40.5%), which read low. 0.01-0.03% of download packets reached the CPU. cpu0 at 1.1 GHz throughout. This image lacks the 651 backports, so the downloads' ACKs still took the slow path |
+| 2026-10-27 | L4 again, image r37586 | One OVH stream and Ookla multi-stream, three runs of each; router `/proc/stat` every second; governor schedutil; no guard | Pass on CPU; Ookla's download reached line rate, the single stream did not (proof.ovh.net varies). One stream at 1302-1786 Mbit/s: cpu0 14-23% busy (the two faster runs each include a second of a cron job). Ookla's download at 2110-2133 Mbit/s: busiest core 24-36%, a second one 13-22% (how the flows split between them changes from run to run). Its upload, in software, at 761-764 Mbit/s: 50-57% on each of two cores, or 84% on one (15% on the other) when the flows land mostly on one core. 0.01-0.2% of download packets reached the CPU. The packet cores at 1.1 GHz during the downloads |
+| 2026-10-23 to 2026-10-27 | Soak | Image r37586, offload on (not persisted), no guard | 4 days: `stuck 0`, `degraded 0`, `rearmed_invalid 0`, `rearmed_superseded 0`, `withdrawn 0`, `rearmed_deacce` 52 (HD) |
+| 2026-10-26 | HE2, frames | PC capture of a download; bounded router captures of what the CPU forwarded (section 6.6) | Pass in 5 runs (see note 1) |
+| 2026-10-26 | R5, `fw4 reload` | `fw4 reload` 8 s into a 20 s download: 5 runs with offload (one with captures), 1 without | Driver pass, but every download stalled with offload on (see note 2) |
+| 2026-10-27 | R5, session loss | `ifup wan` during a download | Pass (see note 3) |
+| - | Not run | R4/HP1 (what must not hit, including the VLAN residual); HE2b; HV1 untagged and software-bridged; HB; HM with UDP; the HD procedure; R5 disable under load; bridge VLAN change and client move (no router-visible move on this LAN); R6 profile A (H0, HP2); R7 | Open |
+
+1. **HE2, frames.** PPE-forwarded frames carry the same TTL, source MAC
+   and DSCP as the packets software routed in the same connection (the
+   handshake and the FIN). There was no bad IP checksum, no TCP checksum
+   error at the PC, and no stray ethertype. One earlier run had 334
+   packets with TTL+1 interleaved in its last 60 ms, after the PC closed
+   the connection. It was not reproduced in 6 later runs and is
+   unexplained; connections to that server arrive with two different
+   TTLs.
+2. **`fw4 reload`.** The driver did its part: `flowtable unbound: ~40
+   flow(s) out of hardware, 0 stuck`. The PPPoE session was back in
+   hardware within 0.1 s, and the captured download's own flow after
+   0.24 s.
+   - The downloads stalled for about 5.1, 1.8, 1.5, 0.5 and 5.1 s with
+     offload on, and not at all with it off.
+   - The captured run, the 0.5 s one, showed reordering plus about 2.8k
+     lost segments.
+   - Neither the router's counters nor the PC's account for them
+     (DESIGN.md section 11).
+3. **Session loss.** `PPPoE session <S> out of hardware (device down):
+   78 flow(s) back to software, 0 stuck`. The ISP gave the same session ID
+   back, on a new `pppoe-wan` with a new IP, and the driver programmed it.
+   A flow for the old IP was declined. The next download ran at 1.83
+   Gbit/s with 0.11% of its packets on the CPU. The WAN-up hotplug caused
+   two `fw4 reload`s.
 
 ## 1. Safety envelope
 
@@ -23,10 +90,10 @@ check, 2026-10-22).
 
 ```sh
 ls -l /root/rollback.armed; grep -n rollback /etc/rc.local     # disarm leftovers first
-uci get firewall.@defaults[0].flow_offloading_hw                # 0
+uci get firewall.@defaults[0].flow_offloading_hw                # 0 or unset
 cat /sys/module/qcom_ppe/parameters/flow_offload                # N
 cat /sys/module/qcom_ppe/parameters/pppoe_offload               # N
-grep qcom_ppe /etc/modules.conf                                 # nothing
+grep qcom-ppe /etc/modules.conf                                 # nothing, or the start-from-off line below
 cat /sys/kernel/debug/ppe/offload_flows | head -3               # enabled 0 degraded 0 tripped 0
 dmesg | grep -c 'disable incomplete\|restoring .* failed\|new flows declined'   # 0
 ubus call system watchdog                                       # status running
@@ -38,6 +105,16 @@ rc.local line) is disarmed before anything new is armed: `rm -f
 /root/rollback.armed; sed -i '/rollback.armed/d' /etc/rc.local`. A second
 path to the router is checked before each phase: Wi-Fi (`ap-mld0`) when the
 PC is on the LAN, the LAN when the operator is on Wi-Fi.
+
+The expected values above are for a session that starts from off. An image
+built with `0442`'s defaults (on in kmod-qcom-ppe) boots with both
+parameters `Y`, and offloads as soon as fw4's hardware offload is on. Such
+a session starts by turning offload off, in one of two ways:
+
+- `options qcom-ppe flow_offload=0 pppoe_offload=0` in `/etc/modules.conf`,
+  and fw4 set to software offload and committed, then a reboot (kmodloader matches the module's file name, `qcom-ppe`, so
+  `qcom_ppe` there is ignored);
+- writing 0 to both parameters and setting fw4 back to software offload.
 
 ### 1.2 Timers
 
@@ -80,16 +157,30 @@ Nothing stays armed across a break.
    deleted, registers written back; flows continue in software. Check
    `dmesg | tail` for `disabled: N flow(s)`; `disable incomplete` means
    entries may still forward: go to 3.
-2. `uci revert firewall; fw4 reload` (or `uci set
-   firewall.@defaults[0].flow_offloading_hw=0; fw4 reload`): software
-   flowtable.
-3. `reboot` (the PPE is reset at probe). On a hang, wait 90 s for the panic
+2. `uci set firewall.@defaults[0].flow_offloading_hw=0; fw4 reload`:
+   software flowtable. `uci revert firewall` does the same only while the
+   hardware setting is uncommitted.
+3. `reboot` (the PPE is reset at probe). With `0442`'s defaults and fw4's
+   hardware offload committed, offload comes back on with the first flows
+   after the reboot. If it must stay off, persist that first:
+   - `options qcom-ppe flow_offload=0` in `/etc/modules.conf`;
+   - or step 2 followed by `uci commit firewall`.
+   If neither can be written, go to 4. On a hang, wait 90 s for the panic
    reboot before power-cycling, then read `/sys/fs/pstore/` first.
 4. Flash the previous image (kept, with its `sha256sum`, on the PC).
 
-Neither switch is persisted (no `uci commit firewall`, nothing in
-`/etc/modules.conf`) before section 6.5: a reboot always comes back off.
-`sysupgrade -c` keeps `/etc/modules.conf`: check it after every upgrade.
+Up to `0441`, neither switch is persisted before section 6.5 (no `uci
+commit firewall`, nothing in `/etc/modules.conf`), so a reboot comes back
+off. With `0442`'s defaults, a reboot comes back with the driver on. Two
+things keep offload off across reboots:
+
+- fw4 set to software flow offloading (LuCI, or `uci set
+  firewall.@defaults[0].flow_offloading_hw=0; uci commit firewall`);
+- `options qcom-ppe flow_offload=0` in `/etc/modules.conf`, with a hyphen:
+  kmodloader matches the module's file name.
+
+`sysupgrade -c` keeps `/etc/modules.conf` and `/etc/config/firewall`: check
+both after every upgrade.
 
 ### 1.4 Reading state under load
 
@@ -105,7 +196,8 @@ reads): `offload_flows_hw`, the PPE debugfs counters (`cpu_code`,
 port MAC's counters, every frame on the wire, offloaded or not; only
 `ethtool -S <port> | grep -w rx_packets` (and `tx_packets`) counts what
 EDMA exchanged with the CPU. "Absent from the CPU path" is always read
-from the latter.
+from the latter. CPU load is read from `/proc/stat` as section 6.4 says,
+not from BusyBox `top`.
 
 ## 2. Stop lines
 
@@ -131,20 +223,27 @@ Wi-Fi, VLAN 10/20, IPv6 are expected), `re-armed` (debug), `table full`,
 
 Build on geekom from the gateway's `.config`, adding
 `CONFIG_PACKAGE_kmod-ramoops=y`, `CONFIG_PACKAGE_conntrack=y`,
-`CONFIG_PACKAGE_tcpdump=y`, `CONFIG_PACKAGE_iperf3=y`. Offload is off in the
-image; nothing else changes.
+`CONFIG_PACKAGE_tcpdump=y`, `CONFIG_PACKAGE_iperf3=y`.
+
+Up to `0441`, offload is off in the image and nothing else changes. From
+`0442`, two kmod-qcom-ppe menuconfig options set the parameters' defaults,
+both on by default for the ipq53xx subtarget (off for ipq95xx): `KERNEL_QCOM_PPE_FLOW_OFFLOAD` and
+`KERNEL_QCOM_PPE_PPPOE_OFFLOAD`. Unset them for an image that boots with
+offload off.
 
 ```sh
 make defconfig && make -j"$(nproc)"
 grep -c ppe_offload_unbind build_dir/target-*/linux-qualcommbe_ipq53xx/linux-*/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c   # >= 1
 grep -c FLOW_DISSECTOR_KEY_PPPOE build_dir/target-*/linux-qualcommbe_ipq53xx/linux-*/net/netfilter/nf_flow_table_offload.c    # >= 1
+grep QCOM_PPE_ build_dir/target-*/linux-qualcommbe_ipq53xx/linux-*/.config   # FLOW_OFFLOAD=y, PPPOE_OFFLOAD=y (or not set)
 ```
 
 Before flashing: `sysupgrade -b /tmp/backup.tar.gz` and copy it off (`scp
 -O`); keep the running image and its `sha256sum` on the PC. The owner
-flashes. After boot: section 1.1 reads clean, `ppe_offload` prints nothing,
-and everything works as on the old image for a day (this is the image kept
-if every later phase fails). Recheck the https-dns-proxy bootstrap padding
+flashes. After boot, for an image with the defaults off: section 1.1 reads
+clean, `ppe_offload` prints nothing, and everything works as on the old
+image for a day (this is the image kept if every later phase fails). An
+image with the defaults on is checked as section 6.5 says. Recheck the https-dns-proxy bootstrap padding
 after the flash.
 
 ## 4. The rig
@@ -282,8 +381,8 @@ With R2's state:
   port; read them again after it ends. The `wan` EDMA delta is under 1% of
   the packets geekom counted; no new counts for CPU codes 79, 80, 82, 83, 88,
   89, 91, 93, 94 (L2/L3 MRU and MTU, de-acceleration, source interface, flow
-  MTU); `offload_flows` shows the flow's packets. CPU idle (`/proc/stat`)
-  well above the software baseline. Separately, on a rate-limited download
+  MTU); `offload_flows` shows the flow's packets. Busy time (section 6.4)
+  well below the software baseline. Separately, on a rate-limited download
   (`iperf3 -R -b 50M`), `timeout 70 tcpdump -Q out -n -e -i wan -c 5 'vlan
   <vid> and pppoes and tcp port <cport>'` shows the router's own ACKs (the
   filter matches), and the same with `-Q in -c 50` shows no data segment
@@ -451,15 +550,20 @@ Dead-man armed, operator on Wi-Fi. `echo "A 120" >
 ### 5.7 R7, throughput
 
 8-stream and single-stream downloads at line rate for 5 minutes with fixed
-cports and the recorded governor: throughput, per-CPU idle, no stop line,
-`offload_flows` occupancy. Uploads in software, unchanged.
+cports and the recorded governor: throughput, per-CPU busy time (section
+6.4), no stop line, `offload_flows` occupancy. Uploads in software,
+unchanged.
 
 ## 6. Live phases (only after section 5 passed)
+
+The owner ran these without section 5 (section 0).
 
 ### 6.1 L1, E alone
 
 At a quiet time, arm `l1` (1200 s) and the dead-man, fw4 hardware offload
 off, then enable: R1's checks for 10 minutes, then disable.
+
+Ran on 2026-10-22: passed.
 
 ### 6.2 L2, first live session
 
@@ -471,25 +575,112 @@ connection, a ping to the PPPoE address from a phone on cellular, a
 WireGuard handshake from it, the 443 port forward). Disarm only when all
 pass.
 
+Ran on 2026-10-22 in two parts: the pin with no flow (HS1), then a
+download (HP0). Both passed.
+
 ### 6.3 L3, household traffic
 
 Arm `l3a` (90 min), renewed as section 1.2 says. Normal use for an hour:
 R3's HE2 captures once, the stop lines every 10 minutes, `offload_flows`
 counters.
 
+Replaced by an unattended night under a guard script, then four days of
+normal use (section 0). The HE2 frame check ran separately (section 6.6).
+
 ### 6.4 L4, acceptance
 
 Single-stream and 8-stream downloads at line rate with fixed cports
 (Cloudflare recipe), recorded governor. Accept when both reach line rate
-with every core's busy time (100 - idle in `/proc/stat`) under 50%, against
-about 90% on one core in software, and with no stop line.
+with every core's busy time under 50% over the download, against about 90%
+on one core in software, and with no stop line.
+
+Busy time is 1 - Δ(idle + iowait) / Δelapsed per core, from `/proc/stat`
+sampled every second, with Δelapsed in USER_HZ ticks (100 per second) from
+`/proc/uptime` read with each sample. Not BusyBox `top`, and not the busy
+columns' share of the total. This kernel (HZ=100, NO_HZ_IDLE, tick-based
+CPU accounting, no IRQ_TIME_ACCOUNTING) measures idle from the clock, but
+charges softirq only when a tick lands in it and never charges irq, so
+packet work on an otherwise idle core is mostly counted nowhere. On
+2026-10-27 the share read 1.5-2.2x low on the packet cores during the
+downloads (7.3% against 13.7%, 15.5% against 27.8%), 1.2-1.6x during the
+uploads at 50-57%, and close only near saturation (82.5% against 83.9%).
+On r37585 it read 39% against 43% and 42% against 56%. `top` also prints
+one four-core average, rounded down, every 5 s. The figures include the
+router's background and the sampling: an idle run reads 2-4% per core
+(cpu0 4.3%, 2026-10-27).
+
+The runs below predate the `/proc/uptime` reads. They took Δelapsed from
+the largest total of a core's fields, which an idle core keeps about 1%
+short of elapsed time (1508 against 1522 ticks in that idle run), so they
+may read up to a point low. A packet core's total can run over elapsed
+time; in every window below the largest total stayed under the elapsed
+time given by the samples' own timestamps. The download was Ookla's from
+its first to its last progress line, and a single stream from 1 s after
+its start.
+
+Ran on 2026-10-23 on r37585. It was recorded as a pass from the
+tick-sampled shares; by the measure above it failed, with cpu0 at 56%
+during Ookla's download. Ran again on 2026-10-27 on r37586, whose 651
+backports put the downloads' ACKs on the software flowtable: passed on CPU,
+with the busiest core at 14-23% for one stream and 24-36% for Ookla's
+download, against 43% and 56% on r37585 (section 0). Three things differed
+from the plan:
+
+- The multi-stream test was Ookla's CLI, because Cloudflare now caps each
+  request at 50 MB and rate-limits. The single stream was one 20 s HTTP
+  download from proof.ovh.net.
+- curl 8.23 ignores `--local-port` when `--interface` names a device. A
+  fixed client port needs `--interface <address>`.
+- On r37586 the single stream reached only 1.3-1.8 Gbit/s, short of line
+  rate, so its CPU figure is for that rate.
 
 ### 6.5 Soak, then keep
 
 24 hours non-persistent, the rollback renewed (`l5a`, `l5b`, ...) as
-section 1.2 says. Then `options qcom_ppe flow_offload=1 pppoe_offload=1` in
+section 1.2 says. Then `options qcom-ppe flow_offload=1 pppoe_offload=1` in
 `/etc/modules.conf` and `uci commit firewall` with `flow_offloading_hw=1`;
 after the next reboot, L1's checks once more.
+
+What happened instead:
+
+- **The soak** became four days of normal use (five since the first
+  enable), with offload switched on at runtime and nothing persisted.
+- **Keeping it** is done by the build: from `0442`, both parameters
+  default on for the ipq53xx subtarget, so `/etc/modules.conf` is not
+  needed.
+- **fw4's hardware offload** is still to be committed, from LuCI: Network,
+  Firewall, Routing/NAT Offloading, "Hardware flow offloading".
+
+The first boot of an image with `0442` is a check of its own. Offload is
+then enabled at probe, before the switch driver attaches to the conduit;
+that path has not run on hardware yet. Expect:
+
+- `dmesg | grep ppe_offload`: `enabled: ... profile E not yet (no rtl8_4
+  conduit) (port 0)` at probe, then `rtl8_4 head tag emulation on PPE port
+  1` with the first flow towards the LAN;
+- `head -3 /sys/kernel/debug/ppe/offload_flows`: `enabled 1 degraded 0`
+  and `pppoe_offload 1`;
+- L1's checks pass;
+- one download runs at line rate with a small `ethtool -S wan` rx_packets
+  delta.
+
+### 6.6 Lifecycle on the live line
+
+These ran on 2026-10-26 and 2026-10-27; section 0 has the results.
+
+- **Frames (HE2).** Capture a download on the PC, and on the router
+  `timeout 25 tcpdump -i any -Q out ... 'src port 443 and dst port <cport>'`.
+  - The PPE takes a flow before its first data packet, so the packets the
+    CPU forwards (the handshake and the FIN) are the software reference.
+  - A FIN is handed to the CPU as an intact PPPoE frame. The software
+    flowtable forwards it straight from `wan`'s ingress, so it never
+    appears on `pppoe-wan`.
+- **`fw4 reload`** 8 s into a 20 s download. Measure the PC's receive rate
+  every 0.5 s. Read `ethtool -S wan` rx_packets, the softnet drops and the
+  CPU codes while idle, before and after.
+- **Session loss.** `ifup wan` during a download. Detect the new session
+  by `pppoe-wan`'s ifindex: the concentrator may hand out the same session
+  ID again.
 
 ## 7. What to capture
 
@@ -509,3 +700,7 @@ the idle-time counter reads, and after a crash `/sys/fs/pstore/*`.
 - All LAN ports and VLANs share the conduit's L3 interface; VLAN-aware
   egress is VLAN 1 only.
 - IPv6, Wi-Fi clients and VLANs 10/20 stay in software.
+- A download running at line rate during `fw4 reload` stalls for 0.5-5 s
+  (section 0, DESIGN.md section 11).
+- `declined` counts offers, not flows: each active flow's upload half is
+  declined about once a second, by each of the two bound callbacks.

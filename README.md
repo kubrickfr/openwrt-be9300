@@ -21,8 +21,9 @@ which provided the IPQ5332 Wi-Fi and RTL837x DSA foundation.
 
 The rebase is not a plain replay. The series was reorganised and refreshed
 for current upstream, picks up newer ath12k and hostapd fixes from JiaY-shi's
-tree, and adds further GL-BE9300 work: PPE clocking, Wi-Fi MAC addresses,
-the regulatory country and fan control.
+tree, and adds further GL-BE9300 work: PPE clocking, PPE hardware flow
+offload for PPPoE and NAT downloads, Wi-Fi MAC addresses, the regulatory
+country and fan control.
 
 The goal of this project is simply to have a version that tracks upstream
 more closely: the same GL-BE9300 support, carried as a curated patch series
@@ -65,7 +66,7 @@ profiles of the trees it grew from are not carried.
 | LAN (RTL8372N via DSA + EDMA/PPE) | working with the new driver, one bridge switched in hardware (bench results in `package/kernel/rtl8372n/TESTING.md`) |
 | WAN (2.5G) | working at 2.5 Gbps; 1G/100M link rates untested |
 | VLANs (bridge-vlan on DSA) | working: one VLAN-aware bridge offloaded, access and trunk ports, tagged-only ports (some checks still need more hosts, see `TESTING.md`) |
-| Flow offloading | software flowtable only; no PPE hardware flow offload (see below) |
+| Flow offloading | PPE hardware offload of IPv4 downloads (NAT, PPPoE over a VLAN WAN), on by default on this board, used when "Hardware flow offloading" is selected in LuCI; uploads, Wi-Fi and IPv6 stay in the software flowtable. Validated live on one gateway, October 2026 (see below) |
 | Wi-Fi 7, all three bands | working |
 | MLO (AP MLD across 2.4/5/6 GHz) | working |
 | DFS | working: CAC and secondary AP after CAC tested (a radar event itself not yet tested) |
@@ -74,9 +75,32 @@ profiles of the trees it grew from are not carried.
 
 With this driver, through a PPPoE WAN with software flowtable offload and
 the core split in `packet-steering.sh`: **one TCP download at 2.00–2.16
-Gbit/s** (7 of 8 runs, 2026-10-21). With the previous, SDK-based driver
-(`tag_8021q`): between two units over a 2.5G trunk, **~1.8–1.9 Gbit/s**;
-**2.04 Gbit/s down** with 4 TCP streams (PPE clock 200 MHz, 2026-10-04).
+Gbit/s** (7 of 8 runs, 2026-10-21), with the forwarding core about 90%
+busy. With PPE hardware offload on the same line, **2.1–2.2 Gbit/s down**
+with several streams and **1.3–2.0 Gbit/s** on one (from proof.ovh.net,
+which varies from run to run). The downloads stay off the CPU: 0.01–0.2%
+of their packets reach it. What the CPU still does is forward the client's
+ACKs in software (the cores doing it at 1.1 GHz):
+
+- **one stream (2026-10-27):** 14–23% of one core at 1.3–1.8 Gbit/s (the
+  two faster runs each include a second of a cron job);
+- **Ookla's multi-stream download (2026-10-27):** 24–36% of the busiest
+  core and 13–22% of a second;
+- **before the flowtable VLAN backport (651-01, 2026-10-23):** those ACKs
+  took the slow path: 43% of one core for one stream at 2.0 Gbit/s, and 56%
+  for the multi-stream download.
+
+These are busy times measured from idle time (TESTING.md section 6.4 in
+`target/linux/qualcommbe/docs/ppe-flow-offload/`), with the router's
+background and the sampling included: idle, it reads 2–4% per core.
+BusyBox `top` on the router shows far less, a few percent `sirq`: its CPU
+line averages the four cores, rounds down and refreshes every 5 s, and on
+this kernel softirq that runs between timer ticks on an otherwise idle core
+is not counted at all.
+
+With the previous, SDK-based driver (`tag_8021q`): between two units over a
+2.5G trunk, **~1.8–1.9 Gbit/s**; **2.04 Gbit/s down** with 4 TCP streams
+(PPE clock 200 MHz, 2026-10-04).
 
 The `rtl8_4` tag costs the EDMA/PPE datapath: the PPE parser does not walk
 past its 8 bytes, so frames from the LAN ports nearly all land on one EDMA
@@ -97,20 +121,101 @@ from it (`/etc/uci-defaults/99-gl-be9300-wifi-macs`).
 
 ## Flow offloading
 
-Use **software** flow offloading only:
+Choose in LuCI: **Network → Firewall → General Settings → Routing/NAT
+Offloading → Flow offloading type**:
+
+- **Hardware flow offloading.** The PPE forwards IPv4 downloads into the
+  LAN switch, including PPPoE over a VLAN WAN. Everything it declines runs
+  in the software flowtable: uploads, Wi-Fi clients, IPv6, and VLANs other
+  than 1.
+- **Software flow offloading.** The software flowtable only.
+- **None.**
+
+Or with uci:
 
 ```sh
 uci set firewall.@defaults[0].flow_offloading='1'
-uci set firewall.@defaults[0].flow_offloading_hw='0'
+uci set firewall.@defaults[0].flow_offloading_hw='1'   # '0' for software only
 uci commit firewall && fw4 reload
 ```
 
-- This tree has **no PPE hardware flow offload**: no driver implements
-  flowtable offload (`TC_SETUP_FT`).
-- fw4 still accepts `flow_offloading_hw=1`, because pending patch 701 makes
-  its probe pass. The flowtable is then built on `lan1`–`lan4` and the Wi-Fi
-  interfaces instead of `br-lan`, and flows to wired clients are sent straight
-  to a switch port.
+**The PPE driver.** It takes what fw4 offers by default in this tree: the
+kmod-qcom-ppe options `KERNEL_QCOM_PPE_FLOW_OFFLOAD` and
+`KERNEL_QCOM_PPE_PPPOE_OFFLOAD`, both on for this subtarget (see
+[Building](#building)).
+
+- `options qcom-ppe flow_offload=0` (or `pppoe_offload=0`, to keep PPPoE in
+  software) in `/etc/modules.conf` overrides that at boot. The module name
+  there is `qcom-ppe`, with a hyphen: kmodloader matches the file name.
+- `/sys/module/qcom_ppe/parameters/` changes it at runtime.
+- Its state is in `/sys/kernel/debug/ppe/offload_flows`. `declined` counts
+  offers, not flows: the kernel re-offers each active flow about once a
+  second, and every upload half is declined.
+
+**Quality status, October 2026: validated live on one GL-BE9300.** The line
+is FTTH, with PPPoE over the ISP's WAN VLAN, 2.2/0.8 Gbit/s. Offload ran there for four days
+(five since the first enable), switched on at runtime and off only once,
+briefly, for a comparison run, with no stuck entry and no fault latched. The LAN side was one VLAN-1-tagged trunk
+to a managed switch. What was checked:
+
+- the switch-side tag emulation alone leaves the software path as it was;
+- a PPPoE session in hardware keeps LCP and other session traffic going;
+- downloads leave the CPU path and reach line rate;
+- forwarded frames match software's: TTL, MAC, DSCP, checksums;
+- a firewall reload and a WAN redial with flows in hardware.
+
+Not validated:
+
+- **The cases that need a fake ISP.** These are frames the PPE must hand
+  to the CPU instead of forwarding: wrong session or concentrator,
+  priority bits from the ISP, PPPoE control, TTL 1, IP options, fragments.
+  They include the residual below.
+- **The first boot with the defaults on.** Offload then starts at probe,
+  before the switch attaches; every test above switched it on at runtime.
+- **Other LAN and WAN layouts.** These were never offloaded:
+  - untagged LAN ports and a VLAN-unaware `br-lan`, which is OpenWrt's
+    default layout;
+  - a WAN without PPPoE (DHCP or static).
+- **Other boards, other ISPs and IPv6.** IPv6 is not offloaded.
+
+The bench record and the open gates are in
+`target/linux/qualcommbe/docs/ppe-flow-offload/` (TESTING.md section 0,
+DESIGN.md section 9).
+
+**Accepted residuals.** Neither match the PPE uses has a VLAN:
+
+- **PPPoE.** While a session is in hardware, frames with its session ID
+  from the concentrator's MAC also reach its flows on another VLAN of the
+  WAN port, or untagged. `pppoe_offload=0` avoids that.
+- **A WAN without PPPoE.** A flow's 5-tuple also hits untagged, or on
+  another VLAN of the WAN port. Only `flow_offload=0`, or software
+  offloading, avoids that.
+
+Either way the PPE forwards frames that software would drop. It matters
+only if something else on the line upstream of the ONT can send them
+(DESIGN.md section 10).
+
+**Known effects:**
+
+- **A firewall reload stalls fast downloads.** A download running at line
+  rate when fw4 reloads stalls for 0.5–5 s, then recovers by itself. fw4
+  reloads on any firewall change, and twice after every WAN redial. With
+  software offloading it does not stall. Where the packets are lost during
+  the hand-over is not established yet.
+- **Uploads stay in software.** The PPE's parser cannot read past the
+  switch's `rtl8_4` tag. Only the switch-side tag emulation is used
+  (egress only); the ingress parser alias that would offload uploads breaks
+  a VLAN WAN.
+
+### Software flowtable notes
+
+These apply to the software flowtable: with software offloading, and with
+hardware offloading for every flow the PPE declines.
+
+- With hardware offloading, fw4 builds the flowtable on `lan1`–`lan4`, the
+  Wi-Fi interfaces and `wan` instead of `br-lan`. Pending patch 701 lets it
+  mix devices that offload with devices that do not. Flows to wired clients
+  that the PPE declines are sent straight to a switch port in software.
 - Pending patch 708 marks the frames the flowtable sends straight to a
   switch port for TX forwarding offload, as the bridge does for the frames
   it forwards, so that the switch delivers them from its own FDB; for
@@ -142,9 +247,9 @@ uci commit firewall && fw4 reload
   one PPPoE download went from ~1.84 to ~1.92–2.08 Gbit/s (2026-10-09, RPS on
   the WAN). That was measured with 766 and the previous switch driver,
   before 708 replaced it. fw4 does not add the ports in software mode.
-- A PPPoE WAN cannot be hardware-offloaded even with the experimental PPE
-  offload series in perceival/openwrt-flint3: that driver declines PPPoE in
-  both directions.
+- The flowtable keys on a frame's VLAN ID, not its whole tag, from the
+  backported 651-01 on. Before it, LAN uploads that the managed switch tagged
+  with a priority missed the software flowtable and took the slow path.
 
 ## Firmware
 
@@ -186,6 +291,10 @@ uci commit firewall && fw4 reload
   section 7 of `package/kernel/rtl8372n/TESTING.md`. The VLAN-filtering and
   IGMP-snooping issues seen with the previous driver (2026-10-04) have not
   been retested.
+- **PPE offload and firewall reloads.** With hardware flow offloading, a
+  download running at line rate when fw4 reloads stalls for 0.5–5 s.
+  fw4 reloads on any firewall change, and twice after every WAN redial.
+  Under investigation; see [Flow offloading](#flow-offloading).
 - **Unprogrammed ART country.** The regulatory country is read from the ART
   partition at first boot. Some units have none, and their 6 GHz radio then
   fails to come up with country `00`. When ART has no country and a radio has
@@ -213,6 +322,16 @@ offload=0` (or `=1`) in `/etc/modules.conf` overrides that at boot; with
 offload off, every bridge runs in software. See
 `package/kernel/rtl8372n/TESTING.md`.
 
+The PPE driver takes the flows fw4 offers by default: kmod-qcom-ppe's
+`KERNEL_QCOM_PPE_FLOW_OFFLOAD` (and `KERNEL_QCOM_PPE_PPPOE_OFFLOAD` for
+PPPoE). Both are on for the ipq53xx subtarget (the GL-BE9300), and off for
+ipq95xx, where this code has never run. Whether anything is offered is
+fw4's hardware flow offloading setting ([Flow offloading](#flow-offloading)),
+which is off in a fresh configuration. `options qcom-ppe flow_offload=0` (or
+`pppoe_offload=0`) in `/etc/modules.conf` overrides the build default at
+boot. See
+`target/linux/qualcommbe/docs/ppe-flow-offload/`.
+
 Images land in `bin/targets/qualcommbe/ipq53xx/`. The build fails if the
 kernel image is larger than the 7 MiB `0:HLOS` partition, rather than
 producing an image that cannot boot (`KERNEL_SIZE` in
@@ -236,10 +355,18 @@ Both trees evolve in parallel. This tree was rebased from perceival's
 `flint3-be9300` as of 2026-09-22 (`b12c85403f`), and some later work was
 picked from it since.
 
-- **Not carried:** the PPE hardware flow offload series, including its
-  `rtl8_4` parser alias (the switch now uses the native `rtl8_4` tag, with
-  perceival's EDMA checksum fallback carried as patch 0431), the FT-over-MLO hostapd series
-  (992–999a), and the vendor Q6 memory contract described below.
+- **PPE hardware flow offload, reworked.** His table primitives and IPv4
+  engine are carried as patches 0433/0434, under his authorship. This tree
+  adds a safety layer, PPPoE download offload, and an egress-only emulation
+  of the `rtl8_4` tag (patches 0435–0439, 0441 and 0442, kernel pending
+  714). His ingress
+  parser alias is kept only as a bench-only profile: it stops 802.1Q
+  parsing on the WAN. His IPv6 path and `tag_8021q` encapsulation are not
+  carried. The switch uses the native `rtl8_4` tag, with perceival's EDMA
+  checksum fallback carried as patch 0431. See
+  `target/linux/qualcommbe/docs/ppe-flow-offload/PROVENANCE.md`.
+- **Not carried:** the FT-over-MLO hostapd series (992–999a), and the vendor
+  Q6 memory contract described below.
 - **IPQ5332 UserPD boot.** ath12k describes the UserPD to the RootPD through
   the legacy boot-info path (DT `qcom,legacy-userpd-bootinfo`, patches
   903-02a/903-02b), with the reference-board reserved-memory layout:

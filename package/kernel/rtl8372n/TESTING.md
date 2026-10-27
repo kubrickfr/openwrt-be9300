@@ -276,11 +276,15 @@ config bridge-vlan
 - LAN-to-LAN traffic switched in hardware bypasses nftables bridge rules;
   `ip -s link show lanN`, LuCI and ethtool count only what crosses the CPU
   (the SDK-based driver read the switch MIB).
-- PPE flow offload is off by default (`qcom_ppe.flow_offload`, see
-  `target/linux/qualcommbe/docs/ppe-flow-offload/`): routed traffic crosses
-  the CPU unless it is enabled, and with it only downloads into the switch
-  are offloaded (the nexthop emulates the rtl8_4 tag); uploads from the
-  switch cross the CPU, except under the PPE offload's bench-only profile A.
+- PPE flow offload (`qcom_ppe.flow_offload`, see
+  `target/linux/qualcommbe/docs/ppe-flow-offload/`) is on by default in
+  kmod-qcom-ppe for this subtarget, and used when fw4's hardware flow
+  offloading is on.
+  - Routed traffic crosses the CPU unless both are on.
+  - With both on, only downloads into the switch are offloaded (the
+    nexthop emulates the rtl8_4 tag).
+  - Uploads from the switch cross the CPU, except under the PPE offload's
+    bench-only profile A.
 - The PPE parser does not walk past the 8-byte rtl8_4 tag: frames from the
   LAN ports nearly all land on one EDMA Rx ring and CPU (95% on one PPE queue
   in 1.3; RPS still spreads the protocol work) and get no Rx checksum offload
