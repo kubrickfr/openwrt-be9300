@@ -2169,6 +2169,47 @@ define KernelPackage/qcom-ppe/description
   devices.
 endef
 
+define KernelPackage/qcom-ppe/config
+  if PACKAGE_kmod-qcom-ppe
+
+	config KERNEL_QCOM_PPE_FLOW_OFFLOAD
+		bool "Offload flowtable flows to the PPE by default"
+		default y if TARGET_qualcommbe_ipq53xx
+		help
+		  Sets the default of the qcom_ppe "flow_offload" module
+		  parameter (kernel option QCOM_PPE_FLOW_OFFLOAD). On, the PPE
+		  takes the IPv4 flows fw4 offers when hardware flow
+		  offloading is selected (LuCI: Network, Firewall, Routing/NAT
+		  Offloading; firewall.@defaults[0].flow_offloading_hw=1); with
+		  software or no flow offloading, nothing is offered to it.
+		  "options qcom-ppe flow_offload=0" (or =1) in /etc/modules.conf
+		  overrides this default at boot.
+
+		  On by default only for the ipq53xx subtarget (GL-BE9300),
+		  where it was validated; behind its RTL8372N only downloads are
+		  offloaded. On other boards, with plain PPE ports, uploads would
+		  be offloaded too, untested. The flow key has no VLAN: a
+		  plain-IP flow from the WAN port also hits untagged or on
+		  another VLAN of that port, where software would not forward
+		  it. See target/linux/qualcommbe/docs/ppe-flow-offload/.
+
+	config KERNEL_QCOM_PPE_PPPOE_OFFLOAD
+		bool "Also offload PPPoE downloads by default"
+		depends on KERNEL_QCOM_PPE_FLOW_OFFLOAD
+		default y if TARGET_qualcommbe_ipq53xx
+		help
+		  Sets the default of the qcom_ppe "pppoe_offload" module
+		  parameter (kernel option QCOM_PPE_PPPOE_OFFLOAD). The PPE's
+		  PPPoE session match has no VLAN: while a session is in
+		  hardware, frames with its session ID from its access
+		  concentrator's MAC also reach its flows on another VLAN of
+		  the WAN port, or untagged, where software would drop them
+		  (DESIGN.md section 10). "options qcom-ppe pppoe_offload=0" in
+		  /etc/modules.conf keeps PPPoE in software.
+
+  endif
+endef
+
 $(eval $(call KernelPackage,qcom-ppe))
 
 define KernelPackage/qlcnic
