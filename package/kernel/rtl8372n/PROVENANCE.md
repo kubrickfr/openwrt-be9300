@@ -65,13 +65,13 @@ maintainer decision before submission.
 
 ## Register and feature ledger
 
-"HW" is what has run on a BE9300; "bench" is this driver's run of
-2026-10-20/21 (`TESTING.md` section 0; numbers are its checks); "stock" is
-GL 4.10.1 corroboration (next section). Everything else is unmeasured. On the
-bench, every setup readback that is checked (78 of the 79 `P0 readback`
-lines; SA-moving is only logged) matched on five boots and two module
-reloads. That shows a value sticks, not what it does; the rows do not
-repeat it.
+"HW" is what has run on a BE9300; "bench" is this driver's runs of
+2026-10-20/21 and 2026-10-27 (`TESTING.md` section 0; numbers are its checks;
+results of the second run carry its date); "stock" is GL 4.10.1 corroboration
+(next section). Everything else is unmeasured. On the 2026-10-20/21 bench,
+every setup readback that is checked (78 of the 79 `P0 readback` lines;
+SA-moving is only logged) matched on five boots and two module reloads. That
+shows a value sticks, not what it does; the rows do not repeat it.
 
 | Registers / feature | Source | Status |
 | --- | --- | --- |
@@ -92,16 +92,16 @@ repeat it.
 | L2 table clear `0x53d8` bit 0 | SDK `dal_rtl8373_l2_table_clear` | **SDK-only lineage, disposition open.** Used by the SDK-based driver without polling. HW: bit 0 self-cleared at every bench setup (1.1). |
 | Admission `0x4e10`, egress tag mode `0x6738` (2 bits per port) | RTLPlayground; ZTE (addresses, layout); rtl8365mb by analogy and SDK (encodings) | ORIGINAL 0 corroborated by stock; REAL_KEEP 3 not. Admission 1 (TAG_ONLY): **SDK-only lineage, disposition open**. HW (bench): with REAL_KEEP on the CPU port, VID 1 tags reached the CPU although VLAN 1 lists that port untagged (1.5); ORIGINAL on lan4 tagged frames that entered lan1 untagged (phase 3); TAG_ONLY on lan4 admitted tagged VID 1 and dropped untagged frames (phase 3). |
 | Egress transparency `0x4eb8 + (port / 3) * 4` | SDK `dal_rtl8373_vlan_portTransparent_set` only; mechanism as rtl8365mb | **SDK-only lineage, disposition open.** No public source; stock never writes it. Effect not shown on the bench: VID 1, the only VID recorded through a VLAN-unaware port, has the CPU as a member anyway. |
-| VLAN-aware port mode: bridge PVID, else PVID 0 + TAG_ONLY + empty VID 0 (`0x02000000`); PVID 1 when unaware | rtl8365mb (942-06); SDK-based driver's PVID-per-mode rule | HW: PVID 0 on a VLAN-unaware port gave a dead LAN (SDK-based driver), so never written there. Bench: PVID 1 on unaware ports (phases 1, 2); in phase 3, lan1 took the bridge PVID 1 and lan4, given none, PVID 0 + TAG_ONLY (admission row). Priority-tagged frames into the empty VID 0 not recorded; link-local frames on such a port not run (3.3). |
-| Isolation `0x50c0 + port * 4` | RTLPlayground; ZTE | Stride HW-proven for ports 0-8 (P0); port 9 (`0x50e4`): **SDK-only lineage**. Self bit as in the SDK-based driver. Per-bridge masks, bench phase 2: the debug `linked` masks grew 0x0, 0x10, 0x30, 0x70 as the four ports joined, lan1-lan4 unicast was switched in hardware, and ports left and rejoined (2.9 on idle ports, 3.7). Isolation of a port taken out of the bridge not checked with traffic (1.4, 2.3). |
+| VLAN-aware port mode: bridge PVID, else PVID 0 + TAG_ONLY + empty VID 0 (`0x02000000`); PVID 1 when unaware | rtl8365mb (942-06); SDK-based driver's PVID-per-mode rule | HW: PVID 0 on a VLAN-unaware port gave a dead LAN (SDK-based driver), so never written there. Bench: PVID 1 on unaware ports (phases 1, 2); in phase 3, lan1 took the bridge PVID 1 and lan4, given none, PVID 0 + TAG_ONLY (admission row). Priority-tagged frames into the empty VID 0 not recorded. On such a port (3.3, 2026-10-27) untagged BPDU, LACPDU, EAPOL and LLDP still reached the CPU; untagged ARP and frames to :10, :20, :21, CDP, SSTP and PTP were dropped; frames to :04-:0d and :0f were not sent. |
+| Isolation `0x50c0 + port * 4` | RTLPlayground; ZTE | Stride HW-proven for ports 0-8 (P0); port 9 (`0x50e4`): **SDK-only lineage**. Self bit as in the SDK-based driver. Per-bridge masks, bench phase 2: the debug `linked` masks grew 0x0, 0x10, 0x30, 0x70 as the four ports joined, lan1-lan4 unicast was switched in hardware, and ports left and rejoined (2.9 on idle ports, 3.7). A port taken out of the offloaded bridge (lan2, 2026-10-27, 1.4 and 2.3's isolation half) passed nothing to or from the bridged ports, with traffic from both sides. |
 | Learning limit `0x5384 + port * 4` (bits 12:0, 4160 = on) | ZTE (with `_MAX` 4160); RTLPlayground address; SDK | Public. 0 at setup and on leave; behaviour at 0 unmeasured. HW: with 4160 on the bridged ports, lan1-lan4 unicast was switched in hardware with the CPU counters flat (bench, phase 2), so those ports learned (inferred). |
 | Flood masks `0x5360`-`0x5370` | ZTE `*FLOOD`; SDK-based driver's flag mapping | Public. CPU-only at setup; bridge flags drive the port bits. |
-| CIST state `0x5310` (2 bits per port) | RTLPlayground; MNeroba#2; SDK | HW: encoding (MNeroba#2); stock uses the same. That states 0-2 block data is unmeasured. |
+| CIST state `0x5310` (2 bits per port) | RTLPlayground; MNeroba#2; SDK | HW: encoding (MNeroba#2); stock uses the same. CIST 0 (DISABLED) blocked data both ways with the link up (2.10, 2026-10-27); that CIST 1 and 2 block data is unmeasured. |
 | Per-port flush `0x53d4`, mode `0x53dc` | RTLPlayground `port_l2_forget_port()`; ZTE; MNeroba#2; SDK | HW: completion on ports 4-7. Mode 0 sparing static unicast entries: documented, unmeasured. |
 | Ageing `0x5354` 15:0 = s x 5, clamped 14-800 s | ZTE (cites the SDK DAL); SDK | **SDK-only lineage, disposition open.** The clamp has no SDK basis. HW: the debug lines read 30, 14, 800 and 300 s through 2.6's `ageing_time` sequence, the clamp included; expiry time not recorded. |
 | Lookup-miss `0x5374`, `0x4f74`, `0x4f78`/`0x4f7c`; new-SA `0x4f6c`; unmatched-SA `0x4f70` | SDK action setters | **SDK-only lineage, disposition open.** Written 0 (forward). |
 | IGMP/MLD snooping `0x5290` bit 0 | SDK `dal_rtl8373_igmp_state_set` | **SDK-only lineage, disposition open.** Written 0. |
-| Link-local trap: RMA `0x4ecc + 4 * slot` (slots 0, 2-7), LLDP `0x4f18`, RMA_CFG `0x4f1c` bit 3, trap CPU `0x4f34` 17:16 and `0x5350` 16:15 | RTLPlayground (addresses only); SDK; MNeroba's analysis (airjinkela#2) | **SDK-only lineage, disposition open**, every field. Which select steers RMA traps, and the REASON of trapped frames, unmeasured (1.6, 2.4 not run on the bench). |
+| Link-local trap: RMA `0x4ecc + 4 * slot` (slots 0, 2-7), LLDP `0x4f18`, RMA_CFG `0x4f1c` bit 3, trap CPU `0x4f34` 17:16 and `0x5350` 16:15 | RTLPlayground (addresses only); SDK; MNeroba's analysis (airjinkela#2) | **SDK-only lineage, disposition open**, every field. Bench (1.6, 2.4, 3.3, 2026-10-27): frames to 01:80:c2:00:00:00, :02, :03 and :0e reached the CPU once per frame (10 sent per address) with REASON 0x5f from a standalone, a bridged and a tagged-only port; :10, :20, :21, CDP, SSTP and PTP were not trapped (REASON 0 from the standalone and bridged ports, dropped untagged at the tagged-only one). Which select steers RMA traps unmeasured. |
 | VLAN table reset: sentinel VID 4094, `0x4e14` bit 3 TABLE_RST, sample/sweep | SDK `dal_rtl8373_vlan_reset()` | **SDK-only lineage, disposition open.** Stock never uses TABLE_RST but sweeps every VID (fallback corroborated). HW: cleared the VID 4094 sentinel in 290-520 us on five boots and two module reloads (bench, 1.1); a table populated before a warm reboot (3.8) not run. |
 | VLAN controls: `0x4e14` bits 0/1 VID types, `0x4e30`/`0x4e34` learn-disable, `0x4e38` port FID, egress keep `0x6728` | SDK field list, `vlan_init` | **SDK-only lineage, disposition open.** Stock writes `0x4e30`/`0x4e34` = 0 too. |
 | L2 actions: `0x5350` bit 8 lookup-hit isolation, 7:6 hash-full; `0x4f80` learn-limit; `0x4f84` source-port permit | SDK setters; SDK-based driver cleared `0x4f84` | **SDK-only lineage, disposition open.** |

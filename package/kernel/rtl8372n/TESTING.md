@@ -31,6 +31,67 @@ r37571-89c18ad1cb, hosts: a PC on lan1 and a managed switch on lan4.
   tagged-only port, 3.6, 3.8.
 - Two days of normal use in that layout: no stop lines, no EDMA errors.
 
+2026-10-27, same unit, image r37586-b82b97e5be from the PPE offload branch
+(be9300-next-ppe-pppoe): this driver unchanged (kmod-dsa-rtl8372n 0.0.2-r10,
+debug build, offload on) plus a PPE flow offload series this tree does not
+carry, which was on. br-lan stayed VLAN-aware, in a layout other than phase
+3's: lan1 the trunk (VID 1 PVID, tagged in 1, 10 and 20), lan2-lan4 untagged
+in VID 1; so the phase 1 and 2 checks below ran with offload on and a
+VLAN-aware bridge. Hosts: a laptop straight on lan2 (2.5G USB adapter) and a
+host behind the managed switch, now on lan1, in VID 1 and, on a second NIC,
+VID 10. Changes made at runtime and undone after each check.
+
+- **Phase 1 checks**: 1.2: lan2 advertising only 1000, 100 or 10 linked at
+  that speed in 3-4 s and carried 941, 94 and 9.2-9.3 Mbit/s each way, then
+  2.5G again. 1.4 and 2.3's isolation half: lan2 taken out of the offloaded
+  br-lan onto its own subnet; unicast to the other host's MAC (static
+  neighbour), broadcast, ARP and multicast, from the far host for 3 minutes
+  and a few of each from the laptop (5 unicast pings, 3 each of broadcast,
+  ARP and multicast): nothing crossed once lan2 had left the bridge (the far
+  host captured throughout and saw only the laptop's frames from the second
+  before; the laptop captured for 45 s after); lan2's address answered the
+  laptop (ARP, then ICMP errors from the firewall's REJECT). 1.6, from lan2
+  standalone, 10 frames per address: each BPDU, LACPDU, EAPOL and LLDP
+  reached the conduit once with REASON 0x5f; each frame to
+  01:80:c2:00:00:10, :20, :21, CDP, SSTP and PTP once with REASON 0 (a
+  standalone port sends everything to the CPU).
+- **Phase 2 checks**: 2.2: lan2 to the host behind lan1 at 2347 and 2346
+  Mbit/s (receiver), router cores under 4%, at most 905 conduit packets (Rx
+  and Tx) per run against about 2 million segments. 2.4, with STP off and
+  `group_fwd_mask` 0 only: BPDU trapped (0x5f) and forwarded once by Linux
+  (one copy out of lan1, one at the far host); LACPDU, EAPOL and LLDP
+  trapped and not sent out of lan1 (the far host saw none, though the
+  managed switch in front of it drops those addresses itself); :10, :20,
+  :21, CDP, SSTP and PTP not trapped (REASON 0) but switched in hardware
+  (one copy at the far host, none out of lan1 from the CPU). 2.5: `hairpin`,
+  `isolated`, `locked` and `mcast_to_unicast` refused with `Not supported`,
+  `mab` with `Invalid argument` by the bridge (it needs `locked`); no flag
+  changed. 2.10: in a 15 s hold at state 0 with the link up, pings both ways
+  were all lost; in a second, 8 s hold, a capture on lan2 saw no frame from
+  the laptop (295 outside the hold); traffic resumed at state 3. With STP
+  off, Linux puts a port set to state 4 straight back to forwarding (port
+  state selection): the switch port held state 4 for about 20 ms and no ping
+  was lost.
+- **Phase 3 checks**: 3.2 for VID 10: lan2 an access port of VID 10 to the
+  host's VID 10 NIC behind the lan1 trunk at 2347 Mbit/s each way in
+  hardware. 3.4 for VIDs 1 and 10: isolated both ways. 3.5 in part: the
+  router's VID 10 address answered (ICMP errors: the zone rejects input).
+  3.3, lan2 tagged-only in VID 10: tagged traffic at 2346 Mbit/s in
+  hardware; untagged pings failed (0/3) and no untagged frame other than the
+  link-local ones reached lan2 or the VID 1 far port (the VID 10 port's
+  capture left out IPv6 and 192.168.211.0/24, which the tagged traffic
+  shares); untagged BPDU, LACPDU, EAPOL and LLDP still reached the conduit
+  (REASON 0x5f); untagged :10, :20, :21, CDP, SSTP and PTP were dropped.
+- Still not run: the cable test (the image's `ethtool` has no netlink),
+  forced 100 with autoneg off, 1.4's lan1 down/up, the STP-on halves of 1.6
+  and 2.4 and 2.4's `0x4008` half (each disturbs the live LAN), 2.2's VID 10
+  uppers and routed download, 2.3's second bridge, 2.5's flood flags,
+  roaming, 3.2's PCP check and VID 20, 3.3's priority-tagged frames and its
+  STP-on run, 3.4's VIDs 20, 4095 and 40 and its priority-tagged frames (VID
+  30 was dropped at ingress on 2026-10-20/21), 3.5's br-lan.20 and its
+  conduit tag checks, 3.6, 3.8, and frames to 01:80:c2:00:00:04-0d and :0f
+  (RMA slots 4-6) on any port.
+
 ## 1. Prerequisites and recovery
 
 - **Unit.** Prefer a spare unit with the AP profile. On the gateway, keep the
@@ -192,7 +253,7 @@ The default br-lan (lan1-lan4, no `bridge-vlan`) is offloaded at boot.
 | 2.2 | Repeat 1.3's iperf3 runs and the routed download. VID 10 uppers on the lan1 and lan2 hosts ping each other. | Near line rate, router CPU near idle, `ip -s link show lan` nearly still. Tag unchanged. Routed rate as in 1.3. |
 | 2.3 | `ip link set lan4 nomaster`, own subnet as in 1.4: ARP, unicast to the lan1 host's MAC (static neighbour), mDNS, UDP to 239.1.1.1. Then `ip link add br-test type bridge; ip link set lan4 master br-test`. Clean up. | `port 4 left bridge 1`. The lan1 and lan4 hosts see nothing of each other; lan4 reaches the router. br-test warns `Range of offloadable bridges exceeded` (DSA) and runs in software; lan4 stays CPU-only. |
 | 2.4 | Control frames, lan1 and lan2 in br-lan: script above from the lan1 host, observer on lan2, with `ip link set br-lan type bridge stp_state 0` / `1` and `group_fwd_mask 0` / `0x4008`. Also a few frames to 01:80:c2:00:00:10, :20, :21, 01:00:0c:cc:cc:cc, :cd and 01:1b:19:00:00:00. | STP off: exactly one copy of each BPDU (none: 0432 missing; two: the switch forwarded it too); STP on: none. EAPOL and LLDP: none at mask 0, exactly one at 0x4008. LACPDUs never. The other DAs arrive exactly once; none, with a non-zero REASON on the conduit, means that reset action traps: record the DA. |
-| 2.5 | From the lan1 host: unknown unicast (static ARP for an absent MAC), multicast to 239.1.1.1, ff0e::1234 and 03:00:00:00:00:01, ARP broadcast. `bridge link set dev lan2 flood off`, `mcast_flood off`, `bcast_flood off`, then on. `hairpin on`, `isolated on`. | Each class stops reaching the lan2 host exactly while its flag is off; the router sees all of them; nothing returns to its sender. hairpin/isolated fail: `Only learning and flood flags are offloaded`. |
+| 2.5 | From the lan1 host: unknown unicast (static ARP for an absent MAC), multicast to 239.1.1.1, ff0e::1234 and 03:00:00:00:00:01, ARP broadcast. `bridge link set dev lan2 flood off`, `mcast_flood off`, `bcast_flood off`, then on. `hairpin on`, `isolated on`. | Each class stops reaching the lan2 host exactly while its flag is off; the router sees all of them; nothing returns to its sender. hairpin/isolated fail: `RTNETLINK answers: Not supported` (OpenWrt's `ip` and `bridge` do not print the driver's `Only learning and flood flags are offloaded`). |
 | 2.6 | FDB: `bridge fdb show dev lan2`; `bridge fdb add 02:00:00:00:00:01 dev lan1 master static`, show, `del`; unplug and replug lan2; `bridge link set dev lan2 learning off` with one-way UDP from the lan2 host; `ip link set br-lan type bridge ageing_time` 3000, 0, 100000, 3000 with a lan2 host sending one frame; restore 30000. `stp_state 1`, re-enslave lan2, `stp_state 0`. | The lan2 host is `self`, vlan 1. Debug `L2 02:00:00:00:00:01 vid 1: static entry for port 7`, listed `self` and `static`, then gone. Unplug: `port 6: STP state 0, CIST 0`, `port 6: dynamic L2 entries flushed`, entry gone, relearned after replug; static entries survive. Learning off: learned entry flushed, static kept, UDP still switched in hardware. Debug `L2 ageing time 30 s`, `14 s`, `800 s`; the silent host leaves after about 30-60 s (record). STP: `port 6: STP state 1, CIST 1`, then 2, then 3; no LAN traffic before 3. |
 | 2.7 | Wi-Fi client W talks; `iperf3` between the lan1 host and W with `tcpdump 'ether host <W> and not broadcast and not multicast'` on the lan3 host. Roam: W on an AP on lan2, pinged from the lan1 host, moved to the router's Wi-Fi and back. | Debug `L2 <W> vid 1: static entry for port 3`; nothing of the stream on lan3. The ping resumes within seconds each way, not after 300 s. Back on the AP: `L2 <W>: DSA vid 0 released by port 3, entry for port -1`; `bridge fdb show dev lan2` lists W as learned `self`. |
 | 2.8 | `ip link add link lan1 name lan1.100 type vlan id 100` with lan1 in br-lan. Then out of br-lan, create it, re-add lan1. Delete it and re-add lan1. | First: EBUSY, `8021q uppers are not supported on ports of the offloaded bridge`. Then `Port has 8021q uppers, bridged in software`, no `port 7 joined bridge`, lan1's LAN traffic crosses the conduit. Last: offloaded again. |
@@ -248,7 +309,7 @@ config bridge-vlan
 | --- | --- | --- |
 | 3.1 | Boot; dmesg; `bridge vlan show`. | Join lines, then `port N: VLAN filtering 1, bridge PVID P, linked M` per port (the last lists the other three) and `port N: VLAN V added (flags F), bridge PVID P` matching `bridge vlan show`. Last entry words: `VLAN 1 entry 0x02026098` (CPU, lan1, lan4), `VLAN 10 entry 0x020100c8`, `VLAN 20 entry 0x020080a8`. |
 | 3.2 | Trunk/access: VID 10 and 20 traffic between the AP and the lan2/lan3 hosts, with iperf3. | Untagged on access ports, tagged with PCP kept on lan1; switched in hardware (router CPU idle). |
-| 3.3 | PVID: `bridge vlan add dev lan2 vid 10` (no `pvid`); untagged, priority-tagged and VID 10 frames from the lan2 host; with `stp_state 1`, untagged BPDU, LLDP and EAPOL from it. Restore with `pvid untagged`. | Debug `port 6: VLAN 10 added (...), bridge PVID 0`. Untagged and priority-tagged dropped everywhere, conduit included; VID 10 passes. The link-local frames still reach the conduit; if not, TAG_ONLY acts before the trap: report, and give such ports a PVID. |
+| 3.3 | PVID: `bridge vlan add dev lan2 vid 10` (no `pvid`); untagged, priority-tagged and VID 10 frames from the lan2 host; with `stp_state 1`, untagged BPDU, LLDP and EAPOL from it. Restore with `pvid untagged`. | Debug `port 6: VLAN 10 added (...), bridge PVID 0`. Untagged frames other than the trapped link-local ones, and priority-tagged frames, dropped everywhere, conduit included; VID 10 passes. The link-local frames still reach the conduit; if not, TAG_ONLY acts before the trap: report, and give such ports a PVID. |
 | 3.4 | VLAN isolation: lan2 and lan3 hosts on one subnet; VID 20 tagged into lan2, VID 30 into lan1, VID 4095 into lan2, priority-tagged into lan2; VID 40 on lan2 and lan3 only (`bridge vlan add dev lan2 vid 40`, same for lan3). | No lan2-lan3 path. VIDs 20, 30, 4095 dropped everywhere, conduit included. Priority-tagged lands in VID 10. VID 40 switched lan2-lan3, never on the conduit. |
 | 3.5 | br-lan.X: hosts and the AP (VID 10) reach the `br-lan.10`/`br-lan.20` addresses; `tcpdump -i lan -e -xx`. | Access-port frames arrive untagged, trunk frames tagged; router frames leave access ports untagged, the trunk tagged. A VID 1 tag on a router frame at lan2/lan3: the KEEP bit does not override ORIGINAL; stop, keep br-lan VLAN-unaware. |
 | 3.6 | `ip link set br-lan type bridge vlan_filtering 0`, test, `1`, test; three times; then ten toggles with the AP sending VID 20 broadcasts, capturing on the lan2 host. | Per toggle, `port N: VLAN filtering V, bridge PVID P, linked M` per port with growing masks, then `L2 VID 0/1 entries re-synced for VLAN filtering V`. At 0 all ports are one domain, tags unchanged; at 1, 3.2 and 3.4 hold. The lan2 host never gets an untagged copy, nor VID 20 while at 1. After `VLAN filtering V failed` and `kept VLAN filtering V after a failed change`, repeat the same command (down/up does not heal it). |
@@ -302,9 +363,10 @@ config bridge-vlan
   protocol before adding the ports.
 - Only learning, flood, mcast_flood and bcast_flood are offloaded; other
   bridge port flags (isolated, hairpin, locked, MAB, multicast-to-unicast)
-  are refused on offloaded ports ("Only learning and flood flags are
-  offloaded"), since the switch would forward around them. With
-  `offload=0` the software bridge applies them. No MDB: multicast floods
+  are refused on offloaded ports (`RTNETLINK answers: Not supported`; MAB
+  fails earlier with `Invalid argument`, as the bridge requires `locked`),
+  since the switch would forward around them. With `offload=0` the
+  software bridge applies them. No MDB: multicast floods
   per `mcast_flood` whatever IGMP snooping decides. No LAG, MST, rate
   limiting, MIB counters or GPIO; EEE off.
 - Ageing is clamped to 14-800 s; `ip -d link show br-lan` shows the value set.
@@ -312,8 +374,10 @@ config bridge-vlan
 - `bridge fdb replace` of a host address onto a LAN port: once deleted there
   it floods; replaced back onto Wi-Fi, the entry stays on the LAN port.
 - Link-local traps need 0432; 01:80:c2:00:00:10-2f, CDP, SSTP and PTP keep
-  their reset actions. A VLAN-aware port without a PVID admits tagged frames
-  only (TAG_ONLY; the bench's lan4 dropped untagged frames); whether untagged
-  link-local frames still reach the CPU on such a port is untested (3.3).
+  their reset actions (on the bench, :10, :20, :21, CDP, SSTP and PTP were
+  switched in hardware as other multicast). A VLAN-aware port without a PVID
+  admits tagged frames only (TAG_ONLY); there, untagged BPDU, LACPDU, EAPOL
+  and LLDP still reached the CPU on the bench, while untagged ARP and frames
+  to :10, :20, :21, CDP, SSTP and PTP were dropped (3.3).
 - VID 1 and priority-tagged frames reach Linux tagged: a host tagging VID 1
   needs a VLAN-aware br-lan with VID 1 untagged PVID, or a `lanN.1` upper.
