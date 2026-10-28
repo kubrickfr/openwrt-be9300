@@ -1,0 +1,40 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] wifi: mac80211: keep the 802.3 group frames of an AP MLD
+
+OpenWrt patch 458 (send MLO group frames only on links with a running
+AP) drops a group addressed frame at dequeue when the AP of the
+link in its TX control link field no longer beacons. A frame sent
+through the 802.3 encapsulation offload names no link:
+ieee80211_8023_xmit() clears the TX info and sets only the queue flags,
+so its link field reads 0, not IEEE80211_LINK_UNSPECIFIED, and the
+driver picks the link itself.
+
+With IEEE80211_OFFLOAD_ENCAP_MCAST, group frames of an AP MLD take that
+path and are queued to the TXQ of the vif. While link 0 of the AP MLD
+does not beacon (a CAC, an AP removal, a radio restart) or does not
+exist, every group addressed data frame (ARP, ND, DHCP) was dropped on
+all links.
+
+Do not treat an 802.3 frame as bound to a link. mac80211 sends the
+802.3 group frames of an AP MLD only for a driver that sets
+MLO_MCAST_MULTI_LINK_TX and so picks the links itself; ath12k sends a
+copy only on the links whose vdev is up.
+
+Assisted-by: LLM
+---
+ net/mac80211/tx.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -4060,6 +4060,10 @@ static bool ieee80211_tx_link_stopped(st
+ 	unsigned int link_id = u32_get_bits(info->control.flags,
+ 					    IEEE80211_TX_CTRL_MLO_LINK);
+ 
++	/* an 802.3 frame names no link, the driver picks it */
++	if (info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP)
++		return false;
++
+ 	if (link_id == IEEE80211_LINK_UNSPECIFIED ||
+ 	    (sdata->vif.type != NL80211_IFTYPE_AP &&
+ 	     sdata->vif.type != NL80211_IFTYPE_AP_VLAN))
