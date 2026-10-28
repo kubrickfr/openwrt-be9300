@@ -37,6 +37,12 @@ BusyBox top, a four-core average, reads far lower.
   second core) for the multi-stream download at 2172 Mbit/s, over the
   acceptance bar of 50%.
 
+With offload the router does not cap the line [meas-U, 2026-10-27]: a PC
+running its own PPPoE session straight on the ONT, its busiest core at
+most 69% busy, got 2080-2107 Mbit/s down and 732-745 up from Ookla's
+server, against 2110-2133 and 761-764 through the router, and 1436 Mbit/s
+in one stream from proof.ovh.net, within the router's 1.3-1.8 Gbit/s.
+
 In scope: IPv4 NAT flows that the nftables flowtable offers with `flags
 offload`; PPPoE over one 802.1Q tag on the PPE WAN port; LAN egress through
 the RTL8372N (rtl8_4 tag), including a VLAN-aware br-lan.
@@ -61,7 +67,8 @@ on a different one, read on 2026-10-26:
 
 - lan1 is a trunk to a managed switch, with every wired client behind it
   (VLAN 1 tagged and PVID, plus VLANs 10 and 20);
-- lan2 to lan4 are untagged VLAN 1 ports and unused;
+- lan2 to lan4 are untagged VLAN 1 ports, unused except by a PC in the
+  port tests of 2026-10-27 (TESTING.md section 0);
 - br-lan's MAC is the conduit's.
 
 | | Download (reply, DNAT) WAN->LAN | Upload (original, SNAT) LAN->WAN |
@@ -100,6 +107,7 @@ where a nexthop inserts one.
 | 8 | qualcommbe: document the PPE flow offload | DESIGN, PROVENANCE, TESTING | François Guerraz |
 | 9 | qualcommbe: ppe: offload by default, switched by fw4 | `0442`, kmod-qcom-ppe menuconfig options | François Guerraz |
 | 10 | qualcommbe: record the live PPE offload bench | DESIGN, PROVENANCE, TESTING, README | François Guerraz |
+| 11 | qualcommbe: record the PPE port tests and the ONT reference | DESIGN, PROVENANCE, TESTING, README | François Guerraz |
 
 `0440` is taken by an unrelated ath12k patch. Every commit builds with `W=1
 -Wmaybe-uninitialized` without a new warning, and also with `NET_DSA=n`.
@@ -399,7 +407,9 @@ follows only learns in VID 1. It only acts on a move between two ports that
 both stay up with no STP change (a client moved between two switches behind
 lan1 and lan4): a move that takes the old port's link down drops the port's
 flows first, through the flowtable's carrier-loss teardown (pending 709) and
-the bridge change above, and the flowtable offers them afresh.
+the bridge change above, and the flowtable offers them afresh. On the live
+line 709 had already removed them when the bridge change came, and the
+connection was back in hardware on the new port at once [meas-U].
 
 ## 6. PPPoE (0438 download, 0439 upload)
 
@@ -590,9 +600,9 @@ section 0); the gates marked "not run" are still open.
 | Id | Hypothesis | Where | If it fails | Live result |
 | --- | --- | --- | --- | --- |
 | HE1 | E (and the port MTU command) alone change nothing for the software path: ARP, DHCP, PPPoE discovery and session, full-size frames, Rx spread | rig, offload on with fw4 HW offload off | disable; DSA egress not used | held (L1, 2026-10-22) |
-| HE2 | The RTL8372N on this tree's driver delivers the emulated frame to the named port only | rig | decline DSA egress | delivered on lan1 (VLAN 1 tagged) at line rate, TTL, source MAC, DSCP and checksums matched software's (2026-10-26). "Only" not checked: one port in use |
+| HE2 | The RTL8372N on this tree's driver delivers the emulated frame to the named port only | rig | decline DSA egress | delivered on lan1 (VLAN 1 tagged) at line rate, TTL, source MAC, DSCP and checksums matched software's (2026-10-26); also on lan2 and lan3, untagged, near line rate in one stream (2026-10-27). "Only" not checked: nothing captured on the other ports |
 | HE2b | Ingress PCP/DEI on the WAN's VLAN tag do not reach W1/W3 | rig, PCP 3/5 and DEI 1 from the fake ISP | decline DSA egress for tagged-WAN ingress | not exercised: the ISP sends PCP 0 |
-| HV1 | VLAN-aware: tagged VID 1 on lan1 and lan4; untagged on a port made an untagged PVID-1 member for the rig (lan2); declined on a software-bridged port (lan4 with `lan4.100` created while out of br-lan) | rig | decline VLAN-aware egress | tagged VID 1 held (lan1). Untagged and software-bridged cases not run |
+| HV1 | VLAN-aware: tagged VID 1 on lan1 and lan4; untagged on a port made an untagged PVID-1 member for the rig (lan2); declined on a software-bridged port (lan4 with `lan4.100` created while out of br-lan) | rig | decline VLAN-aware egress | tagged VID 1 held (lan1); untagged held (lan2 and lan3, untagged PVID-1 ports, 2026-10-27: `vlan1-untagged` flows near line rate, 1821-1880 Mbit/s in one stream, the PC's stack keeping the frames). The second untagged VLAN and software-bridged cases not run |
 | HB | An L3 interface bound to no port (no L3_VP_PORT, MAC_BITMAP 0, routing off), used only as a nexthop's POST_L3_IF, gives the frame its EG_L3_IF source MAC, and its IN_L3_IF MTU is the one checked | rig, R3 (br-lan's own MAC, then the conduit's) | enable routing on slots 24-27 as the vendor does; else decline flows whose source MAC is not the conduit's | not exercised: br-lan's MAC is the conduit's here |
 | HS1 | A valid session entry leaves the session's other frames intact for the CPU | rig: pinned with no flow, then with one offloaded download, 5 min each, across a redial | keep PPPoE in software | held: pinned 300 s with no flow, then 4 days with flows. A redial with 78 flows in hardware was clean (2026-10-27) |
 | HD | Hardware sets DE_ACCE in the flow entry when a de-accelerating exception fires | rig: after a code-0 control that hits, one wrong-code PPPoE frame on an offloaded download idle for 6-20 s; `rearmed_deacce` +1 at once, `rearmed_invalid` flat (software forwards the frame and re-offers the flow); a flat count is judged only with `offload_flows_hw` and the CPU code | staleness falls back to VALID only; a flow so de-accelerated stays in software until destroyed | held: `rearmed_deacce` reached 52 in 4 days. It counts only DE_ACCE bits read from hardware entries. The wrong-code procedure was not run |
@@ -647,6 +657,12 @@ household offline, the operator on Wi-Fi.
   port's carrier loss) and offered afresh; one moved between two ports that
   both stay up is followed only when the bridge learns it again (VID 1 in a
   VLAN-aware bridge), and until then its downloads stay on the old port.
+  Moved from lan2 to lan3 during a download, a client went about 6 s
+  without data: 3.2 s without link, about 1 s before the link was reported
+  down, and about 2 s of the server's retransmission backoff after it was
+  back. It was then back in hardware on lan3 [meas-U]; conntrack showed the
+  connection as `[OFFLOAD]`, not `[HW_OFFLOAD]` (TESTING.md section 0,
+  note 4).
 - Up to 4 PPPoE sessions and 4 bridge MACs; more stay in software.
 - A route's own `mtu` metric is not seen: the flow's PMTU is the egress
   port's MTU capped by the PPP device's, the bridge's and its VLAN 1

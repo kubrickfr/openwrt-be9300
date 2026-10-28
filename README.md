@@ -77,10 +77,13 @@ With this driver, through a PPPoE WAN with software flowtable offload and
 the core split in `packet-steering.sh`: **one TCP download at 2.00–2.16
 Gbit/s** (7 of 8 runs, 2026-10-21), with the forwarding core about 90%
 busy. With PPE hardware offload on the same line, **2.1–2.2 Gbit/s down**
-with several streams and **1.3–2.0 Gbit/s** on one (from proof.ovh.net,
-which varies from run to run). The downloads stay off the CPU: 0.01–0.2%
-of their packets reach it. What the CPU still does is forward the client's
-ACKs in software (the cores doing it at 1.1 GHz):
+with several streams (Ookla's CLI) and **1.3–2.0 Gbit/s** on one (from
+proof.ovh.net, which varies from run to run). The router is not the limit:
+a PC running PPPoE straight on the ONT got 2.08–2.11 Gbit/s down from the
+same Ookla server, and 1.44 Gbit/s from proof.ovh.net in one stream
+(2026-10-27). The downloads stay off the CPU: 0.01–0.2% of their packets
+reach it. What the CPU still does is forward the client's ACKs in
+software (the cores doing it at 1.1 GHz):
 
 - **one stream (2026-10-27):** 14–23% of one core at 1.3–1.8 Gbit/s (the
   two faster runs each include a second of a cron job);
@@ -156,13 +159,19 @@ kmod-qcom-ppe options `KERNEL_QCOM_PPE_FLOW_OFFLOAD` and
 is FTTH, with PPPoE over the ISP's WAN VLAN, 2.2/0.8 Gbit/s. Offload ran there for four days
 (five since the first enable), switched on at runtime and off only once,
 briefly, for a comparison run, with no stuck entry and no fault latched. The LAN side was one VLAN-1-tagged trunk
-to a managed switch. What was checked:
+to a managed switch. After the router was powered off for a reference run
+straight on the ONT, offload was switched on again at runtime for two
+tests with a PC plugged straight into the untagged ports `lan2` and
+`lan3`. What was checked:
 
 - the switch-side tag emulation alone leaves the software path as it was;
 - a PPPoE session in hardware keeps LCP and other session traffic going;
-- downloads leave the CPU path and reach line rate;
+- downloads leave the CPU path and reach line rate; out of the untagged
+  ports `lan2` and `lan3` too (one stream, 1.8–1.9 Gbit/s);
 - forwarded frames match software's: TTL, MAC, DSCP, checksums;
-- a firewall reload and a WAN redial with flows in hardware.
+- a firewall reload and a WAN redial with flows in hardware;
+- a client re-cabled from `lan2` to `lan3` mid-download: its flows were
+  torn down and went back into hardware on `lan3`.
 
 Not validated:
 
@@ -173,8 +182,8 @@ Not validated:
 - **The first boot with the defaults on.** Offload then starts at probe,
   before the switch attaches; every test above switched it on at runtime.
 - **Other LAN and WAN layouts.** These were never offloaded:
-  - untagged LAN ports and a VLAN-unaware `br-lan`, which is OpenWrt's
-    default layout;
+  - a VLAN-unaware `br-lan`, which is OpenWrt's default layout (the
+    untagged ports of a VLAN-aware one were);
   - a WAN without PPPoE (DHCP or static).
 - **Other boards, other ISPs and IPv6.** IPv6 is not offloaded.
 
@@ -235,7 +244,11 @@ hardware offloading for every flow the PPE declines.
   down, because the bridge had learned the client on `lan4`. Pending patch
   709 tears flows down when their port loses carrier or joins or leaves a
   bridge, so the next packet takes the bridge and the flow is set up again.
-  708, 709 and 767-01/02 are not yet tested on hardware.
+  709's carrier-loss case ran on hardware on 2026-10-27, with PPE offload
+  on: a client re-cabled from `lan2` to `lan3` mid-download had its flows
+  set up again through `lan3` (`TESTING.md` section 0 in
+  `target/linux/qualcommbe/docs/ppe-flow-offload/`). 708, 767-01/02 and
+  709's bridge join and leave cases are not yet tested on hardware.
 - Known limit of sending flows straight to the ports: a station that moves
   to another switch port, or between a switch port and the router's own
   Wi-Fi, without changing address and while its old port keeps carrier,
