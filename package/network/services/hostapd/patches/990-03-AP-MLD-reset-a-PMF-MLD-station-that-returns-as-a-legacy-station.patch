@@ -1,0 +1,42 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] AP MLD: reset a PMF non-AP MLD that returns as a legacy
+ station
+
+A non-AP MLD with a PMF association can authenticate again as a legacy
+station from its MLD address, for example after it lost its keys.
+handle_auth() then clears its ML information but keeps the state machine
+of the protected association, and the partner link stations stay.
+
+Once the SA Query of the association times out, handle_assoc() resets
+the earlier association only for an MLD station, so the legacy request
+reuses the ML state machine: M1 carries the MLD MAC Address KDE and an
+M2 without it is refused, and the station cannot connect until the
+earlier association expires.
+
+Also reset the earlier association, as for an MLD station, for a
+station of an AP MLD whose SA Query timed out. ap_sta_re_add() then
+frees the partner link stations of the earlier association.
+
+Based on JiaY-shi's "AP: clean up stale MLD links after SA Query
+timeout", which is otherwise covered by patches 181 and 876.
+
+Assisted-by: LLM
+---
+ src/ap/ieee802_11.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -7825,7 +7825,11 @@ static void handle_assoc(struct hostapd_
+ 	 * and FILS keep keys of the authentication in the state machine, so
+ 	 * only Open System and SAE authentication are covered.
+ 	 */
+-	if (hapd->conf->wpa && ap_sta_is_mld(hapd, sta) &&
++	if (hapd->conf->wpa &&
++	    (ap_sta_is_mld(hapd, sta) ||
++	     /* a non-AP MLD that comes back as a legacy station */
++	     (hapd->conf->mld_ap && (sta->flags & WLAN_STA_MFP) &&
++	      sta->sa_query_timed_out)) &&
+ 	    ((sta->flags & WLAN_STA_ASSOC) ||
+ 	     ((sta->flags & WLAN_STA_MFP) && sta->sa_query_timed_out)) &&
+ 	    FULL_AP_CLIENT_STATE_SUPP(hapd->iface->drv_flags) &&

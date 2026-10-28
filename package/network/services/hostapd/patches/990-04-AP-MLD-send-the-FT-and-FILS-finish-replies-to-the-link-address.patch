@@ -1,0 +1,50 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] AP MLD: send the FT and FILS finish replies to the link
+ address
+
+The FT and FILS authentication of a non-AP MLD can finish after
+handle_auth() returns. Their replies then go to the MLD address, the
+address of the state machine or the station entry, while the other
+Authentication replies go to the link address of the station
+(ap_sta_link_addr()), as patch 193 does.
+
+Send them to the link address too.
+
+Based on JiaY-shi's "AP: fix same-band MLD reauthentication state".
+
+Assisted-by: LLM
+---
+ src/ap/ieee802_11.c | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -555,11 +555,13 @@ static void handle_auth_ft_finish(void *
+ 	struct sta_info *sta;
+ 	int reply_res;
+ 
+-	reply_res = send_auth_reply(hapd, NULL, dst, WLAN_AUTH_FT,
+-				    auth_transaction, status, ies, ies_len,
+-				    "auth-ft-finish");
+-
++	/* dst is the MLD address of a non-AP MLD */
+ 	sta = ap_get_sta(hapd, dst);
++	reply_res = send_auth_reply(hapd, NULL,
++				    sta ? ap_sta_link_addr(hapd, sta) : dst,
++				    WLAN_AUTH_FT, auth_transaction, status,
++				    ies, ies_len, "auth-ft-finish");
++
+ 	if (sta == NULL)
+ 		return;
+ 
+@@ -3367,8 +3369,8 @@ static void handle_auth_fils_finish(stru
+ 	auth_alg = (pub ||
+ 		    resp == WLAN_STATUS_FINITE_CYCLIC_GROUP_NOT_SUPPORTED) ?
+ 		WLAN_AUTH_FILS_SK_PFS : WLAN_AUTH_FILS_SK;
+-	send_auth_reply(hapd, sta, sta->addr, auth_alg, 2, resp,
+-			data ? wpabuf_head(data) : (u8 *) "",
++	send_auth_reply(hapd, sta, ap_sta_link_addr(hapd, sta), auth_alg, 2,
++			resp, data ? wpabuf_head(data) : (u8 *) "",
+ 			data ? wpabuf_len(data) : 0, "auth-fils-finish");
+ 	wpabuf_free(data);
+ 
