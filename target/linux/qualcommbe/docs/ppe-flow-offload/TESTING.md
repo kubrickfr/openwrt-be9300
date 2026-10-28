@@ -26,7 +26,8 @@ the session is `pppoe-wan` on `wan.<vid>`, `<vid>` being the ISP's WAN VLAN ID. 
 - The live bench ran on a different layout, read on 2026-10-26:
   - lan1 is a trunk (VLAN 1 tagged and PVID, plus 10 and 20) to a managed
     switch, with every wired client behind it;
-  - lan2 to lan4 are untagged VLAN 1 ports and unused;
+  - lan2 to lan4 are untagged VLAN 1 ports, unused except by the PC in
+    the port tests of 2026-10-27;
   - br-lan's MAC is the conduit's.
 
 ## 0. Bench record
@@ -37,8 +38,9 @@ the session is `pppoe-wan` on `wan.<vid>`, `<vid>` being the ISP's WAN VLAN ID. 
 - **Images:** r37585-0e253b519f, flashed 2026-10-22. Then
   r37586-b82b97e5be from 2026-10-23 13:30, which adds the generic
   backports 651-01/02.
-- **Client:** a PC behind the managed switch on lan1, on a 2.5G USB
-  adapter.
+- **Client:** a PC on a 2.5G USB adapter, behind the managed switch on
+  lan1; for the port tests of 2026-10-27, plugged straight into lan2,
+  then lan3.
 - **Rig:** not built.
 - **How offload was switched on:** at runtime in every phase. Both
   parameters were written, and fw4's `flow_offloading_hw` set without a
@@ -57,7 +59,10 @@ the session is `pppoe-wan` on `wan.<vid>`, `<vid>` being the ISP's WAN VLAN ID. 
 | 2026-10-26 | HE2, frames | PC capture of a download; bounded router captures of what the CPU forwarded (section 6.6) | Pass in 5 runs (see note 1) |
 | 2026-10-26 | R5, `fw4 reload` | `fw4 reload` 8 s into a 20 s download: 5 runs with offload (one with captures), 1 without | Driver pass, but every download stalled with offload on (see note 2) |
 | 2026-10-27 | R5, session loss | `ifup wan` during a download | Pass (see note 3) |
-| - | Not run | R4/HP1 (what must not hit, including the VLAN residual); HE2b; HV1 untagged and software-bridged; HB; HM with UDP; the HD procedure; R5 disable under load; bridge VLAN change and client move (no router-visible move on this LAN); R6 profile A (H0, HP2); R7 | Open |
+| 2026-10-27 | Reference: the router out of the path | The router powered off, the PC straight on the ONT with its own PPPoE session (MTU 1492), running the L4 tests: Ookla twice on the same server, one 20 s proof.ovh.net stream. Offload, not persisted, was switched on again at runtime after the reboot for the rows below | Ookla 2080 and 2107 Mbit/s down, 745 and 732 up, against 2110-2133 and 761-764 through the router with offload (the r37586 L4 row). One stream: 1436 Mbit/s, inside the router's 1302-1786. The PC's busiest core peaked at 69% busy, so the PC was not the limit: the router does not cap the line |
+| 2026-10-27 | HV1 untagged; HE2 on another port | A 30 s download to the PC on lan2, an untagged PVID-1 port (switch port 6) | Pass: in hardware towards port 6, untagged, at both reads (`dsa_port 6 vlan1-untagged`, conntrack `[HW_OFFLOAD]`). 1880 Mbit/s on average, about 1.95 Gbit/s once ramped up (2.0-2.1 at the PC's adapter, headers included); 0.13% of the download's packets reached the CPU. The PC's adapter received about 1.05 bytes per byte curl kept (1.048 over the client move's download; this run's sampler stopped 0.4 s before curl and reads 1.036), what Ethernet, IP, TCP and TLS headers add: the PC's stack kept the frames, as it would not with a wrong tag. No driver line, `stuck 0` |
+| 2026-10-27 | R5, client move | A download of up to 60 s to the PC on lan2; at a prompt 10 s in, its cable was moved by hand to lan3 (switch port 5), coming out about 15 s in | Pass (see note 4) |
+| - | Not run | R4/HP1 (what must not hit, including the VLAN residual); HE2b; HV1's second untagged VLAN and software-bridged cases; HB; HM with UDP; the HD procedure; R5 disable under load, bridge VLAN change, a move between two ports that both stay up (the FDB follower), a move to Wi-Fi, and the session-loss breaker (two losses within a minute); R6 profile A (H0, HP2); R7 | Open |
 
 1. **HE2, frames.** PPE-forwarded frames carry the same TTL, source MAC
    and DSCP as the packets software routed in the same connection (the
@@ -83,6 +88,29 @@ the session is `pppoe-wan` on `wan.<vid>`, `<vid>` being the ISP's WAN VLAN ID. 
    A flow for the old IP was declined. The next download ran at 1.83
    Gbit/s with 0.11% of its packets on the CPU. The WAN-up hotplug caused
    two `fw4 reload`s.
+4. **Client move.** lan3 came up 3.2 s after lan2 went down, and the PC
+   kept its address. No data arrived for about 6 s, from about 1 s before
+   either end reported the link down to about 2 s after it was back (the
+   server's retransmission backoff). Then about 1.95 Gbit/s again (2.0-2.1
+   at the PC's adapter), and curl completed its 10.7 GB in 51 s.
+   - The connection went back into hardware towards lan3 at once: the PPE
+     held it on port 5 (2.3 GB at the read 22 s after the move prompt,
+     5.4 GB 10 s later), and 0.05% of the run's 7.4M download packets
+     reached the CPU. `stuck 0`, no warning, no `moved to`.
+   - There was no `bridge change` line either. 709's carrier-loss teardown
+     had taken lan2's flows out of hardware before lan2's STP state change
+     reached the driver, so its flush found nothing to drop (it logs only
+     a count above 0).
+   - Conntrack showed the connection as `[OFFLOAD]`, not `[HW_OFFLOAD]`,
+     at all three reads after the move, while the PPE forwarded it. A
+     fresh 20 s download on lan3 showed `[HW_OFFLOAD]` (1821 Mbit/s, 0.07%
+     on the CPU). Why is not known. The kernel sets that bit only from a
+     flow's add work, when a driver accepts the flow, and a re-offer that
+     the driver answers with -EEXIST (the flow already in hardware) does
+     not set it. The old flow's delete work, which clears it, ran inside
+     709's carrier-loss teardown, 3.2 s before lan3 came up, so it cannot
+     have undone the add of the flow towards lan3. After a teardown, judge
+     by `offload_flows` and the CPU-path count, not by the flag.
 
 ## 1. Safety envelope
 
@@ -186,7 +214,9 @@ both after every upgrade.
 
 Allowed: `/proc/stat`, `/proc/softirqs`, `/proc/interrupts`, `cat
 /sys/kernel/debug/ppe/offload_flows` and `offload_profile` (driver memory,
-no register read), `conntrack -L`, `nft list flowtables`, and a bounded,
+no register read), `conntrack -L` (or `/proc/net/nf_conntrack`), `nft list
+flowtables`, `bridge fdb get <MAC> br br-lan vlan 1` (the bridge's own
+table; `bridge fdb show` also reads the switch's over MDIO), and a bounded,
 filtered `tcpdump` (`timeout 70 tcpdump -c N ...`) on an interface whose
 traffic reaches the CPU only at a low rate. Not under load (register
 reads): `offload_flows_hw`, the PPE debugfs counters (`cpu_code`,
@@ -505,15 +535,20 @@ stop-line message is not read again.
   in hardware within seconds; delete VID 30.
 - Client move: re-cabling geekom from lan1 to lan4 during a download takes
   lan1's link down: the flowtable tears the flow down on carrier loss
-  (pending 709) and the driver logs `bridge change: N port-addressed
-  flow(s) back to software`. Once geekom is up on lan4 the download
-  resumes: back in hardware towards lan4 (`offload_flows` names lan4's
-  port) if the flow is offered after the bridge learned geekom there,
-  otherwise in software for the rest of the connection. No `moved to`
-  line is expected; pass is no stall beyond the link-up time. The FDB
-  follower itself needs a move with no link or STP change on either
-  router port (geekom behind an unmanaged switch on lan1 moved to one
-  already up on lan4): only then `moved to lan4: N flow(s) re-pointed`.
+  (pending 709). The driver logs `bridge change: N port-addressed flow(s)
+  back to software` only if some of lan1's flows are still in hardware
+  when lan1's STP state change reaches it; on the live line 709 had
+  removed them first (section 0, note 4). Once geekom is up on lan4 the
+  download resumes: back in hardware towards lan4 (`offload_flows` names
+  lan4's port) if the flow is offered after the bridge learned geekom
+  there, otherwise in software for the rest of the connection. No `moved
+  to` line is expected; pass is data again at the sender's first
+  retransmission after lan4's link-up. Conntrack may then show the
+  connection as `[OFFLOAD]` while the PPE forwards it: judge by
+  `offload_flows` and the CPU-path count. The FDB follower itself needs a
+  move with no link or STP change on either router port (geekom behind an
+  unmanaged switch on lan1 moved to one already up on lan4): only then
+  `moved to lan4: N flow(s) re-pointed`.
   To Wi-Fi: the flow continues in software.
 - Session loss: `ifdown wan; sleep 5; ifup wan`: `PPPoE session <S> out of
   hardware (device down): N flow(s) back to software`, then a new session.
@@ -632,7 +667,9 @@ from the plan:
 - curl 8.23 ignores `--local-port` when `--interface` names a device. A
   fixed client port needs `--interface <address>`.
 - On r37586 the single stream reached only 1.3-1.8 Gbit/s, short of line
-  rate, so its CPU figure is for that rate.
+  rate, so its CPU figure is for that rate. The PC straight on the ONT got
+  1436 Mbit/s from the same server that day (section 0): the shortfall is
+  the server's or its path's, not the router's.
 
 ### 6.5 Soak, then keep
 
@@ -681,6 +718,27 @@ These ran on 2026-10-26 and 2026-10-27; section 0 has the results.
 - **Session loss.** `ifup wan` during a download. Detect the new session
   by `pppoe-wan`'s ifindex: the concentrator may hand out the same session
   ID again.
+- **An untagged port (HV1, HE2 on another port).** The PC plugged straight
+  into lan2, an untagged PVID-1 member of br-lan and one of the
+  flowtable's devices (`fw4 reload` lists only the ports in br-lan at the
+  time). A 30 s download from proof.ovh.net with a fixed client port;
+  during it,
+  `offload_flows`, `bridge fdb get <PC's MAC> br br-lan vlan 1` and the
+  connection's line in `/proc/net/nf_conntrack`. Pass: the flow in
+  hardware towards lan2's switch port, `vlan1-untagged`, near line rate, a
+  small `ethtool -S wan` rx_packets delta, and the PC's adapter receiving
+  little more than the headers over what curl kept. A wrong port bit sends
+  the download elsewhere (curl gets almost nothing); a wrong tag gives
+  frames the PC receives and drops.
+- **Client move (R5).** As in section 5.5, from lan2 to lan3 (set up like
+  lan2), the cable moved by hand at a prompt 10 s into a download of up to
+  60 s. STP is off on br-lan, so lan3 forwards as soon as its link is up,
+  and NetworkManager keeps the PC's address for 6 s without carrier. The
+  PC reaches the router over Wi-Fi through a host route, so the reads go
+  on while the cable is out. The PC samples its adapter's receive bytes
+  and carrier every 0.5 s; the router is read 8 s in, then 12, 22 and 32 s
+  after the prompt. A fresh 20 s download started on lan3 afterwards is
+  the control for conntrack's flag.
 
 ## 7. What to capture
 
@@ -702,5 +760,7 @@ the idle-time counter reads, and after a crash `/sys/fs/pstore/*`.
 - IPv6, Wi-Fi clients and VLANs 10/20 stay in software.
 - A download running at line rate during `fw4 reload` stalls for 0.5-5 s
   (section 0, DESIGN.md section 11).
+- After a flow is torn down and set up again (a client move), conntrack
+  may show it as `[OFFLOAD]` while the PPE forwards it (section 0, note 4).
 - `declined` counts offers, not flows: each active flow's upload half is
   declined about once a second, by each of the two bound callbacks.
