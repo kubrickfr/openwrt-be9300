@@ -71,11 +71,19 @@ static int rtl8372n_soft_reset_chip(struct rtl837x_priv *priv)
 
 }
 
+/*
+ * The tagger follows the svlan parameter latched at probe (WP1-DESIGN D1):
+ * rtl8_4 by default, the rtl8_4s hybrid with svlan=1. There is no
+ * change_tag_protocol, so writes to the conduit's "tagging" are refused and
+ * a change applies at the next bind.
+ */
 static enum dsa_tag_protocol rtl8372n_get_tag_protocol(struct dsa_switch *ds,
 							int port,
 							enum dsa_tag_protocol mp)
 {
-	return DSA_TAG_PROTO_RTL8_4;
+	struct rtl837x_priv *priv = ds->priv;
+
+	return priv->sv.enabled ? DSA_TAG_PROTO_RTL8_4S : DSA_TAG_PROTO_RTL8_4;
 }
 
 static int rtl8372n_mdio_phy_read_c45(struct mii_bus *bus, int port, int devad, int regnum)
@@ -446,16 +454,13 @@ static int rtl8372n_set_tag_rtl(struct dsa_switch *ds)
 	if (!cpu_dp)
 		return -ENODEV;
 
-	/* Set external CPU DSA tag insert mode. */
 	/*
-	 *	CPU_INSERT_TO_ALL = 0,
-	 *	CPU_INSERT_TO_TRAPPING,
-	 *	CPU_INSERT_TO_NONE,
-	 *	CPU_INSERT_END
+	 * Every frame to the CPU carries the tag. S-R steering moves this to
+	 * TRAPPING while armed, and its disarm and off values put it back.
 	 */
 	ret = rtl837x_reg_bits_write(priv, RTL837X_CPU_TAG_CTRL,
-			  RTL837X_CPU_TAG_INSERT_MODE, 0
-			);
+				     RTL837X_CPU_TAG_INSERT_MODE,
+				     RTL837X_CPU_TAG_INSERT_ALL);
 	if (ret)
 		return ret;
 
@@ -804,6 +809,12 @@ void rtl8372n_disable_offload(struct rtl837x_priv *priv, const char *reason)
 static int rtl8372n_port_prechangeupper(struct dsa_switch *ds, int port,
 					struct netdev_notifier_changeupper_info *info)
 {
+	int ret;
+
+	/* svlan=1: reserved 8021q VIDs, and 802.1ad while armed. */
+	ret = rtl8372n_svlan_prechangeupper(ds, port, info);
+	if (ret)
+		return ret;
 	if (!info->linking || !is_vlan_dev(info->upper_dev) ||
 	    !dsa_port_bridge_dev_get(dsa_to_port(ds, port)))
 		return 0;
@@ -981,6 +992,8 @@ static void rtl8372n_port_bridge_leave(struct dsa_switch *ds, int port,
 
 	if (!dsa_is_user_port(ds, port))
 		return;
+	/* Armed S-R steering only warns (lock-free); WP2 declines the port. */
+	rtl8372n_svlan_topology_note(ds, port);
 
 	mutex_lock(&priv->vlan_lock);
 	unlinked = !rtl8372n_port_unlink(ds, port);
@@ -1245,6 +1258,8 @@ static void rtl8372n_report_p0_readback(struct dsa_switch *ds, u16 members)
 	if (!offload)
 		rtl8372n_disable_offload(priv, "VLAN readback mismatch");
 	rtl8372n_l2_report_readback(ds);
+	/* S block off, entries 3900-3919 empty; setup acted on the off values. */
+	rtl8372n_svlan_report(priv);
 }
 
 static int rtl8372n_configure_sds_polarity(struct rtl837x_priv *priv)
@@ -1338,7 +1353,12 @@ static void rtl8372n_quiesce(struct dsa_switch *ds)
 	struct rtl837x_priv *priv = ds->priv;
 	int port, ret;
 
-	/* Best effort on setup failure/teardown; never hide the first error. */
+	/*
+	 * Best effort on setup failure/teardown; never hide the first error.
+	 * The S-VLAN off values first, the uplink first of all; tagger_data
+	 * and the S-R control state are not touched.
+	 */
+	rtl8372n_svlan_quiesce(priv);
 	for (port = 0; port <= RTL8372N_INTERNAL_CPU_PORT; port++) {
 		ret = rtl8372n_port_set_isolation(priv, port, 0);
 		if (ret)
@@ -1412,6 +1432,25 @@ module_param_named(offload, rtl8372n_offload, bool, 0444);
 MODULE_PARM_DESC(offload,
 		 "Offload a bridge to the switch (default set at build time); 0 keeps every bridge in software");
 
+/*
+ * S-R steering (rtl8372n_svlan.c). svlan is latched at probe and decides the
+ * tagger: 1 binds rtl8_4s, which needs the tag_rtl8_4.ko of the same build
+ * (without it the probe defers forever and the wired LAN stays down; reload
+ * with svlan=0 over Wi-Fi). Arming is then a debugfs control. 0 keeps
+ * rtl8_4 and today's behaviour, apart from the S-VLAN off values setup
+ * writes and checks either way.
+ */
+bool rtl8372n_svlan_param;
+module_param_named(svlan, rtl8372n_svlan_param, bool, 0644);
+MODULE_PARM_DESC(svlan,
+		 "S-R steering: 1 binds the rtl8_4s tagger and allows arming (read at bind); 0 (default) keeps rtl8_4");
+
+bool rtl8372n_svlan_shutdown_disarm = true;
+module_param_named(svlan_shutdown_disarm, rtl8372n_svlan_shutdown_disarm,
+		   bool, 0644);
+MODULE_PARM_DESC(svlan_shutdown_disarm,
+		 "Disarm S-R steering at shutdown (default 1)");
+
 static int rtl8372n_setup(struct dsa_switch *ds)
 {
 	struct rtl837x_priv *priv = ds->priv;
@@ -1440,9 +1479,24 @@ static int rtl8372n_setup(struct dsa_switch *ds)
 	ds->max_num_bridges = 1;
 	ds->fdb_isolation = false;
 	ds->assisted_learning_on_cpu_port = true;
+	/* Whether the chip reset clears the S-VLAN block: logged on both sides. */
+	rtl8372n_svlan_setup_pre_reset(priv);
 	ret = rtl8372n_soft_reset_chip(priv);
 	if (ret)
 		return dev_err_probe(priv->dev, ret, "failed to reset switch\n");
+	/*
+	 * The S-VLAN off values, svlan=0 too. An uplink that stays armed
+	 * S-tags every CPU-bound frame, which no tagger delivers before an
+	 * arm: that fails setup (WP1-DESIGN D13). Another off field that
+	 * stays set only turns offload off and latches S-R FAULT off_inert.
+	 */
+	ret = rtl8372n_svlan_setup_post_reset(priv);
+	if (ret) {
+		/* §5's stop regex: "svlan: S-VLAN uplink not cleared". */
+		ret = dev_err_probe(priv->dev, ret,
+				    "svlan: S-VLAN uplink not cleared\n");
+		goto fail;
+	}
 
 	for (port = 3; port <= 8; port += 5) {
 		chip_data->pcs[port].pcs.ops = &rtl8372n_sds_pcs_ops;

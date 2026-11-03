@@ -18,4 +18,5 @@ ccflags-$(CONFIG_RTL837X_DSA_OFFLOAD) += -DRTL8372N_OFFLOAD_DEFAULT=1
 
 obj-$(CONFIG_RTL837X_DSA) += rtl8372n_dsa.o
 rtl8372n_dsa-objs := rtl8372n.o rtl837x_mdio.o rtl837x_common.o \
-		     rtl837x_table.o rtl8372n_l2.o rtl8372n_vlan.o
+		     rtl837x_table.o rtl8372n_l2.o rtl8372n_vlan.o \
+		     rtl8372n_svlan.o rtl8372n_svlan_seq.o

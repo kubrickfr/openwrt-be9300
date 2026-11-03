@@ -458,6 +458,13 @@ int rtl8372n_port_vlan_filtering(struct dsa_switch *ds, int port,
 
 	if (!dsa_is_user_port(ds, port))
 		return 0;
+	/*
+	 * Armed S-R steering only warns (lock-free); WP2 declines the port.
+	 * A port leaving the bridge has no bridge here any more: DSA resets
+	 * its filtering after port_bridge_leave, which noted it already.
+	 */
+	if (!vlan_filtering && dsa_port_bridge_dev_get(dsa_to_port(ds, port)))
+		rtl8372n_svlan_topology_note(ds, port);
 
 	mutex_lock(&priv->vlan_lock);
 	ret = rtl8372n_port_unlink(ds, port);
@@ -533,6 +540,11 @@ static int rtl8372n_vlan_check(struct dsa_switch *ds, int port, u16 vid,
  * VLAN: an add without the PVID flag for the current PVID removes it. A
  * failed add leaves the shadow and, as far as the hardware allows, the
  * switch as they were.
+ *
+ * With svlan=1, VIDs 3900-3919 are reserved for S-R steering (WP1-DESIGN
+ * D5): user and host adds are refused with -EINVAL, not -EOPNOTSUPP, so
+ * that the bridge does not fall back to a software VLAN whose CPU path the
+ * tagger drops (inner reserved C-VIDs).
  */
 int rtl8372n_port_vlan_add(struct dsa_switch *ds, int port,
 			   const struct switchdev_obj_port_vlan *vlan,
@@ -549,6 +561,11 @@ int rtl8372n_port_vlan_add(struct dsa_switch *ds, int port,
 	ret = rtl8372n_vlan_check(ds, port, vid, extack);
 	if (ret || !vid)
 		return ret;
+	if (rtl8372n_sv_vid_reserved(priv, vid)) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "VLANs 3900-3919 are reserved for S-R steering");
+		return -EINVAL;
+	}
 
 	mutex_lock(&priv->vlan_lock);
 	old = state->entry[vid];
@@ -650,6 +667,12 @@ int rtl8372n_port_vlan_del(struct dsa_switch *ds, int port,
 	ret = rtl8372n_vlan_check(ds, port, vid, NULL);
 	if (ret || !vid)
 		return ret;
+	/*
+	 * A reserved VID was never added (svlan=1): no shadow entry is ever
+	 * committed over a driver-owned S-R entry.
+	 */
+	if (rtl8372n_sv_vid_reserved(priv, vid))
+		return 0;
 
 	mutex_lock(&priv->vlan_lock);
 	/* The delete's own result, not the check's 0 carried over. */
@@ -707,6 +730,48 @@ int rtl8372n_port_vlan_drop_stale(struct dsa_switch *ds, int port)
 			return ret;
 	}
 	return 0;
+}
+
+/*
+ * For the S-R arm's collision check (rtl8372n_svlan.c), vlan_lock held: the
+ * first VID in @first..@last that has a member in the shadow, or 0.
+ */
+u16 rtl8372n_vlan_shadow_used(struct rtl837x_priv *priv, u16 first, u16 last)
+{
+	struct rtl8372n_vlan *state = priv->vlan;
+	unsigned int vid;
+
+	lockdep_assert_held(&priv->vlan_lock);
+
+	if (!state || last >= VLAN_N_VID)
+		return 0;
+	for (vid = first; vid <= last; vid++)
+		if (state->entry[vid].member)
+			return vid;
+	return 0;
+}
+
+/*
+ * The same, vlan_lock held: a user port whose bridge PVID is in
+ * @first..@last (*@pvid gets it), or -1.
+ */
+int rtl8372n_vlan_pvid_in(struct rtl837x_priv *priv, u16 first, u16 last,
+			  u16 *pvid)
+{
+	struct rtl8372n_vlan *state = priv->vlan;
+	int port;
+
+	lockdep_assert_held(&priv->vlan_lock);
+
+	if (!state)
+		return -1;
+	for (port = 0; port < RTL8372N_NUM_PORTS; port++) {
+		if (state->pvid[port] >= first && state->pvid[port] <= last) {
+			*pvid = state->pvid[port];
+			return port;
+		}
+	}
+	return -1;
 }
 
 static void rtl8372n_vlan_free(void *data)

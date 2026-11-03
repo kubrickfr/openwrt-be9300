@@ -15,6 +15,8 @@
 #include <net/dsa.h>
 
 #include "rtl837x_regmap.h"
+/* Includes <linux/dsa/rtl8_4s.h> whole (no RTL8_4S_PURE here). */
+#include "rtl8372n_svlan_seq.h"
 
 #define MDC_MDIO_CTRL_REG   RTL837X_SMI_MDIO_CTRL_REG
 #define MDC_MDIO_ADDR_REG   RTL837X_SMI_MDIO_ADDR_REG
@@ -58,6 +60,32 @@ static inline enum rtl8372n_vlan_mode rtl8372n_vlan_mode(bool aware)
 {
 	return aware ? RTL8372N_VLAN_MODE_AWARE : RTL8372N_VLAN_MODE_UNAWARE;
 }
+
+/*
+ * S-R steering (rtl8372n_svlan.c, WP1-DESIGN §4). Lock order: RTNL -> lock
+ * -> vlan_lock -> table_lock -> map_lock -> MII bus; fdb_lock is never taken
+ * under lock. Nothing takes RTNL while holding lock. The deadline work takes
+ * lock only, and under lock only the non-sync cancel_delayed_work() and
+ * mod_delayed_work() are used.
+ */
+struct rtl8372n_svlan {
+	struct mutex lock;
+	/* The svlan module parameter, latched at probe: rtl8_4s is bound. */
+	bool enabled;
+	/*
+	 * The control window (lock): set once debugfs exists after
+	 * dsa_register_switch(), cleared first by rtl8372n_svlan_ctl_stop().
+	 * The rtl8_4s tagger_data is valid inside it.
+	 */
+	bool ctl_ready;
+	/* The state machine (lock); seq.state is also read lock-free. */
+	struct sv_seq seq;
+	/* The deadline, and the disarm retry after FAULT disarm_incomplete. */
+	struct delayed_work deadline;
+	/* Ports that left the VLAN-aware bridge while armed (lock-free). */
+	atomic_t topo_warn;
+	struct dentry *dir;
+};
 
 struct rtl837x_ops;
 struct rtl8372n_vlan;
@@ -108,6 +136,7 @@ struct rtl837x_priv {
 	struct dsa_switch *ds;
 	const struct rtl837x_ops *ops;
 	int (*write_reset)(struct rtl837x_priv *priv);
+	struct rtl8372n_svlan sv;
 	void *chip_data;
 };
 
@@ -249,6 +278,33 @@ bool rtl8372n_report_p0_reg(struct rtl837x_priv *priv, const char *name,
 void rtl8372n_report_p0_value(struct rtl837x_priv *priv, const char *name,
 			      u32 reg);
 void rtl8372n_disable_offload(struct rtl837x_priv *priv, const char *reason);
+u16 rtl8372n_vlan_shadow_used(struct rtl837x_priv *priv, u16 first, u16 last);
+int rtl8372n_vlan_pvid_in(struct rtl837x_priv *priv, u16 first, u16 last,
+			  u16 *pvid);
+
+/* The svlan and svlan_shutdown_disarm module parameters (rtl8372n.c). */
+extern bool rtl8372n_svlan_param;
+extern bool rtl8372n_svlan_shutdown_disarm;
+
+void rtl8372n_svlan_probe_init(struct rtl837x_priv *priv);
+void rtl8372n_svlan_ctl_start(struct rtl837x_priv *priv);
+void rtl8372n_svlan_ctl_stop(struct rtl837x_priv *priv, bool shutdown);
+void rtl8372n_svlan_setup_pre_reset(struct rtl837x_priv *priv);
+int rtl8372n_svlan_setup_post_reset(struct rtl837x_priv *priv);
+void rtl8372n_svlan_quiesce(struct rtl837x_priv *priv);
+void rtl8372n_svlan_report(struct rtl837x_priv *priv);
+int rtl8372n_svlan_arm(struct rtl837x_priv *priv, unsigned int deadline_s);
+int rtl8372n_svlan_disarm(struct rtl837x_priv *priv, bool force);
+int rtl8372n_svlan_prechangeupper(struct dsa_switch *ds, int port,
+				  struct netdev_notifier_changeupper_info *info);
+void rtl8372n_svlan_topology_note(struct dsa_switch *ds, int port);
+
+/* D5: with svlan=1, bridge and host VLANs 3900-3919 are refused. */
+static inline bool rtl8372n_sv_vid_reserved(const struct rtl837x_priv *priv,
+					    u16 vid)
+{
+	return priv->sv.enabled && rtl8_4s_vid_reserved(vid);
+}
 
 extern const struct rtl837x_variant rtl8372n_variant;
 

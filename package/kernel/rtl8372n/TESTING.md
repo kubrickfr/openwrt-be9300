@@ -392,3 +392,92 @@ config bridge-vlan
   to :10, :20, :21, CDP, SSTP and PTP were dropped (3.3).
 - VID 1 and priority-tagged frames reach Linux tagged: a host tagging VID 1
   needs a VLAN-aware br-lan with VID 1 untagged PVID, or a `lanN.1` upper.
+
+## 8. S-R steering mode (`svlan=1`)
+
+`rtl8372n_dsa.svlan=1`, latched at probe, binds the `rtl8_4s` tagger of
+patch 0460 instead of `rtl8_4` (`tagging` writes are refused either way).
+`/sys/kernel/debug/rtl8372n/svlan` then arms (`arm <deadline_s>`, 30-86400)
+and disarms (`disarm`, `disarm force`) with the LAN up, and reads the S block
+back (idle only); `svlan_counters` reads memory only and may be read under
+load. With `svlan=0` (the default) the driver is the offload driver plus the
+S block off writes at setup and quiesce, and setup fails if the S-VLAN uplink
+cannot be cleared. VIDs 3900-3919 are refused on bridge ports, the host and
+8021q uppers while `svlan=1`.
+
+### 8.1 Desk record (2026-11-02, D4 2026-11-03; no hardware)
+
+| # | What | Result |
+| --- | --- | --- |
+| D1 | 0460 applies after 0432 in the build tree; kernel and package built (`-Werror`, debug and offload on); W=1 on `tag_rtl8_4` and the driver; checkpatch `--strict` | 0 compiler warnings; vmlinux build ID and `Module.symvers` unchanged, vermagic equal to the image's; 0460 clean; the driver's checkpatch findings (volatile store and `__attribute__((format))` for the user-space build, macro argument reuse, two cosmetic checks, MAINTAINERS) justified; sparse absent |
+| D2 | Classifier harness: 200 frame vectors (27 captured at the conduit in the S-R windows) under every accept, s_ports and hwaccel, 92 hand cases, the dissector, the state word. Receive glue harness: the real `rtl8_4s_tag_rcv()`, `rtl8_4_tag_rcv()` and counters on an sk_buff model with exact-size heads and pulls that move the head, six linear layouts per frame; a conduit teardown that clears `dsa_ptr` inside rcv | all pass under ASan/UBSan; the glue harness fails on each of nine injected glue bugs |
+| D3 | Switch harness: arm, disarm, retry and deadline sequences on a fake regmap with a fault at every I/O; deadlines from 30 s to 86400 s in steps of at most 30 s against a model of the timer wheel; REMOVE and SHUTDOWN never queue the work; the topology notes' predicate; the state-word race on threads; `svlan_counters` makes no register access; the contract header is 0460's | all pass under ASan/UBSan; fails on each of five injected sequence bugs |
+| D4 | Lifetime and concurrency review (tagger connect/disconnect, control window, deadline work, shutdown order), one Codex and one Claude round | done: an S-tag's user port is found from the CPU port rcv loaded (the conduit teardown clears `dsa_ptr` under it); the arm never waits for the svlan lock under RTNL and the debugfs disarm waits killably; the deadline work waits 30 s at most at a time (the timer wheel fires a 1800 s delay up to 41 s late at HZ 100); the bridge-leave warning only while S-R may be live; REMOVE and SHUTDOWN leave no retry. The 8 byte tag path keeps `rtl8_4_tag_rcv()`'s own `dsa_ptr` load, as upstream `rtl8_4` |
+| D5 | 0460 adds lines only; scrub check | 0 and 0 |
+
+### 8.2 Live acceptance (image 2 with the two modules hot-swapped, `flow_offload=0`): L1-L5 run 2026-11-03 (8.3)
+
+Swap in with `insmod` (every parameter on the command line), `svlan=0` then
+`svlan=1`; management over Wi-Fi. Per step, read `svlan_counters` before and
+after; under load read nothing else.
+
+| # | Do | Expect |
+| --- | --- | --- |
+| L1 | Swap in with `svlan=0` | `tagging` = `rtl8_4`; `svlan: pre-reset`, `post-reset` and `off ... match` lines; no entry 3900-3919; `ethtool -k lanN` as before; ping matrix |
+| L2 | Reload with `svlan=1`, unarmed | `tagging` = `rtl8_4s`; abi 1, state off, accept 8899; GRO and features as before; drop counters 0; `bridge vlan add dev lan2 vid 3906` refused; a `tagging` write refused; software throughput and CPU recorded |
+| L3 | `arm 1800` at idle, 10 Hz pings | at most 3 lost; `switch_ready`, accept s, `s_ports` 0xf0; the `svlan` read matches the armed words |
+| L4 | Armed: access VLAN 1 and VID 10, tagged VID 1/10 on a trunk, Wi-Fi and LAN-to-LAN pings, software WAN throughput, traps, a forged rtl8_4 "port 7" frame, own-port 39xx C-VIDs and a nested 88a8, foreign 39xx forms, configuration changes | each delivered on its own port; the forged frame as lan2 payload; own-port 39xx C-VIDs counted `inner_rsv`, the nested 88a8 delivered as payload (`rx_s_nested`); every unexpected drop counter 0 at idle |
+| L5 | `disarm`; `arm 120` | the deadline disarms with at most 3 lost; entries gone; LAN healthy for 10 min |
+| L6 | `arm 300` / `disarm`; `arm 300` / `disarm force`; `arm` twice | the second `arm` returns `-EALREADY` |
+| L7 | `arm 300`, then unbind and reload | remove-disarm and quiesce lines; the next `pre-reset` line shows the block off |
+| L8 | Optional: warm reboot while armed | shutdown line; the block off after boot |
+
+Stop lines: `rtl8_4s: drop`, `svlan: (disarm refused|disarm incomplete|disarm
+retry gave up|entry removal failed|arm failed|deadline yields|S-VLAN uplink
+not cleared|FAULT latched)`, `svlan: (off|quiesce) .*MISMATCH`, `S-VLAN block
+not off`. A FAULT refuses every further arm until the next bind; a
+`disarm_incomplete` FAULT retries the disarm every 2 s for 300 s and then
+every 60 s until it verifies.
+
+Before any unbind (L7, a swap), stop every reader of `svlan` and
+`svlan_counters`, by PID: debugfs pins the module while one of them is
+open, so `rmmod rtl8372n_dsa` fails with "Resource temporarily unavailable"
+after the unbind (bind the device again, or retry the `rmmod`). Prefer to
+unbind with the wired LAN quiet: the 8 byte tag path, like upstream
+`rtl8_4`'s, loads `dsa_ptr` again after the conduit teardown may have
+cleared it.
+
+`svlan: lanN left the VLAN-aware bridge while armed` is logged, and
+`topo_warn` counted, only while S-R steering may be live: armed, arming,
+disarming, or a `disarm_incomplete` FAULT not yet verified by a retry. A
+FAULT with the uplink verified clear logs nothing at teardown. 802.1ad
+uppers stay refused in every FAULT.
+
+### 8.3 Live record: short session (2026-11-03)
+
+L1, L2, L3, L4 (access VLAN 1, tagged VID 1/10 on lan1, access VID 10 on
+lan2), the idle counter check, L5 and the swap back to the image modules.
+Witnesses: a laptop on lan2; a host on lan1 behind a managed switch, on
+VLAN 1 and on VID 10.
+
+| # | Result |
+| --- | --- |
+| L1 | Swap in about 12 s; `rtl8_4`; S block off and matching; VLANs as before; pings router to lan2, lan1 VLAN 1 and lan1 VID 10 hosts 100/100 each, hosts to router 100/100 |
+| L2 | `rtl8_4s`, abi 1, off, accept 8899; GRO flags as before on lan1-4; pings as L1; 8 byte tag receive counters rising on ports 6 and 7, every drop counter 0; VID 3906 refused, VID 30 added and deleted, a `tagging` write refused (EBUSY) |
+| L3 | Armed with the LAN up: one 10 Hz ping lost per stream; accept-nothing window 94 ms; the eight entries read back as the narrow `{p untagged, CPU}` words |
+| L4 | Access VLAN 1 on lan2: DHCP renew, 200/200 pings, 20/20 at 1500 bytes DF. Tagged on lan1: router to VLAN 1 and VID 10 hosts 100/100 each at 1500 bytes (1522-byte S+C frames), host to router 100/100, every S drop counter 0. Access VID 10 on lan2: every router echo crossed lan2 and every answer came back through the S path to `br-lan.10`, ARP both ways (the test host's own firewall answered echo with host-prohibited, so this was counted by capture) |
+| Idle | every drop counter 0 except two not-ready drops at the arm transition |
+| L5 | Manual disarm: off, entries gone. `arm 120`: disarmed by the deadline, accept-nothing window 80 ms, 2 and 3 pings lost over the two transitions; 10 minutes after, 600/600 to each host |
+| Back | Image modules and `rtl8_4` back, VLANs as before, no stop line, no PPPoE redial |
+
+A hot swap changes the user ports' offload flags (not a driver change):
+EDMA adds its checksum, scatter-gather and TSO flags to the conduit's
+`vlan_features` when `lan` opens, and DSA copies `vlan_features` when it
+creates a user port. Created at boot, before `lan` opens, lan1-4 have them
+off; created by a hot swap, they have them on, and cannot turn them off.
+GRO is unaffected, and software forwarding through them ran at
+1720 Mbit/s. They stay on until the next boot.
+
+Not run yet: Wi-Fi to wired, LAN-to-LAN, throughput, traps, the forged
+"port 7" frame, own-port 39xx C-VIDs and the nested 88a8, foreign 39xx
+forms, configuration while armed, L6, L7 and L8.

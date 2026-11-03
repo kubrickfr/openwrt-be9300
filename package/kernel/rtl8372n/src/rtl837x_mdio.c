@@ -250,6 +250,8 @@ static int rtl837x_mdio_probe(struct mdio_device *mdiodev)
 	priv->chip_data = (void *)(priv + 1);
 	priv->ops = variant->ops;
 	priv->write_reset = rtl837x_mdio_write_reset;
+	/* Latches svlan, which get_tag_protocol reads during registration. */
+	rtl8372n_svlan_probe_init(priv);
 
 	/* Logical active means asserted, including active-low GPIOs. */
 	priv->reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
@@ -291,6 +293,8 @@ static int rtl837x_mdio_probe(struct mdio_device *mdiodev)
 	}
 
 	dev_set_drvdata(dev, priv);
+	/* The S-R control window; a debugfs failure only makes arming impossible. */
+	rtl8372n_svlan_ctl_start(priv);
 	return 0;
 }
 
@@ -301,6 +305,8 @@ static void rtl837x_mdio_remove(struct mdio_device *mdiodev)
 	if (!priv)
 		return;
 
+	/* Close the S-R control window and disarm, before tagger_data goes. */
+	rtl8372n_svlan_ctl_stop(priv, false);
 	dsa_unregister_switch(priv->ds);
 	if (priv->reset)
 		gpiod_set_value_cansleep(priv->reset, 1);
@@ -311,6 +317,8 @@ static void rtl837x_mdio_shutdown(struct mdio_device *mdiodev)
 	struct rtl837x_priv *priv = dev_get_drvdata(&mdiodev->dev);
 
 	if (priv) {
+		/* Disarms S-R steering unless svlan_shutdown_disarm=0. */
+		rtl8372n_svlan_ctl_stop(priv, true);
 		/* Teardown cancels it too, but shutdown runs no teardown. */
 		cancel_delayed_work_sync(&priv->fdb_resync_work);
 		dsa_switch_shutdown(priv->ds);

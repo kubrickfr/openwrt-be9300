@@ -50,8 +50,52 @@
 #define RTL837X_CPU_TAG_CTRL                        0x6720
 #define RTL837X_CPU_TAG_ENABLE                      BIT(1)
 #define RTL837X_CPU_TAG_INSERT_MODE                 GENMASK(11, 10)
+/* Values of RTL837X_CPU_TAG_INSERT_MODE (RTL8373 SDK CPU_INSERT_TO_*). */
+enum rtl837x_cpu_tag_insert {
+	RTL837X_CPU_TAG_INSERT_ALL,
+	/* Only trapped frames carry the tag (MEASURED with S-VLAN armed). */
+	RTL837X_CPU_TAG_INSERT_TRAPPING,
+	RTL837X_CPU_TAG_INSERT_NONE,
+};
+/* The EtherType of the RTL8_4 CPU tag; only read back. */
+#define RTL837X_CPU_TAG_TPID                        0x6038
+#define RTL837X_CPU_TAG_TPID_MASK                   GENMASK(15, 0)
 #define RTL837X_EXTERNAL_CPU_PORT                   0x6724
 #define RTL837X_EXTERNAL_CPU_PORT_MASK              GENMASK(3, 0)
+
+/*
+ * S-VLAN engine, as the bench probe drove it (svlan/map-regdefs.md and the
+ * probe windows of 2026-10-28 and 2026-11-02). Only S-R steering
+ * (rtl8372n_svlan_seq.c) writes it armed; setup and quiesce write the off
+ * values. A port in the uplink mask (the CPU port) sends every frame it
+ * forwards with an S-tag: that is what arms the engine, so the uplink is
+ * written last and cleared first.
+ */
+#define RTL837X_SVLAN_UPLINK                        0x57c0
+#define RTL837X_SVLAN_UPLINK_PORTS                  GENMASK(9, 0)
+#define RTL837X_SVLAN_CTRL                          0x57c4
+#define RTL837X_SVLAN_CTRL_FIELDS                   GENMASK(4, 0)
+/* S-PCP source; 1 copies the C-tag's PCP (MEASURED). */
+#define RTL837X_SVLAN_CTRL_SPRISEL                  GENMASK(4, 3)
+#define RTL837X_SVLAN_CTRL_UIFSEG                   BIT(2)
+/* S-untagged frames from the uplink: 0 drops them, 2 assigns UNTAG_SVID. */
+#define RTL837X_SVLAN_CTRL_UNTAG                    GENMASK(1, 0)
+#define RTL837X_SVLAN_UNTAG_SVID                    0x57c8
+#define RTL837X_SVLAN_UNTAG_SVID_MASK               GENMASK(11, 0)
+/* Default S-VID of each port, two ports per word: port p in word p / 2. */
+#define RTL837X_SVLAN_PORT_SVID(k)                  (0x57cc + 4 * (k))
+#define RTL837X_SVLAN_PORT_SVID_WORDS               5
+#define RTL837X_SVLAN_PORT_SVID_FIELDS              GENMASK(23, 0)
+#define RTL837X_SVLAN_PORT_SVID_MASK(port)          (GENMASK(11, 0) << (12 * ((port) & 1)))
+#define RTL837X_SVLAN_TPID                          0x6044
+#define RTL837X_SVLAN_TPID_MASK                     GENMASK(15, 0)
+/* The S-TPID's reset value, which S-R steering also uses. */
+#define RTL837X_SVLAN_TPID_8021AD                   0x88a8
+/* Meaning not settled: only logged (0x10000 at every recorded baseline). */
+#define RTL837X_SVLAN_TRAP_CTRL                     0x4ec8
+/* The C2S table: never written; every word read 0 at every baseline. */
+#define RTL837X_SVLAN_C2S(i)                        (0x57e0 + 4 * (i))
+#define RTL837X_SVLAN_C2S_WORDS                     256
 
 #define RTL837X_SDS_MODE_SELECT                     0x7b20
 #define RTL837X_SDS0_MODE_MASK                      GENMASK(4, 0)

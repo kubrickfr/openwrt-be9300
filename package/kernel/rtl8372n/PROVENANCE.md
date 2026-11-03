@@ -41,7 +41,9 @@ maintainer decision before submission.
   driver", internal PHYs as C45 devices bound to the kernel RTL8224 driver
   (P0's PHY layer and its C22 page emulation, after Linux `r8169`, are gone);
   "rtl8372n: keep EEE off and leave internal PHY power to phylib"; tagger
-  patch 0432; "rtl8372n: offload bridging and VLANs to the switch".
+  patch 0432; "rtl8372n: offload bridging and VLANs to the switch"; tagger
+  patch 0460 and the S-R steering mode (`svlan=1`: `rtl8372n_svlan.c`,
+  `rtl8372n_svlan_seq.c`, `rtl8372n_svlan_seq.h`).
 - **Kamil Bienkiewicz**: patch 0431 (0443 in perceival's tree): EDMA falls
   back to software checksum/GSO when its parser cannot find L3, which the
   RTL8_4 tag breaks. Outside this package; required by it.
@@ -105,6 +107,10 @@ shows a value sticks, not what it does; the rows do not repeat it.
 | VLAN table reset: sentinel VID 4094, `0x4e14` bit 3 TABLE_RST, sample/sweep | SDK `dal_rtl8373_vlan_reset()` | **SDK-only lineage, disposition open.** Stock never uses TABLE_RST but sweeps every VID (fallback corroborated). HW: cleared the VID 4094 sentinel in 290-520 us on five boots and two module reloads (bench, 1.1); a table populated before a warm reboot (3.8) not run. |
 | VLAN controls: `0x4e14` bits 0/1 VID types, `0x4e30`/`0x4e34` learn-disable, `0x4e38` port FID, egress keep `0x6728` | SDK field list, `vlan_init` | **SDK-only lineage, disposition open.** Stock writes `0x4e30`/`0x4e34` = 0 too. |
 | L2 actions: `0x5350` bit 8 lookup-hit isolation, 7:6 hash-full; `0x4f80` learn-limit; `0x4f84` source-port permit | SDK setters; SDK-based driver cleared `0x4f84` | **SDK-only lineage, disposition open.** |
+| S-VLAN block (`svlan=1` only arms it): uplink `0x57c0` 9:0, control `0x57c4` (SPRISEL 4:3, UIFSEG 2, UNTAG 1:0), untag S-VID `0x57c8` 11:0, port default S-VIDs `0x57cc + 4 * (port / 2)` (12 bits per port, at 12 * (port & 1)), S-TPID `0x6044` 15:0 | SDK register definitions (`VS_UPLINK_PORT`, `VS_CTRL`, `VS_UNTAG_SVID`, `VS_PORT_DFLT_SVID`, `VS_GLB_CTRL`); the value meanings (UNTAG 0 = drop, UIFSEG 0 = port default S-VID, SPRISEL 1 = C-tag priority) are SDK `svlan.h` enums, not definitions. Air `rtl837x.h` and ZTE agree on `0x6044` but derive from the same SDK | **SDK-only lineage, disposition open.** HW: two live S-VLAN probe runs armed and restored the block with the LAN up (2026-10-28 and the two S-R windows of 2026-11-02): uplink BIT(3) = `0x008`, `0x57c4` = `0x08`, port S-VID words `0xf41f40`/`0xf43f42` for ports 4-7, TPID `0x88a8`; data from lan1-lan3 then reached the CPU S-tagged with 3900 + port, C-tags kept inside, S-PCP copied from the C-tag. lan4 (port 4) was armed with no host on it. Setup writes the off values with `svlan=0` too and fails on an uplink it cannot clear. |
+| C2S table `0x57e0 + 4 * i`, 256 words (128 entries of 2 words); S-VLAN trap control `0x4ec8` | SDK register definitions (`VLAN_C2S_ENTRY`, `SVLAN_TRAP_CTRL`) | **SDK-only lineage, disposition open.** Read only: the arm requires every C2S word 0, as the probe did before it started (all 256 read 0); `0x4ec8` is logged (it read `0x10000`). Never written. |
+| CPU tag TPID `0x6038` 15:0; CPU tag insert mode `0x6720` 11:10 (0 ALL, 1 TRAPPING, 2 NONE) | SDK definitions (`CPU_TAG_TPID_CTRL`, `EXT_CPUTAG_INSERTMOD`); the insert-mode values are the SDK `cpuTag.h` `CPU_INSERT_TO_*` enum, not a definition | **SDK-only lineage, disposition open.** `0x6038` read only (the arm requires `0x8899`, as read live). Insert mode: ALL (0) as before; TRAPPING (1) only while armed. HW: armed, trapped BPDU/LACP/EAPOL/LLDP frames kept the 8 byte tag with REASON `0x5f` and their exact port while data carried the S-tag (the probe run and both S-R windows), and a forged rtl8_4 "port 7" frame from lan2 arrived inside lan2's S-tag (the probe run). |
+| Driver-owned VLAN entries 3900 + p and 3910 + p ({p untagged, CPU}, one pair per user port; VIDs 3900-3919 reserved while `svlan=1`) | The VLAN entry row's layout; the S-R discovery's narrow-entry choice | HW: the narrow words `0x02004018`-`0x02020088` (lan4-lan1) carried uploads, traps and LAN-to-LAN in the second S-R window, and foreign 39xx C-VIDs sent by clients reached no witness, the CPU included. An own-port 39xx C-VID is not measured; the tagger drops it on both receive paths. |
 | Left at reset: `0x535c` SA-moving (logged), `0x5088`/`0x508c`, RMA trap priority and storm bypass, PTP `0x4f20`/`0x4f24`, RMA 10-2f `0x4eec`-`0x4f0c`, CDP `0x4f10`, SSTP `0x4f14` | SDK only | Not written; listed so bench anomalies can be traced to them. |
 
 ## What stock GL 4.10.1 corroborates
@@ -128,7 +134,10 @@ CPU-tag, L2 or STP register.
 ## Licences
 
 - GPL-2.0-or-later, as Air's headers: `rtl8372n.c`, `rtl837x_mdio.c`,
-  `rtl837x_common.c`, `rtl837x.h`, `rtl837x_regmap.h`, `src/Makefile`.
+  `rtl837x_common.c`, `rtl837x.h`, `rtl837x_regmap.h`, `src/Makefile`; new
+  in this branch under the same licence: `rtl8372n_svlan.c`,
+  `rtl8372n_svlan_seq.c`, `rtl8372n_svlan_seq.h`. Patch 0460 (in the
+  kernel tree, not this package) is GPL-2.0.
   GPL-2.0-only, as the MNeroba code they adapt: `rtl837x_table.c`,
   `rtl8372n_l2.c`, `rtl8372n_vlan.c`. `MODULE_LICENSE("GPL")` is metadata;
   `LICENSE` is the GPL-2.0 text. 0432 has no Signed-off-by yet.
