@@ -1,0 +1,847 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: dsa: tag_rtl8_4: add the rtl8_4s hybrid S-tag receive
+ protocol
+
+The RTL8372N can label the frames it forwards or floods to the CPU with
+an IEEE 802.1ad S-tag instead of its 8 byte CPU tag. With the S-VLAN
+uplink pointed at the CPU port, port p given the S-VID 3900 + p, and the
+CPU tag inserted on trapped frames only, a GL-BE9300 armed live showed
+at its conduit:
+
+- from an access port: 88a8/3900+p, then the frame as the client sent it;
+- from a trunk: 88a8/3900+p, then the client's C-tag;
+- from a client that sends its own 88a8: that tag behind the switch's,
+  as payload of the port's VLAN;
+- trapped frames (the link-local traps): the 8 byte tag with REASON
+  0x5f, as before.
+
+The outer S-tag names the ingress port in a form that the PPE in front
+of the conduit can parse, which the qualcommbe offload needs to classify
+LAN uploads by port and VLAN in hardware. rtl8_4 drops every such frame
+("non-realtek ethertype"), so with it an armed switch darkens the wired
+LAN.
+
+Add a third protocol to this file, rtl8_4s, for that hybrid stream. The
+switch driver binds it at probe time and arms and disarms the switch
+itself, with the LAN up; no tag protocol change is involved. The two
+share struct rtl8_4s_tagger_data (include/linux/dsa/rtl8_4s.h, ABI 1):
+the tagger allocates it in .connect, and the switch driver publishes in
+it, with release/acquire ordering, which form the tagger accepts: none,
+the 8 byte tag only, or S-tags of the armed ports. Every transition
+passes through "none", followed by a drain.
+
+Receive, first match wins. Drops are counted per reason and per CPU, and
+those a working switch never causes are warned, rate limited:
+
+- a hwaccel VLAN tag, accept "none", or fewer than 24 bytes: drop;
+- the 8 byte tag: rtl8_4_tag_rcv(), unchanged, except that REASON 0 is
+  dropped while S-tags are accepted, and so is a C-tag with a VID in
+  3900-3919 behind the tag. Armed, the switch adds the tag to trapped
+  frames only, so such a REASON 0 frame is left from the transition or
+  forged. Those VIDs are the switch's steering VLANs (below), whose
+  entries are C-VLANs too: while they exist, a port can reach the CPU
+  with one under the 8 byte tag as well;
+- any other outer type, or an S-tag while only the 8 byte tag is
+  accepted: drop;
+- an S-VID other than 3900 + p for an armed user port p, the download
+  S-VIDs 3910-3919 included: drop;
+- an inner C-tag with a VID in 3900-3919, the switch's internal steering
+  VLANs, which the switch driver reserves: drop, silently, since any
+  client can send one;
+- otherwise strip exactly the S-tag and deliver the rest on port p,
+  marked as forwarded in hardware unless the DA is link-local, with
+  CHECKSUM_NONE. A nested 88a8 is delivered as payload and counted.
+
+The classifier is pure (net/dsa/tag_rtl8_4s.h), so that it is tested in
+user space against the captured frames.
+
+Transmit is rtl8_4_tag_xmit(), which was measured to work with the
+switch armed, so the headroom, the conduit MTU and promisc_on_conduit
+are those of rtl8_4. flow_dissect skips the 4 byte S-tag, or 8 bytes
+for the 8 byte tag; dsa_tag_generic_flow_dissect() would always skip 8
+and give RPS a wrong hash for S-tagged frames.
+
+.disconnect unpublishes the tagger data and frees it after
+synchronize_net(). rcv runs in dsa_switch_rcv()'s RCU read-side
+section and loads dsa_ptr and the tagger data once each. The conduit
+teardown clears dsa_ptr while the conduit still receives, so rcv finds
+the user port of an S-tag from the CPU port it loaded, with
+dsa_to_port(), not with dsa_conduit_find_user(), which would load
+dsa_ptr again and dereference it unchecked. The 8 byte tag keeps
+rtl8_4_tag_rcv()'s own lookup.
+
+The protocol ID, 120, is private to this tree, and include/net/dsa.h is
+left alone: DSA finds a tagger by walking a list, and the module alias
+is made from the ID. rtl8_4 and rtl8_4t do not change; this patch only
+adds lines.
+
+Signed-off-by: François Guerraz <kubrick@fgv6.net>
+---
+ include/linux/dsa/rtl8_4s.h |  267 +++++++++++++++++++++++++++++++++++++++++++
+ net/dsa/tag_rtl8_4.c        |  228 +++++++++++++++++++++++++++++++++++++
+ net/dsa/tag_rtl8_4s.h       |  229 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 724 insertions(+)
+
+--- /dev/null
++++ b/include/linux/dsa/rtl8_4s.h
+@@ -0,0 +1,267 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Shared by net/dsa/tag_rtl8_4.c, rtl8372n_dsa, qcom-ppe. Part 1 is pure (constants, enums,
++ * word decode) and compiles in user space. Part 2 needs the kernel. Only a .c file (never a
++ * header) may define RTL8_4S_PURE before including this, to get part 1 alone.
++ */
++#ifndef _LINUX_DSA_RTL8_4S_CONST_H
++#define _LINUX_DSA_RTL8_4S_CONST_H
++
++#include <linux/bits.h>
++#include <linux/types.h>
++
++#define DSA_TAG_PROTO_RTL8_4S_VALUE 120
++#define RTL8_4S_NAME          "rtl8_4s"
++#define RTL8_4S_ABI           1
++#define RTL8_4S_SVID_UP_BASE  3900   /* upload S-VID of switch port p = 3900 + p */
++#define RTL8_4S_SVID_DN_BASE  3910   /* download S-VID of switch port p = 3910 + p */
++#define RTL8_4S_VID_RSV_FIRST 3900
++#define RTL8_4S_VID_RSV_LAST  3919
++#define RTL8_4S_NUM_PORTS     10     /* switch port indices 0..9 */
++#define RTL8_4S_PORT_SLOTS    16     /* counter slots: 4-bit rtl8_4 port field */
++
++enum rtl8_4s_accept { RTL8_4S_ACCEPT_NONE, RTL8_4S_ACCEPT_8899, RTL8_4S_ACCEPT_S };
++
++enum rtl8_4s_sw_state {
++	RTL8_4S_SW_OFF,
++	RTL8_4S_SW_ARMING,
++	RTL8_4S_SW_READY,
++	RTL8_4S_SW_DISARMING,
++	RTL8_4S_SW_FAULT
++};
++
++enum rtl8_4s_ppe_state {
++	RTL8_4S_PPE_OFF,
++	RTL8_4S_PPE_SR_READY,
++	RTL8_4S_PPE_ACTIVE,
++	RTL8_4S_PPE_FAULT
++};	/* != OFF pins the switch armed */
++
++enum rtl8_4s_state {
++	RTL8_4S_ST_OFF,
++	RTL8_4S_ST_SWITCH_READY,
++	RTL8_4S_ST_SR_READY,
++	RTL8_4S_ST_ACTIVE,
++	RTL8_4S_ST_DISARMING,
++	RTL8_4S_ST_FAULT
++};
++
++/* RX_S counts every S delivery; RX_S_NESTED the subset whose inner type is 0x88a8 (payload). */
++enum rtl8_4s_rx {
++	RTL8_4S_RX_S,
++	RTL8_4S_RX_S_NESTED,
++	RTL8_4S_RX_RT_FWD,
++	RTL8_4S_RX_RT_TRAP,
++	RTL8_4S_RX_NUM
++};
++
++enum rtl8_4s_drop {
++	RTL8_4S_DROP_NOT_READY,
++	RTL8_4S_DROP_S_OFF,
++	RTL8_4S_DROP_HWACCEL,
++	RTL8_4S_DROP_TRUNC,
++	RTL8_4S_DROP_ETYPE,
++	RTL8_4S_DROP_RT,
++	RTL8_4S_DROP_RT_REASON0,
++	RTL8_4S_DROP_SVID_DN,
++	RTL8_4S_DROP_SVID_OTHER,
++	RTL8_4S_DROP_SVID_PORT,
++	RTL8_4S_DROP_NO_USER,
++	RTL8_4S_DROP_INNER_RSV,
++	RTL8_4S_DROP_NUM
++};
++
++static inline bool rtl8_4s_vid_reserved(u16 vid)
++{
++	return vid >= RTL8_4S_VID_RSV_FIRST && vid <= RTL8_4S_VID_RSV_LAST;
++}
++
++static inline u16 rtl8_4s_svid_up(unsigned int p)
++{
++	return RTL8_4S_SVID_UP_BASE + p;
++}
++
++static inline u16 rtl8_4s_svid_dn(unsigned int p)
++{
++	return RTL8_4S_SVID_DN_BASE + p;
++}
++
++/* -1 outside 3900..3909 */
++static inline int rtl8_4s_up_port(u16 svid)
++{
++	return svid >= RTL8_4S_SVID_UP_BASE && svid < RTL8_4S_SVID_UP_BASE + RTL8_4S_NUM_PORTS ?
++	       svid - RTL8_4S_SVID_UP_BASE : -1;
++}
++
++/* The state word: sw_state in bits 7:0, ppe_state in bits 15:8. */
++#define RTL8_4S_WORD(sw, ppe) ((int)((u32)(sw) | (u32)(ppe) << 8))
++
++static inline u8 rtl8_4s_word_sw(int w)
++{
++	return (u32)w & 0xff;
++}
++
++static inline u8 rtl8_4s_word_ppe(int w)
++{
++	return ((u32)w >> 8) & 0xff;
++}
++
++static inline enum rtl8_4s_state rtl8_4s_word_state(int w)
++{
++	u8 sw = rtl8_4s_word_sw(w), pp = rtl8_4s_word_ppe(w);
++
++	if (sw == RTL8_4S_SW_FAULT || pp == RTL8_4S_PPE_FAULT)
++		return RTL8_4S_ST_FAULT;
++	if (sw == RTL8_4S_SW_DISARMING)
++		return RTL8_4S_ST_DISARMING;
++	if (sw != RTL8_4S_SW_READY)
++		return RTL8_4S_ST_OFF;		/* OFF, ARMING */
++	return pp == RTL8_4S_PPE_ACTIVE ? RTL8_4S_ST_ACTIVE :
++	       pp == RTL8_4S_PPE_SR_READY ? RTL8_4S_ST_SR_READY : RTL8_4S_ST_SWITCH_READY;
++}
++#endif /* _LINUX_DSA_RTL8_4S_CONST_H */
++
++#ifndef RTL8_4S_PURE
++#ifndef _LINUX_DSA_RTL8_4S_H
++#define _LINUX_DSA_RTL8_4S_H
++
++#include <linux/atomic.h>
++#include <linux/build_bug.h>
++#include <linux/cpumask.h>
++#include <linux/percpu.h>
++#include <linux/string.h>
++#include <linux/u64_stats_sync.h>
++#include <net/dsa.h>
++
++#define DSA_TAG_PROTO_RTL8_4S ((enum dsa_tag_protocol)DSA_TAG_PROTO_RTL8_4S_VALUE)
++
++static_assert(RTL8_4S_SVID_UP_BASE + RTL8_4S_NUM_PORTS <= RTL8_4S_SVID_DN_BASE);
++static_assert(RTL8_4S_SVID_DN_BASE + RTL8_4S_NUM_PORTS - 1 <= RTL8_4S_VID_RSV_LAST);
++
++struct rtl8_4s_pcpu {
++	u64_stats_t rx[RTL8_4S_RX_NUM][RTL8_4S_PORT_SLOTS];
++	u64_stats_t drop[RTL8_4S_DROP_NUM];
++	struct u64_stats_sync syncp;
++};
++
++struct rtl8_4s_counters {
++	u64 rx[RTL8_4S_RX_NUM][RTL8_4S_PORT_SLOTS];
++	u64 drop[RTL8_4S_DROP_NUM];
++};
++
++struct rtl8_4s_tagger_data {
++	u32 abi;                 /* tagger, set before publication */
++	u8 accept;               /* switch: smp_store_release; readers smp_load_acquire */
++	u16 s_ports;             /* switch: armed user ports; written before accept */
++	atomic_t st;             /* RTL8_4S_WORD(sw, ppe); changed only by the helpers below */
++	u32 sw_gen;              /* switch: +1 per sw_state change */
++	unsigned long disarm_at; /* switch: deadline in jiffies, never 0 while armed */
++	struct rtl8_4s_pcpu __percpu *pcpu;   /* tagger */
++};
++
++/*
++ * NULL unless rtl8_4s is bound with this ABI. The result is valid only (a) inside
++ * rcu_read_lock(); (b) under RTNL, when obtained in the same RTNL section through
++ * rtl8_4s_conduit_td() on a conduit whose dsa_ptr is set, or from a registered DSA user
++ * netdev (the conduit teardown takes RTNL and runs before .disconnect, KR dsa.c:817-833,
++ * 929-946); (c) inside the switch control window (WP1 §4.9). Never store ds or the result.
++ */
++static inline struct rtl8_4s_tagger_data *rtl8_4s_ds_td(struct dsa_switch *ds)
++{
++	struct rtl8_4s_tagger_data *td;
++
++	if (!ds->dst || !ds->dst->tag_ops || ds->dst->tag_ops->proto != DSA_TAG_PROTO_RTL8_4S)
++		return NULL;
++	td = READ_ONCE(ds->tagger_data);
++	return td && td->abi == RTL8_4S_ABI ? td : NULL;
++}
++
++static inline struct rtl8_4s_tagger_data *rtl8_4s_conduit_td(const struct net_device *conduit)
++{
++	struct dsa_port *cpu_dp = READ_ONCE(conduit->dsa_ptr);
++
++	return cpu_dp ? rtl8_4s_ds_td(cpu_dp->ds) : NULL;
++}
++
++/* Switch side, svlan_lock held. Every successful try_cmpxchg is fully ordered. */
++static inline void rtl8_4s_sw_set(struct rtl8_4s_tagger_data *td, u8 sw)	/* keeps ppe */
++{
++	int old = atomic_read(&td->st);
++
++	while (!atomic_try_cmpxchg(&td->st, &old, (old & ~0xff) | sw))
++		;
++	WRITE_ONCE(td->sw_gen, td->sw_gen + 1);
++}
++
++static inline bool rtl8_4s_sw_begin_disarm(struct rtl8_4s_tagger_data *td, u8 *ppe)
++{
++	int old = atomic_read(&td->st);	/* (any, OFF) -> (DISARMING, OFF), else false */
++
++	do {
++		*ppe = rtl8_4s_word_ppe(old);
++		if (*ppe != RTL8_4S_PPE_OFF)
++			return false;
++	} while (!atomic_try_cmpxchg(&td->st, &old,
++				     RTL8_4S_WORD(RTL8_4S_SW_DISARMING, RTL8_4S_PPE_OFF)));
++	WRITE_ONCE(td->sw_gen, td->sw_gen + 1);
++	return true;
++}
++
++/* PPE side (WP2/WP3). */
++/* (READY,OFF)->(READY,SR_READY) */
++static inline bool rtl8_4s_ppe_claim(struct rtl8_4s_tagger_data *td)
++{
++	int old = RTL8_4S_WORD(RTL8_4S_SW_READY, RTL8_4S_PPE_OFF);
++
++	return atomic_try_cmpxchg(&td->st, &old,
++				  RTL8_4S_WORD(RTL8_4S_SW_READY, RTL8_4S_PPE_SR_READY));
++}
++
++static inline bool rtl8_4s_ppe_move(struct rtl8_4s_tagger_data *td, u8 from, u8 to)
++{
++	int old = RTL8_4S_WORD(RTL8_4S_SW_READY, from);	/* SR_READY <-> ACTIVE, -> FAULT */
++
++	return atomic_try_cmpxchg(&td->st, &old, RTL8_4S_WORD(RTL8_4S_SW_READY, to));
++}
++
++/* nothing S-R left in HW */
++static inline void rtl8_4s_ppe_release(struct rtl8_4s_tagger_data *td)
++{
++	int old = atomic_read(&td->st);
++
++	while (!atomic_try_cmpxchg(&td->st, &old, old & 0xff))
++		;
++}
++
++static inline enum rtl8_4s_state rtl8_4s_state(const struct rtl8_4s_tagger_data *td)
++{
++	return rtl8_4s_word_state(atomic_read(&td->st));
++}
++
++static inline void rtl8_4s_counters_sum(const struct rtl8_4s_tagger_data *td,
++					struct rtl8_4s_counters *c)
++{
++	unsigned int cpu, start, i, j;
++
++	memset(c, 0, sizeof(*c));
++	for_each_possible_cpu(cpu) {
++		const struct rtl8_4s_pcpu *p = per_cpu_ptr(td->pcpu, cpu);
++		struct rtl8_4s_counters t;
++
++		do {
++			start = u64_stats_fetch_begin(&p->syncp);
++			for (i = 0; i < RTL8_4S_RX_NUM; i++)
++				for (j = 0; j < RTL8_4S_PORT_SLOTS; j++)
++					t.rx[i][j] = u64_stats_read(&p->rx[i][j]);
++			for (i = 0; i < RTL8_4S_DROP_NUM; i++)
++				t.drop[i] = u64_stats_read(&p->drop[i]);
++		} while (u64_stats_fetch_retry(&p->syncp, start));
++		for (i = 0; i < RTL8_4S_RX_NUM; i++)
++			for (j = 0; j < RTL8_4S_PORT_SLOTS; j++)
++				c->rx[i][j] += t.rx[i][j];
++		for (i = 0; i < RTL8_4S_DROP_NUM; i++)
++			c->drop[i] += t.drop[i];
++	}
++}
++#endif /* _LINUX_DSA_RTL8_4S_H */
++#endif /* !RTL8_4S_PURE */
+--- a/net/dsa/tag_rtl8_4.c
++++ b/net/dsa/tag_rtl8_4.c
+@@ -74,13 +74,33 @@
+  * software or hardware. To avoid this issue, if the checksum is still pending,
+  * this tagger checksums the packet in software before adding the tag.
+  *
++ * A third version, "rtl8_4s", is for an RTL8372N whose switch driver has
++ * pointed the switch's S-VLAN uplink at the CPU port and inserts the 8 byte
++ * tag on trapped frames only. A frame the switch forwards or floods to the CPU
++ * then carries one IEEE 802.1ad S-tag, whose VID names the ingress port p as
++ * 3900 + p, ahead of whatever tags the client sent:
++ *
++ *  +--------+--------+------------------------+---------+------+-----
++ *  | MAC DA | MAC SA | 0x88a8 + VID 3900 + p  | [C-tag] | Type | ...
++ *  +--------+--------+------------------------+---------+------+-----
++ *
++ * Trapped frames keep the 8 byte tag before the EtherType. rtl8_4s strips the
++ * S-tag and delivers the rest on port p, or passes an 8 byte tag to the rtl8_4
++ * receive path, as far as the switch driver's arming state allows; see
++ * include/linux/dsa/rtl8_4s.h. It transmits the 8 byte tag, as rtl8_4 does.
++ *
+  */
+ 
+ #include <linux/bitfield.h>
+ #include <linux/bits.h>
++#include <linux/dsa/rtl8_4s.h>
+ #include <linux/etherdevice.h>
++#include <linux/percpu.h>
++#include <linux/slab.h>
++#include <linux/u64_stats_sync.h>
+ 
+ #include "tag.h"
++#include "tag_rtl8_4s.h"
+ 
+ /* Protocols supported:
+  *
+@@ -236,6 +256,195 @@ static struct sk_buff *rtl8_4t_tag_rcv(s
+ 	return skb;
+ }
+ 
++/* Hybrid S-tag version: the classifier is in tag_rtl8_4s.h */
++static_assert(RTL8_4S_ET_RTL == ETH_P_REALTEK);
++static_assert(RTL8_4S_ET_S == ETH_P_8021AD);
++static_assert(RTL8_4S_ET_C == ETH_P_8021Q);
++static_assert(RTL8_4S_S_TAG_LEN == VLAN_HLEN);
++static_assert(2 * ETH_ALEN + RTL8_4_TAG_LEN == RTL8_4S_OFF_RT_IET);
++static_assert(RTL8_4S_OFF_RT_IET + VLAN_HLEN == RTL8_4S_CLS_LEN);
++static_assert(ETH_HLEN + 1 == RTL8_4S_OFF_REASON);
++
++static void rtl8_4s_count_rx(struct rtl8_4s_tagger_data *td,
++			     enum rtl8_4s_rx what, unsigned int port)
++{
++	struct rtl8_4s_pcpu *pcpu;
++
++	if (!td)
++		return;
++
++	port = min_t(unsigned int, port, RTL8_4S_PORT_SLOTS - 1);
++	pcpu = this_cpu_ptr(td->pcpu);
++	u64_stats_update_begin(&pcpu->syncp);
++	u64_stats_inc(&pcpu->rx[what][port]);
++	u64_stats_update_end(&pcpu->syncp);
++}
++
++static void rtl8_4s_count_drop(struct rtl8_4s_tagger_data *td,
++			       enum rtl8_4s_drop why)
++{
++	struct rtl8_4s_pcpu *pcpu;
++
++	if (!td)
++		return;
++
++	pcpu = this_cpu_ptr(td->pcpu);
++	u64_stats_update_begin(&pcpu->syncp);
++	u64_stats_inc(&pcpu->drop[why]);
++	u64_stats_update_end(&pcpu->syncp);
++}
++
++static struct sk_buff *rtl8_4s_tag_rcv(struct sk_buff *skb,
++				       struct net_device *dev)
++{
++	u8 accept = RTL8_4S_ACCEPT_8899;
++	struct rtl8_4s_tagger_data *td;
++	struct dsa_port *cpu_dp, *dp;
++	unsigned int len = 0;
++	struct rtl8_4s_cls c;
++	u16 s_ports = 0;
++	bool hwaccel;
++	u8 reason;
++
++	/* The conduit teardown clears dsa_ptr with no grace period, so load it
++	 * once here, and find the user port of an S-tag from this cpu_dp:
++	 * dsa_conduit_find_user() would load dsa_ptr again and dereference it
++	 * unchecked. cpu_dp, its switch and their tree outlive this rcv (the
++	 * user port unregister and .disconnect wait for it). rtl8_4_tag_rcv()
++	 * still loads dsa_ptr again, as it always has for rtl8_4.
++	 */
++	cpu_dp = READ_ONCE(dev->dsa_ptr);
++	if (unlikely(!cpu_dp))
++		return NULL;
++
++	/* dsa_switch_rcv() runs in an RCU read-side critical section, and
++	 * rtl8_4s_disconnect() frees td only a grace period after it unpublished
++	 * it. With no td, behave as accept 8899 and count nothing.
++	 */
++	td = READ_ONCE(cpu_dp->ds->tagger_data);
++	if (likely(td)) {
++		/* Pairs with the switch driver's release, which follows its
++		 * s_ports update.
++		 */
++		accept = smp_load_acquire(&td->accept);
++		s_ports = READ_ONCE(td->s_ports);
++	}
++
++	/* The 8 byte tag, and a C-tag behind it, linear from the MACs on */
++	hwaccel = skb_vlan_tag_present(skb);
++	if (!hwaccel && accept != RTL8_4S_ACCEPT_NONE &&
++	    pskb_may_pull(skb, RTL8_4S_CLS_LEN - ETH_HLEN))
++		len = RTL8_4S_CLS_LEN;
++
++	rtl8_4s_classify(skb_mac_header(skb), len, accept, s_ports, hwaccel,
++			 &c);
++
++	if (c.verdict == RTL8_4S_V_RT) {
++		/* Read REASON before rtl8_4_tag_rcv() moves the MACs over it */
++		reason = skb_mac_header(skb)[RTL8_4S_OFF_REASON];
++		if (!rtl8_4_tag_rcv(skb, dev)) {
++			rtl8_4s_count_drop(td, RTL8_4S_DROP_RT);
++			return NULL;
++		}
++		rtl8_4s_count_rx(td, reason ? RTL8_4S_RX_RT_TRAP :
++					      RTL8_4S_RX_RT_FWD,
++				 dsa_user_to_port(skb->dev)->index);
++		return skb;
++	}
++
++	if (c.verdict == RTL8_4S_V_S) {
++		dp = dsa_to_port(cpu_dp->ds, c.port);
++		skb->dev = dp && dsa_port_is_user(dp) ? dp->user : NULL;
++		if (likely(skb->dev)) {
++			/* c.mark was taken from the DA before the strip */
++			if (c.mark)
++				dsa_default_offload_fwd_mark(skb);
++
++			skb_pull_rcsum(skb, RTL8_4S_S_TAG_LEN);
++			dsa_strip_etype_header(skb, RTL8_4S_S_TAG_LEN);
++
++			/* Trust no checksum the conduit may have verified
++			 * through the S-tag. LAN frames arrive with
++			 * CHECKSUM_NONE on the rtl8_4 path anyway.
++			 */
++			skb->ip_summed = CHECKSUM_NONE;
++
++			rtl8_4s_count_rx(td, RTL8_4S_RX_S, c.port);
++			if (c.nested)
++				rtl8_4s_count_rx(td, RTL8_4S_RX_S_NESTED, c.port);
++			return skb;
++		}
++		rtl8_4s_drop_as(&c, RTL8_4S_DROP_NO_USER, true, c.val);
++	}
++
++	/* dsa_switch_rcv() frees the skb */
++	rtl8_4s_count_drop(td, c.drop);
++	if (c.warn)
++		dev_warn_ratelimited(&dev->dev, "rtl8_4s: drop %s 0x%04x\n",
++				     rtl8_4s_drop_name(c.drop), c.val);
++	return NULL;
++}
++
++/* An S-tagged frame has its real EtherType right after the 4 byte S-tag, not
++ * after needed_headroom bytes as dsa_tag_generic_flow_dissect() assumes. RPS
++ * hashes on what this returns.
++ */
++static void rtl8_4s_flow_dissect(const struct sk_buff *skb, __be16 *proto,
++				 int *offset)
++{
++	u16 type;
++
++	/* The outer EtherType is 2 bytes behind skb->data, as in
++	 * dsa_etype_header_pos_rx(), which does not take a const skb.
++	 */
++	rtl8_4s_dissect(skb->data - 2, skb_headlen(skb) + 2, offset, &type);
++	*proto = htons(type);
++}
++
++static int rtl8_4s_connect(struct dsa_switch *ds)
++{
++	struct rtl8_4s_tagger_data *td;
++	int cpu;
++
++	td = kzalloc(sizeof(*td), GFP_KERNEL);
++	if (!td)
++		return -ENOMEM;
++
++	td->pcpu = alloc_percpu(struct rtl8_4s_pcpu);
++	if (!td->pcpu) {
++		kfree(td);
++		return -ENOMEM;
++	}
++
++	for_each_possible_cpu(cpu)
++		u64_stats_init(&per_cpu_ptr(td->pcpu, cpu)->syncp);
++
++	td->abi = RTL8_4S_ABI;
++	td->accept = RTL8_4S_ACCEPT_8899;
++	atomic_set(&td->st, RTL8_4S_WORD(RTL8_4S_SW_OFF, RTL8_4S_PPE_OFF));
++
++	/* Publish td complete: rcv and the switch driver may use it at once */
++	smp_store_release(&ds->tagger_data, td);
++
++	return 0;
++}
++
++static void rtl8_4s_disconnect(struct dsa_switch *ds)
++{
++	struct rtl8_4s_tagger_data *td = ds->tagger_data;
++
++	if (!td)
++		return;
++
++	WRITE_ONCE(ds->tagger_data, NULL);
++
++	/* Wait for any rcv that still holds td */
++	synchronize_net();
++
++	free_percpu(td->pcpu);
++	kfree(td);
++}
++
+ /* Ethertype version */
+ static const struct dsa_device_ops rtl8_4_netdev_ops = {
+ 	.name = "rtl8_4",
+@@ -262,9 +471,28 @@ DSA_TAG_DRIVER(rtl8_4t_netdev_ops);
+ 
+ MODULE_ALIAS_DSA_TAG_DRIVER(DSA_TAG_PROTO_RTL8_4T, RTL8_4T_NAME);
+ 
++/* Hybrid S-tag version. Every tag it handles follows the MAC addresses, so
++ * the conduit sees the real DA and promisc_on_conduit stays off.
++ */
++static const struct dsa_device_ops rtl8_4s_netdev_ops = {
++	.name = RTL8_4S_NAME,
++	.proto = DSA_TAG_PROTO_RTL8_4S,
++	.xmit = rtl8_4_tag_xmit,
++	.rcv = rtl8_4s_tag_rcv,
++	.flow_dissect = rtl8_4s_flow_dissect,
++	.connect = rtl8_4s_connect,
++	.disconnect = rtl8_4s_disconnect,
++	.needed_headroom = RTL8_4_TAG_LEN,
++};
++
++DSA_TAG_DRIVER(rtl8_4s_netdev_ops);
++
++MODULE_ALIAS_DSA_TAG_DRIVER(DSA_TAG_PROTO_RTL8_4S, RTL8_4S_NAME);
++
+ static struct dsa_tag_driver *dsa_tag_drivers[] = {
+ 	&DSA_TAG_DRIVER_NAME(rtl8_4_netdev_ops),
+ 	&DSA_TAG_DRIVER_NAME(rtl8_4t_netdev_ops),
++	&DSA_TAG_DRIVER_NAME(rtl8_4s_netdev_ops),
+ };
+ module_dsa_tag_drivers(dsa_tag_drivers);
+ 
+--- /dev/null
++++ b/net/dsa/tag_rtl8_4s.h
+@@ -0,0 +1,229 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Receive classifier of the rtl8_4s tagger in tag_rtl8_4.c.
++ *
++ * This file is pure: it needs only part 1 of <linux/dsa/rtl8_4s.h> and touches
++ * no kernel object, so that a user-space harness can compile it, with
++ * RTL8_4S_PURE defined, against the same table the kernel uses.
++ */
++
++#ifndef __DSA_TAG_RTL8_4S_H
++#define __DSA_TAG_RTL8_4S_H
++
++#include <linux/dsa/rtl8_4s.h>
++
++/* EtherTypes, equal to ETH_P_REALTEK, ETH_P_8021AD and ETH_P_8021Q */
++#define RTL8_4S_ET_RTL		0x8899
++#define RTL8_4S_ET_S		0x88a8
++#define RTL8_4S_ET_C		0x8100
++
++/* Frame offsets from the DA */
++#define RTL8_4S_OFF_ET		12	/* outer EtherType */
++#define RTL8_4S_OFF_REASON	15	/* rtl8_4: REASON, after the protocol */
++#define RTL8_4S_OFF_TCI		14	/* S-tag TCI */
++#define RTL8_4S_OFF_IET		16	/* type after the S-tag */
++#define RTL8_4S_OFF_RT_IET	20	/* type after the 8 byte tag */
++
++/*
++ * Linear bytes the classifier needs: the MACs, the 8 byte tag and the TCI of
++ * a C-tag behind it
++ */
++#define RTL8_4S_CLS_LEN		24
++
++#define RTL8_4S_S_TAG_LEN	4
++#define RTL8_4S_VID_MASK	0xfff
++
++enum rtl8_4s_verdict {
++	RTL8_4S_V_DROP,		/* drop and count rtl8_4s_cls.drop */
++	RTL8_4S_V_RT,		/* outer rtl8_4 tag: rtl8_4_tag_rcv() */
++	RTL8_4S_V_S,		/* S-tag of an armed port: strip it */
++};
++
++struct rtl8_4s_cls {
++	u8 verdict;		/* enum rtl8_4s_verdict */
++	u8 drop;		/* RTL8_4S_V_DROP: enum rtl8_4s_drop */
++	u8 port;		/* RTL8_4S_V_S: the ingress switch port */
++	bool mark;		/* RTL8_4S_V_S: the DA is not link-local */
++	bool warn;		/* RTL8_4S_V_DROP: warn, rate limited */
++	bool nested;		/* RTL8_4S_V_S: the inner type is 0x88a8 */
++	u16 val;		/* the EtherType or VID the drop is about */
++};
++
++static inline u16 rtl8_4s_get_be16(const u8 *p)
++{
++	return p[0] << 8 | p[1];
++}
++
++/* 01:80:c2:00:00:0X, as is_link_local_ether_addr() */
++static inline bool rtl8_4s_link_local(const u8 *da)
++{
++	return da[0] == 0x01 && da[1] == 0x80 && da[2] == 0xc2 &&
++	       !da[3] && !da[4] && !(da[5] & 0xf0);
++}
++
++/* A C-tag at @t with a VID in 3900-3919, the switch's steering VLANs */
++static inline bool rtl8_4s_inner_rsv(const u8 *t, u16 *vid)
++{
++	*vid = rtl8_4s_get_be16(t + 2) & RTL8_4S_VID_MASK;
++	return rtl8_4s_get_be16(t) == RTL8_4S_ET_C && rtl8_4s_vid_reserved(*vid);
++}
++
++static inline void rtl8_4s_drop_as(struct rtl8_4s_cls *c, u8 drop, bool warn,
++				   u16 val)
++{
++	c->drop = drop;
++	c->warn = warn;
++	c->val = val;
++}
++
++/**
++ * rtl8_4s_classify() - decide what to do with a frame the conduit received
++ * @f: the frame, from its DA
++ * @len: linear bytes at @f; 0 when they could not be pulled
++ * @accept: enum rtl8_4s_accept, as the switch driver published it
++ * @s_ports: the armed user ports, read after @accept
++ * @hwaccel: the frame carries a hardware-accelerated VLAN tag
++ * @c: the decision
++ *
++ * The outermost tag decides, and the first matching rule wins:
++ *
++ *  1. a hwaccel tag: drop (HWACCEL);
++ *  2. accept NONE: drop (NOT_READY), silently, since every arm and disarm
++ *     crosses it;
++ *  3. fewer than RTL8_4S_CLS_LEN bytes: drop (TRUNC);
++ *  4. rtl8_4 with REASON 0 under accept S: drop (RT_REASON0) and warn. Armed,
++ *     the switch tags only trapped frames, with a non-zero REASON, so this
++ *     is a frame left from before the arm, or a forgery;
++ *  5. any other rtl8_4 frame: rtl8_4_tag_rcv(), unchanged, unless a C-tag
++ *     with a VID in 3900-3919 follows the 8 byte tag: drop that (INNER_RSV),
++ *     silently, as in rule 11. The switch driver's entries for those VIDs
++ *     are C-VLANs too, and while they exist (an arm in progress, a FAULT
++ *     that left them) a port can reach the CPU with one under the 8 byte
++ *     tag;
++ *  6. neither 0x8899 nor 0x88a8 outside: drop (ETYPE) and warn;
++ *  7. 0x88a8 unless accept is S: drop (S_OFF), silently;
++ *  8. S-VID 3910-3919: drop (SVID_DN) and warn; the switch never sends it;
++ *  9. S-VID outside 3900-3919: drop (SVID_OTHER) and warn;
++ * 10. S-VID 3900 + p, p not armed (the CPU port included): drop (SVID_PORT)
++ *     and warn;
++ * 11. inner 0x8100 with a VID in 3900-3919: drop (INNER_RSV), silently,
++ *     since clients choose it;
++ * 12. otherwise deliver on port p, stripping only the S-tag. Whatever
++ *     follows is payload, a client's own 0x88a8 (@c->nested) included.
++ */
++static inline void rtl8_4s_classify(const u8 *f, unsigned int len, u8 accept,
++				    u16 s_ports, bool hwaccel,
++				    struct rtl8_4s_cls *c)
++{
++	u16 et, vid, ivid;
++	int p;
++
++	*c = (struct rtl8_4s_cls){ .verdict = RTL8_4S_V_DROP };
++
++	if (hwaccel) {
++		rtl8_4s_drop_as(c, RTL8_4S_DROP_HWACCEL, false, 0);
++		return;
++	}
++	if (accept == RTL8_4S_ACCEPT_NONE) {
++		rtl8_4s_drop_as(c, RTL8_4S_DROP_NOT_READY, false, 0);
++		return;
++	}
++	if (len < RTL8_4S_CLS_LEN) {
++		rtl8_4s_drop_as(c, RTL8_4S_DROP_TRUNC, false, 0);
++		return;
++	}
++
++	et = rtl8_4s_get_be16(f + RTL8_4S_OFF_ET);
++	if (et == RTL8_4S_ET_RTL) {
++		if (accept == RTL8_4S_ACCEPT_S && !f[RTL8_4S_OFF_REASON]) {
++			rtl8_4s_drop_as(c, RTL8_4S_DROP_RT_REASON0, true, et);
++			return;
++		}
++		if (rtl8_4s_inner_rsv(f + RTL8_4S_OFF_RT_IET, &ivid)) {
++			rtl8_4s_drop_as(c, RTL8_4S_DROP_INNER_RSV, false, ivid);
++			return;
++		}
++		c->verdict = RTL8_4S_V_RT;
++		return;
++	}
++	if (et != RTL8_4S_ET_S) {
++		rtl8_4s_drop_as(c, RTL8_4S_DROP_ETYPE, true, et);
++		return;
++	}
++	if (accept != RTL8_4S_ACCEPT_S) {
++		rtl8_4s_drop_as(c, RTL8_4S_DROP_S_OFF, false, 0);
++		return;
++	}
++
++	vid = rtl8_4s_get_be16(f + RTL8_4S_OFF_TCI) & RTL8_4S_VID_MASK;
++	if (vid >= RTL8_4S_SVID_DN_BASE && vid <= RTL8_4S_VID_RSV_LAST) {
++		rtl8_4s_drop_as(c, RTL8_4S_DROP_SVID_DN, true, vid);
++		return;
++	}
++	p = rtl8_4s_up_port(vid);
++	if (p < 0) {
++		rtl8_4s_drop_as(c, RTL8_4S_DROP_SVID_OTHER, true, vid);
++		return;
++	}
++	if (!(s_ports & BIT(p))) {
++		rtl8_4s_drop_as(c, RTL8_4S_DROP_SVID_PORT, true, vid);
++		return;
++	}
++
++	if (rtl8_4s_inner_rsv(f + RTL8_4S_OFF_IET, &ivid)) {
++		rtl8_4s_drop_as(c, RTL8_4S_DROP_INNER_RSV, false, ivid);
++		return;
++	}
++
++	c->verdict = RTL8_4S_V_S;
++	c->port = p;
++	c->val = vid;
++	c->nested = rtl8_4s_get_be16(f + RTL8_4S_OFF_IET) == RTL8_4S_ET_S;
++	c->mark = !rtl8_4s_link_local(f);
++}
++
++/**
++ * rtl8_4s_dissect() - where the flow dissector finds the real EtherType
++ * @t: the outer EtherType (skb->data - 2 on the conduit)
++ * @len: bytes available at @t
++ * @off: set to the bytes to skip after skb->data
++ * @proto: set to the real EtherType, host order (0 if it is not there)
++ *
++ * After an S-tag the real type follows the 4 byte tag; anything else is
++ * taken as the 8 byte rtl8_4 tag, which is what dsa_tag_generic_flow_dissect()
++ * assumes for a headroom of 8.
++ */
++static inline void rtl8_4s_dissect(const u8 *t, unsigned int len, int *off,
++				   u16 *proto)
++{
++	if (len >= 6 && rtl8_4s_get_be16(t) == RTL8_4S_ET_S) {
++		*off = RTL8_4S_S_TAG_LEN;
++		*proto = rtl8_4s_get_be16(t + 4);
++		return;
++	}
++	*off = 8;
++	*proto = len >= 10 ? rtl8_4s_get_be16(t + 8) : 0;
++}
++
++/* The drop_<name> keys of the switch driver's svlan_counters */
++static inline const char *rtl8_4s_drop_name(unsigned int drop)
++{
++	static const char * const names[RTL8_4S_DROP_NUM] = {
++		[RTL8_4S_DROP_NOT_READY]	= "not_ready",
++		[RTL8_4S_DROP_S_OFF]		= "s_off",
++		[RTL8_4S_DROP_HWACCEL]		= "hwaccel",
++		[RTL8_4S_DROP_TRUNC]		= "trunc",
++		[RTL8_4S_DROP_ETYPE]		= "etype",
++		[RTL8_4S_DROP_RT]		= "rt",
++		[RTL8_4S_DROP_RT_REASON0]	= "rt_reason0",
++		[RTL8_4S_DROP_SVID_DN]		= "svid_dn",
++		[RTL8_4S_DROP_SVID_OTHER]	= "svid_other",
++		[RTL8_4S_DROP_SVID_PORT]	= "svid_port",
++		[RTL8_4S_DROP_NO_USER]		= "no_user",
++		[RTL8_4S_DROP_INNER_RSV]	= "inner_rsv",
++	};
++
++	return drop < RTL8_4S_DROP_NUM && names[drop] ? names[drop] : "?";
++}
++
++#endif /* __DSA_TAG_RTL8_4S_H */
