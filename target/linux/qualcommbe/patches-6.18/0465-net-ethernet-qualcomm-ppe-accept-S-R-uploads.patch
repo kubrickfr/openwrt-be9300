@@ -1,0 +1,1489 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: accept S-R uploads
+
+While the S-R mode is active, a flow entering through a user port of the
+rtl8_4s switch can be told apart from the frames of every other port and
+VLAN: the switch puts its port's upload S-tag on them, and an identity
+(an XLT rule on that S-tag and on the C-tag form of the port's class,
+installed by the mode) gives those frames, and those alone, an L3
+interface of their own. This patch accepts such uploads, keyed on that
+L3 interface instead of the conduit's, which every port and VLAN of the
+switch shares.
+
+An upload from a switch port is classified to its port's untagged class
+U(p) when the flowtable gives it no VLAN key, or to T(p, v) when it gives
+an exact 802.1Q key v with its pop; a second tag, an 802.1ad key, an
+inexact or zero VID and a PCP match are declined before, as for every
+flow. It is judged in two steps:
+
+- lockless (ppe_sr_offer_pre()): the offer's ticket gives the S-R mode, the
+  port awaits no resync (else -EAGAIN), its conduit is the S-R one and
+  says ACTIVE, the port is in the S-R port mask and forwards, and the
+  topology published to offers gives it a class;
+- under the lock (ppe_sr_offer_lock()), after the ticket: the port still
+  awaits no resync, the switch still says ACTIVE (else the disarm of the
+  statistics-time check is queued), the class comes out of the topology
+  as it is now as it came out of the one judged on (else -EAGAIN), and
+  the class has a live identity, whose L3 interface becomes the flow's
+  source L3 interface.
+
+Only the second accepts; both are pure (ppe_sr_eng.c) and tested in user
+space with every gate, class, scope and race between them. Between them,
+the flow must be SNAT towards an EDMA port that is not a switch conduit
+(the WAN; a PPPoE upload included, which this makes possible), the
+ingress and egress EDMA devices must differ, and WP3's scope must hold
+the class and the client (the source address); back to a switch port,
+DNAT and out of scope are declined. Every S-R decline is counted by
+reason, every accepted upload by identity.
+
+An accepted upload is on its identity's flow list from before its
+hardware add until it is forgotten, on every path: a failed add unlinks
+it, a flow left in hardware by one stays linked (and the degraded latch
+is S-R's FAULT, which keeps the identity's L3 interface as it is), a
+lost one is unlinked and is FAULT too. The S-R flushes no longer drop
+every flow: an identity's flush drops its list and reports what stays on
+it, a port flush the S-R flows of those ports, and a scope change the
+S-R flows the new scope excludes (it no longer marks every port dirty:
+it bumps the generation, so no offer judged under the old scope is
+added, and the resync makes the identities follow).
+
+Also: the arm publishes its topology before turning offers on, so that
+an offer judged while ACTIVE always finds one; the dirty marks, the S-R
+port mask and the conduit pointer are stored with WRITE_ONCE() for the
+lockless judgement; the PPPoE and source MAC L3 interfaces are asserted
+below the identities'; offload_flows shows "sr up id I l3_if N" for an
+S-R upload; the idle verify checks every upload against its identity
+(the identity in use with the flow's class and L3 interface, live, the
+upload on its list) and disarms on a mismatch while ACTIVE; the status
+gives each identity's uploads and the accepted offers by direction.
+S-R downloads are still declined.
+
+Signed-off-by: François Guerraz <kubrick@fgv6.net>
+---
+ drivers/net/ethernet/qualcomm/ppe/ppe_offload.c |  302 ++++++++++++++++++++---
+ drivers/net/ethernet/qualcomm/ppe/ppe_offload.h |    1 
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr.c      |  189 +++++++++++++-
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr.h      |   17 +
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_eng.c  |  210 +++++++++++++++-
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_eng.h  |   84 ++++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_seq.c  |    1 
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_seq.h  |    9 -
+ 8 files changed, 739 insertions(+), 74 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -79,18 +79,18 @@
+  *   ppe_offload_pppoe_get(). Without the key the reply of a PPPoE flow is
+  *   declined, as it always was.
+  * - PPPoE egress (the upload of a connection routed out through a PPPoE
+- *   interface, FLOW_ACTION_PPPOE_PUSH) is accepted only for an upload
+- *   classified to an S-R identity, SNAT to the PPP interface's own address
+- *   on the session the kernel has, addressed to its concentrator; the
+- *   nexthop leaves through the session's L3 interface, and the PMTU is at
+- *   most the PPP MTU. No upload is classified so yet: they are declined.
++ *   interface, FLOW_ACTION_PPPOE_PUSH) is accepted only for an S-R upload
++ *   (below), SNAT to the PPP interface's own address on the session the
++ *   kernel has, addressed to its concentrator; the nexthop leaves through
++ *   the session's L3 interface, and the PMTU is at most the PPP MTU.
+  * - Tagged ingress (the reply direction on a tagged WAN) arrives as a
+  *   FLOW_DISSECTOR_KEY_VLAN match on the real device plus a
+  *   FLOW_ACTION_VLAN_POP. The flow key cannot carry the VLAN, only the
+  *   port's ingress L3 interface, so this is accepted with the collapse
+  *   described under SECURITY LIMITATION below, and only when the VID
+  *   names a VLAN upper really stacked on that device. Tagged ingress on
+- *   a DSA user port (a VLAN-aware bridge) is declined.
++ *   a DSA user port (a VLAN-aware bridge) is declined, except as an
++ *   S-R upload, whose tag names its class.
+  * - The flow must carry a FLOW_ACTION_MANGLE for the Ethernet header:
+  *   this is the *only* source this code uses for the nexthop's
+  *   destination MAC, deliberately -- the kernel has already resolved
+@@ -133,12 +133,15 @@
+  *   arriving untagged on wan, and vice versa. The
+  *   hardware offers no finer qualifier, so this is a property of
+  *   enabling the flowtable across such a boundary, not something this
+- *   driver can validate away.
++ *   driver can validate away. S-R uploads are the exception: each is
++ *   keyed on the identity of its switch port and VLAN, an L3 interface
++ *   that only frames of that port and VLAN are given (below).
+  *
+  * Flows entering on the WAN port hit in hardware (measured by Kamil
+  * Bienkiewicz). Flows entering on an rtl8_4 conduit cannot: with the
+  * reset TPIDs the parser stops at the 0x8899 head tag, so they are
+- * declined (ppe_offload_flow_replace()) and uploads stay in software.
++ * declined (ppe_offload_flow_replace()) and uploads stay in software,
++ * except in the S-R mode.
+  *
+  * The S-R mode (ppe_sr.c, ppe_sr_eng.c) is the one chip-wide alternative
+  * to profile E under the rtl8_4s tagger: armed only through ppe_sr_arm(),
+@@ -147,8 +150,21 @@
+  * judged under one mode (E while S-R is off, S-R while it is active, none
+  * in between) and added only if the mode has not moved since, checked
+  * under the lock; every degraded latch while S-R is not off is its FAULT
+- * (ppe_offload_set_degraded()); disabling offload disarms it first. S-R
+- * offers themselves are still declined.
++ * (ppe_offload_set_degraded()); disabling offload disarms it first.
++ *
++ * S-R uploads (WP2-DESIGN §3.4): a flow entering through a user port of
++ * the rtl8_4s switch, in the S-R port mask, is classified by the topology
++ * resolver to its port's untagged class U(p) (no VLAN key) or to T(p, v)
++ * (an exact 802.1Q key v, popped), judged lockless, then decided under the
++ * lock on the topology as it is then; the class must have a live identity
++ * (an XLT rule on the port's upload S-tag and the C-tag form, giving an L3
++ * interface copied from the conduit's), whose L3 interface keys the flow
++ * entry in place of the conduit's. Only SNAT towards a non-switch EDMA
++ * port (the WAN, PPPoE included) is taken: back to a switch port, DNAT and
++ * a class or client out of WP3's scope are declined, each counted by
++ * reason. The flow is on its identity's list from before its hardware add
++ * until it is forgotten, on every error path, so that removing an identity
++ * finds every flow keyed on it. S-R downloads are still declined.
+  *
+  * Ported from Kamil Bienkiewicz's flow-offload series for the GL-BE9300
+  * (perceival/openwrt-flint3); IPv6 routing, the tag_8021q encapsulation
+@@ -331,6 +347,22 @@ struct ppe_offload_flow_entry {
+ 	 */
+ 	unsigned long move_window;
+ 	unsigned int move_count;
++	/* What the flow is to the S-R mode (enum ppe_sr_flow, WP2-DESIGN §3.4
++	 * step 6). An upload is keyed on the identity in slot @sr_id, whose L3
++	 * interface @sr_l3_if is the entry's SRC_L3_IF, and is on that
++	 * identity's flow list (struct ppe_sr::flows) through @sr_node from
++	 * before its hardware add until ppe_offload_flow_forget(): a flow kept
++	 * after a failed add stays on it, and pins the identity. @sr_cls is its
++	 * class and @sr_client its LAN host, the source address, for a scope
++	 * change. @sr_node is an empty list for every other flow. Under
++	 * priv->lock.
++	 */
++	u8 sr_mode;
++	u8 sr_id;
++	u8 sr_l3_if;
++	struct ppe_sr_class sr_cls;
++	__be32 sr_client;
++	struct list_head sr_node;
+ };
+ 
+ static const struct rhashtable_params ppe_offload_flow_ht_params = {
+@@ -417,6 +449,14 @@ struct ppe_offload_pppoe {
+ #define PPE_OFFLOAD_SMAC_MAX		4
+ #define PPE_OFFLOAD_SMAC_L3_IF_BASE	24
+ 
++/* S-R identities take L3 interfaces from PPE_SR_L3IF_FIRST on: past the
++ * ports', the PPPoE sessions' and these, so that no S-R upload is ever keyed
++ * on one of them (WP2-DESIGN §3.3, §4.8 invariant 4).
++ */
++static_assert(PPE_OFFLOAD_PPPOE_L3_IF_BASE + PPE_OFFLOAD_PPPOE_MAX <=
++	      PPE_OFFLOAD_SMAC_L3_IF_BASE);
++static_assert(PPE_OFFLOAD_SMAC_L3_IF_BASE + PPE_OFFLOAD_SMAC_MAX <= PPE_SR_L3IF_FIRST);
++
+ /**
+  * struct ppe_offload_smac - An egress L3 interface for a source MAC address.
+  * @mac: The address.
+@@ -1531,6 +1571,8 @@ static void ppe_offload_flow_forget(struct ppe_offload_priv *priv,
+ {
+ 	rhashtable_remove_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
+ 	list_del(&entry->list);
++	/* Off its S-R identity's list: its hardware entry is gone. */
++	list_del_init(&entry->sr_node);
+ 	if (entry->dsa_fixed) {
+ 		spin_lock_bh(&priv->dsa_fixed_lock);
+ 		hash_del(&entry->dsa_fixed_hnode);
+@@ -2489,6 +2531,9 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	struct edma_port_priv *port_priv;
+ 	struct net_device *odev = NULL;
+ 	struct net_device *idev;
++	/* Only ever compared: the EDMA port the flow enters through. */
++	struct net_device *ingress_edma = NULL;
++	struct ppe_sr_offer sr_offer = {};
+ 	struct flow_match_meta meta;
+ 	u32 ingress_l3_if = PPE_OFFLOAD_L3_IF_NONE;
+ 	__be32 match_src = 0, match_dst = 0;
+@@ -2504,6 +2549,8 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	bool flow_full = false;
+ 	bool ingress_unparsed = false;
+ 	bool ingress_sr = false;
++	bool sr_in = false;
++	int sr_ret = 0;
+ 	struct net_device *in_port;
+ 	struct ppe_offload_pppoe_info pppoe_info;
+ 	bool pppoe_in = false, pppoe_ok = false;
+@@ -2723,15 +2770,19 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	 */
+ 	rcu_read_lock();
+ 	idev = dev_get_by_index_rcu(dev_net(netdev), meta.key->ingress_ifindex);
+-	if (idev) {
++	/* An upload from a switch port: in the S-R mode its VLAN key, or none,
++	 * names its class, judged below; never a DNAT to this router.
++	 */
++	sr_in = idev && ppe_offload_is_dsa_user(idev);
++	if (idev && !sr_in) {
+ 		struct net_device *l3dev = idev;
+ 
+ 		if (ingress_vlan_vid) {
+ 			/* The tag must name a VLAN upper of the very device
+-			 * the frames arrive on. A DSA user port is excluded:
+-			 * its tags are a VLAN-aware bridge's, and the
+-			 * collapse would then cross bridge VLANs, which
+-			 * nobody has measured.
++			 * the frames arrive on. The collapse below would
++			 * otherwise cross VLANs nobody has measured; a switch
++			 * port's tags are its bridge's, which only the S-R
++			 * mode tells apart.
+ 			 */
+ 			l3dev = NULL;
+ 			if (!is_vlan_dev(idev) && edma_port_is_edma_netdev(idev))
+@@ -2762,23 +2813,43 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	if (in_port)
+ 		idev = ppe_offload_ingress_edma_dev(in_port);
+ 	if (idev) {
++		ingress_edma = idev;
+ 		ingress_l3_if = ((struct edma_port_priv *)netdev_priv(idev))->l3_if_index;
+ #if IS_ENABLED(CONFIG_NET_DSA)
+ 		/* The ingress parser stops at the rtl8_4 head tag, so an
+ 		 * entry for frames from the switch would never hit: it
+ 		 * would hold a slot, and every refresh would read it back
+-		 * and get -EEXIST, a valid entry never being stale.
++		 * and get -EEXIST, a valid entry never being stale. Only the
++		 * S-R mode classifies them (its switch port's uploads).
+ 		 */
+-		if (netdev_uses_dsa(idev))
++		if (netdev_uses_dsa(idev) && !sr_in)
+ 			ingress_unparsed = true;
+ #endif
+ 	}
++	/* WP2-DESIGN §3.4 steps 1 and 2, lockless: a hint, decided under the
++	 * lock below.
++	 */
++	if (sr_in && ticket.mode == PPE_SR_MODE_SR) {
++		sr_offer.dir = PPE_SR_UP;
++		sr_offer.tagged = !!ingress_vlan_vid;
++		sr_offer.vid = ingress_vlan_vid;
++		sr_ret = ppe_sr_offer_pre(priv, &ticket, in_port, &sr_offer);
++	}
+ 	rcu_read_unlock();
+ 
+-	if (ingress_unparsed && ticket.mode == PPE_SR_MODE_SR) {
++	if (sr_in && ticket.mode != PPE_SR_MODE_SR) {
++		/* Profile E: the parser stops at the head tag (above). */
+ 		ppe_sr_count_decline(&priv->sr, PPE_SR_W_SR_NOT_ACTIVE);
+-		return ppe_offload_decline("ingress ifindex %d: S-R uploads not implemented",
+-					    meta.key->ingress_ifindex);
++		ingress_unparsed = true;
++	} else if (sr_in) {
++		/* The port's topology awaits its resync: re-offered then. */
++		if (sr_ret == -EAGAIN)
++			return -EAGAIN;
++		if (sr_ret)
++			return ppe_offload_decline("ingress ifindex %d: S-R upload: %s",
++						    meta.key->ingress_ifindex,
++						    ppe_sr_why_name(sr_offer.why));
++		ingress_sr = true;
+ 	}
+ 	if (ingress_unparsed)
+ 		return ppe_offload_decline("ingress ifindex %d: the parser cannot see past the rtl8_4 tag",
+@@ -2955,6 +3026,11 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		struct dsa_port *dp = dsa_port_from_netdev(odev);
+ 
+ 		if (!IS_ERR(dp)) {
++			if (ingress_sr) {
++				ppe_sr_count_decline(&priv->sr, PPE_SR_W_LAN_TO_LAN);
++				return ppe_offload_decline("odev=%s: S-R upload to the switch",
++							    netdev_name(odev));
++			}
+ 			ret = ppe_offload_dsa_egress(priv, odev, dp, vlan_push_seen,
+ 						     vlan_push_vid, ticket.mode, &egress);
+ 			if (ret)
+@@ -2973,8 +3049,11 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		 * hardware flow would not emit; the switch is addressed
+ 		 * through its user ports above, never through the conduit.
+ 		 */
+-		if (netdev_uses_dsa(odev))
++		if (netdev_uses_dsa(odev)) {
++			if (ingress_sr)
++				ppe_sr_count_decline(&priv->sr, PPE_SR_W_LAN_TO_LAN);
+ 			return ppe_offload_decline("odev=%s is a dsa conduit", netdev_name(odev));
++		}
+ 
+ 		egress.dev = odev;
+ 		if (vlan_push_seen) {
+@@ -2998,6 +3077,10 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	} else if (pppoe_out) {
+ 		return ppe_offload_decline("pppoe egress without snat to the session's address");
+ 	} else if (new_dst != match_dst && new_src == match_src && l4.source == match_sport) {
++		if (ingress_sr) {
++			ppe_sr_count_decline(&priv->sr, PPE_SR_W_DNAT_FROM_LAN);
++			return ppe_offload_decline("dnat of %pI4 from a switch port", &match_dst);
++		}
+ 		if (!dst_on_ingress && !pppoe_ok)
+ 			return ppe_offload_decline("dnat of %pI4, not an address of ingress %d",
+ 						    &match_dst, meta.key->ingress_ifindex);
+@@ -3009,6 +3092,15 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 					    &new_dst, ntohs(l4.dest));
+ 	}
+ 
++	/* WP2-DESIGN §3.4 step 4: WP3's scope, for the class and the client
++	 * (the upload's source). Lockless: a scope change bumps the S-R
++	 * generation, so an offer judged under the old one is not added.
++	 */
++	if (ingress_sr && !ppe_sr_scope_ok(priv, &sr_offer.cls, match_src, PPE_SR_UP)) {
++		ppe_sr_count_decline(&priv->sr, PPE_SR_W_SCOPE);
++		return ppe_offload_decline("S-R upload from %pI4: not in scope", &match_src);
++	}
++
+ 	/* eth.bytes is {h_dest[6], h_source[6]}. The new source half
+ 	 * must be this egress port's own MAC -- if it isn't, either
+ 	 * this isn't the flow we think it is or the port's L3_IF entry
+@@ -3033,8 +3125,8 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	/* PPPoE upload: the session must be the kernel's for the address
+ 	 * the flow is translated to, on the device and VLAN it leaves
+ 	 * through, and the frames must be addressed to its concentrator.
+-	 * Accepted only for an upload classified to an S-R identity, which
+-	 * no upload is yet.
++	 * Accepted only for an S-R upload, keyed on its identity: no other
++	 * upload can be told apart from the frames of another port or VLAN.
+ 	 */
+ 	if (pppoe_out) {
+ 		struct net_device *lower = egress.dev;
+@@ -3070,9 +3162,10 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	 * VLAN a frame came in on, so a flow leaving the port it entered
+ 	 * (say untagged wan in, wan.10 out, or one LAN VLAN to another over
+ 	 * the conduit) would also match frames from the other VLAN of that
+-	 * port.
++	 * port. Compared by device too: an S-R upload's key is its identity's
++	 * L3 interface, not the port's (WP2-DESIGN §3.4 step 3).
+ 	 */
+-	if (ingress_l3_if == port_priv->l3_if_index)
++	if (ingress_edma == egress.dev || ingress_l3_if == port_priv->l3_if_index)
+ 		return ppe_offload_decline("odev=%s hairpin to its own ingress port",
+ 					    netdev_name(odev));
+ 
+@@ -3102,6 +3195,18 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		goto unlock;
+ 	}
+ 
++	/* WP2-DESIGN §3.4 step 5: an S-R upload is decided here, on the
++	 * topology and the identities as they are now; its identity gives the
++	 * flow's source L3 interface.
++	 */
++	if (ingress_sr) {
++		ret = ppe_sr_offer_lock(priv, &ticket, &sr_offer);
++		if (ret) {
++			stage = "S-R";
++			goto unlock;
++		}
++	}
++
+ 	/* A device of the session changed since it was resolved: the
+ 	 * session may already be out of hardware, and must not come back
+ 	 * from a stale resolution. Re-offered within a second.
+@@ -3178,6 +3283,11 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		if (pppoe_in)
+ 			flow_l3_if = PPE_OFFLOAD_PPPOE_L3_IF_BASE + pppoe_slot;
+ 	}
++	/* Only frames of the upload's port and VLAN get its identity's L3
++	 * interface (WP2-DESIGN §3.1): any other fails the source check.
++	 */
++	if (ingress_sr)
++		flow_l3_if = sr_offer.l3_if;
+ 
+ 	/* Public IP entry for the translated (post-SNAT) source address.
+ 	 * DNAT carries its new destination in the nexthop entry instead.
+@@ -3282,6 +3392,7 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		stage = "alloc";
+ 		goto deref_host;
+ 	}
++	INIT_LIST_HEAD(&entry->sr_node);
+ 
+ 	entry->cookie = cls->cookie;
+ 	entry->flow_slots = PPE_FLOW_TBL_IPV4_ENTRY_SLOTS;
+@@ -3295,6 +3406,19 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	entry->smac_slot = smac_slot;
+ 	entry->block = block;
+ 
++	/* WP2-DESIGN §3.4 step 6: the identity owns the flow before hardware
++	 * may, so that its FLUSH_ID finds it whatever happens below; one left
++	 * in hardware by a failed add stays on its list and pins it.
++	 */
++	if (ingress_sr) {
++		entry->sr_mode = PPE_SR_FLOW_UP;
++		entry->sr_id = sr_offer.slot;
++		entry->sr_l3_if = sr_offer.l3_if;
++		entry->sr_cls = sr_offer.cls;
++		entry->sr_client = match_src;
++		list_add_tail(&entry->sr_node, &priv->sr.flows[sr_offer.slot]);
++	}
++
+ 	flow_index = 0;
+ 	ret = ppe_flow_entry_add(priv->ppe_dev, PPE_FLOW_OP_MODE_HASH, flow_words,
+ 				 PPE_FLOW_TBL_IPV4_ENTRY_WORDS, &flow_index);
+@@ -3349,6 +3473,9 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		spin_unlock_bh(&priv->dsa_fixed_lock);
+ 	}
+ 
++	if (ingress_sr)
++		ppe_sr_offer_accepted(priv, &sr_offer);
++
+ 	mutex_unlock(&priv->lock);
+ 
+ 	atomic_long_inc(&priv->counters.accepted);
+@@ -3367,7 +3494,9 @@ keep_entry:
+ 	 * go of for another flow to take, and disabling retries its delete
+ 	 * and keeps what it relies on until one succeeds (ppe_offload_flush()).
+ 	 * It is in no hash table, so no destroy or stats request finds it,
+-	 * and forgetting it removes nothing from one.
++	 * and forgetting it removes nothing from one. An S-R upload stays on
++	 * its identity's list: the latch below is S-R's FAULT, which keeps the
++	 * identity's L3 interface as it is.
+ 	 */
+ 	entry->flow_index = flow_index;
+ 	entry->flow_valid = true;
+@@ -3382,8 +3511,11 @@ keep_entry:
+ 	goto unlock;
+ lose_entry:
+ 	/* Where it went only the add's result would have said: no delete can
+-	 * reach it, so what it may point at is never let go of.
++	 * reach it, so what it may point at is never let go of. Nor can an
++	 * S-R identity it may be keyed on: the latch below is S-R's FAULT,
++	 * so its L3 interface is never put back or used again.
+ 	 */
++	list_del_init(&entry->sr_node);
+ 	kfree(entry);
+ 	priv->flows_lost++;
+ 	ppe_offload_set_degraded(priv);
+@@ -3391,6 +3523,7 @@ lose_entry:
+ 	pr_err("ppe_offload: a flow entry add never completed; the entry could not be deleted, wherever it is; new flows declined, disable and reboot\n");
+ 	goto unlock;
+ free_entry:
++	list_del_init(&entry->sr_node);
+ 	kfree(entry);
+ deref_host:
+ 	ppe_host_pool_deref(priv->ppe_dev, &priv->host_pool, host_index);
+@@ -5321,6 +5454,22 @@ static unsigned int ppe_offload_flush(struct ppe_offload_priv *priv, unsigned in
+ 	return stuck + priv->flows_lost;
+ }
+ 
++/* Whether @entry is one of the S-R flows a PPE_SR_FLUSH_PORTS or
++ * PPE_SR_FLUSH_SCOPE flush drops. Under priv->lock.
++ */
++static bool ppe_offload_sr_flush_match(struct ppe_offload_priv *priv,
++				       const struct ppe_offload_flow_entry *entry,
++				       enum ppe_sr_flush what, u32 arg)
++{
++	if (entry->sr_mode == PPE_SR_FLOW_NONE)
++		return false;
++	if (what == PPE_SR_FLUSH_PORTS)
++		return entry->sr_cls.port < PPE_SR_PORTS && (arg & BIT(entry->sr_cls.port));
++
++	return !ppe_sr_scope_ok(priv, &entry->sr_cls, entry->sr_client,
++				entry->sr_mode == PPE_SR_FLOW_UP ? PPE_SR_UP : PPE_SR_DN);
++}
++
+ /**
+  * ppe_offload_sr_flush() - Drop flows for the S-R mode (struct ppe_sr_io's
+  * flush).
+@@ -5329,19 +5478,97 @@ static unsigned int ppe_offload_flush(struct ppe_offload_priv *priv, unsigned in
+  * @arg: Its identity slot or port mask.
+  * @dropped: Set to the flows dropped.
+  *
+- * Under priv->lock. No flow is S-R's yet: while S-R is not off none is
+- * accepted, so every flow is dropped whatever @what names (the identity's
+- * uploads and the ports' downloads are among them).
++ * Under priv->lock. Every flow (PPE_SR_FLUSH_ALL); the uploads on an
++ * identity's list (PPE_SR_FLUSH_ID), which may not be left with any, or the
++ * identity could not be removed (WP2-DESIGN §5.2); the S-R flows of switch
++ * ports, both directions (PPE_SR_FLUSH_PORTS); the S-R flows the scope now
++ * in force excludes (PPE_SR_FLUSH_SCOPE). While S-R is not off no flow of
++ * profile E exists, so the flows of the last three that are not S-R's are
++ * the WAN's own, which they leave alone.
+  *
+  * Return: the flows that could not be dropped, those at an unknown index
+- * included.
++ * included (one of them may be any of S-R's).
+  */
+ unsigned int ppe_offload_sr_flush(struct ppe_offload_priv *priv, enum ppe_sr_flush what, u32 arg,
+ 				  unsigned int *dropped)
+ {
++	struct ppe_offload_flow_entry *entry, *tmp;
++	unsigned int stuck = 0;
++
++	lockdep_assert_held(&priv->lock);
++
++	*dropped = 0;
++	switch (what) {
++	case PPE_SR_FLUSH_ALL:
++		return ppe_offload_flush(priv, dropped);
++	case PPE_SR_FLUSH_ID:
++		if (arg >= PPE_SR_ID_MAX)
++			break;
++		list_for_each_entry_safe(entry, tmp, &priv->sr.flows[arg], sr_node)
++			if (!ppe_offload_flow_drop(priv, entry))
++				(*dropped)++;
++		/* What could not be dropped stays on the list. */
++		stuck = list_count_nodes(&priv->sr.flows[arg]);
++		break;
++	case PPE_SR_FLUSH_PORTS:
++	case PPE_SR_FLUSH_SCOPE:
++		list_for_each_entry_safe(entry, tmp, &priv->flows, list) {
++			if (!ppe_offload_sr_flush_match(priv, entry, what, arg))
++				continue;
++			if (ppe_offload_flow_drop(priv, entry))
++				stuck++;
++			else
++				(*dropped)++;
++		}
++		break;
++	}
++
++	return stuck + priv->flows_lost;
++}
++
++/**
++ * ppe_offload_sr_flows_check() - Check the S-R uploads against their
++ * identities (WP2-DESIGN §3.5, §4.8 invariants 4 and 7).
++ * @priv: The offload.
++ * @n: Set to the S-R uploads tracked.
++ *
++ * Under priv->lock; memory only. Each upload must be on the list of the
++ * identity it names, that identity must be in use with the class and the L3
++ * interface (S-R's, PPE_SR_L3IF_FIRST on) the flow was keyed on and, unless
++ * S-R is in FAULT, live in ACTIVE; every flow on a list is such an upload.
++ *
++ * Return: the inconsistencies found, 0 for none.
++ */
++unsigned int ppe_offload_sr_flows_check(struct ppe_offload_priv *priv, unsigned int *n)
++{
++	const struct ppe_sr_seq *seq = &priv->sr.eng.seq;
++	struct ppe_offload_flow_entry *entry;
++	unsigned int s, bad = 0, listed = 0;
++	const struct ppe_sr_id *id;
++
+ 	lockdep_assert_held(&priv->lock);
+ 
+-	return ppe_offload_flush(priv, dropped);
++	*n = 0;
++	list_for_each_entry(entry, &priv->flows, list)
++		if (entry->sr_mode == PPE_SR_FLOW_UP)
++			(*n)++;
++
++	for (s = 0; s < PPE_SR_ID_MAX; s++) {
++		id = &seq->id[s];
++		list_for_each_entry(entry, &priv->sr.flows[s], sr_node) {
++			listed++;
++			if (entry->sr_mode != PPE_SR_FLOW_UP || entry->sr_id != s || !id->used ||
++			    !ppe_sr_class_eq(&id->cls, &entry->sr_cls) ||
++			    entry->sr_l3_if != id->l3_if || entry->sr_l3_if < PPE_SR_L3IF_FIRST ||
++			    (seq->state != PPE_SR_S_FAULT &&
++			     (seq->state != PPE_SR_S_ACTIVE || !id->live)))
++				bad++;
++		}
++	}
++	if (listed != *n)
++		bad++;
++
++	return bad;
+ }
+ 
+ /* Whether the L3 routing failures flow offload relies on reach the CPU:
+@@ -5656,15 +5883,17 @@ static int ppe_offload_flows_show(struct seq_file *m, void *v)
+ 	}
+ 
+ 	list_for_each_entry(entry, &priv->flows, list) {
+-		seq_printf(m, "flow %u: valid %d nexthop %u host %u pppoe %d smac %d dsa_port %u%s packets %llu bytes %llu idle %ums\n",
++		seq_printf(m, "flow %u: valid %d nexthop %u host %u pppoe %d smac %d dsa_port %u%s",
+ 			   entry->flow_index, entry->flow_valid, entry->nexthop_index,
+ 			   entry->host_index, entry->pppoe ? entry->pppoe_slot : -1,
+ 			   entry->smac ? entry->smac_slot : -1,
+ 			   entry->dsa_fixed ? entry->dsa_index : 0,
+ 			   entry->dsa_vlan_aware ? (entry->dsa_vlan_tagged ? " vlan1-tagged" :
+-						    " vlan1-untagged") : "",
+-			   entry->stats_packets, entry->stats_bytes,
+-			   jiffies_to_msecs(jiffies - entry->lastused));
++						    " vlan1-untagged") : "");
++		if (entry->sr_mode == PPE_SR_FLOW_UP)
++			seq_printf(m, " sr up id %u l3_if %u", entry->sr_id, entry->sr_l3_if);
++		seq_printf(m, " packets %llu bytes %llu idle %ums\n", entry->stats_packets,
++			   entry->stats_bytes, jiffies_to_msecs(jiffies - entry->lastused));
+ 		n++;
+ 	}
+ 	seq_printf(m, "%u flow(s)\n", n);
+@@ -5984,6 +6213,7 @@ static unsigned int ppe_offload_flows_free(struct ppe_offload_priv *priv)
+ 		stuck++;
+ 		rhashtable_remove_fast(&priv->flow_table, &entry->node, ppe_offload_flow_ht_params);
+ 		list_del(&entry->list);
++		list_del_init(&entry->sr_node);
+ 		if (entry->dsa_fixed) {
+ 			spin_lock_bh(&priv->dsa_fixed_lock);
+ 			hash_del(&entry->dsa_fixed_hnode);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.h
+@@ -30,6 +30,7 @@ struct ppe_sr *ppe_offload_sr(struct ppe_offload_priv *priv);
+ void ppe_offload_set_degraded(struct ppe_offload_priv *priv);
+ unsigned int ppe_offload_sr_flush(struct ppe_offload_priv *priv, enum ppe_sr_flush what, u32 arg,
+ 				  unsigned int *dropped);
++unsigned int ppe_offload_sr_flows_check(struct ppe_offload_priv *priv, unsigned int *n);
+ int ppe_offload_sr_precheck(struct ppe_offload_priv *priv, u32 port, const char **what);
+ 
+ #endif
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_sr.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr.c
+@@ -6,6 +6,12 @@
+  * state the pure resolver (ppe_sr_topo.c) works on, and
+  * ppe_sr_topo_vinfo() answers its membership questions from the bridge.
+  *
++ * S-R offers (WP2-DESIGN §3.4, §4.1) are judged in two steps: lockless, on
++ * the topology published by RCU and the conduit's state word read under
++ * RCU (ppe_sr_offer_pre()), then under the lock, where the class is
++ * derived again on the topology as it is then and an upload's identity is
++ * looked up (ppe_sr_offer_lock()). Only the second accepts.
++ *
+  * Locking (WP2-DESIGN §6.3): ppe_offload_param_lock, then RTNL, then the
+  * offload lock (priv->lock, sr->lock), then the pools' mutexes. The arm
+  * holds RTNL and the lock from its prechecks to its end, so that the
+@@ -508,7 +514,7 @@ static void ppe_sr_settle(struct ppe_sr *sr)
+ 		return;
+ 	if (sr->conduit) {
+ 		netdev_put(sr->conduit, &sr->conduit_tracker);
+-		sr->conduit = NULL;
++		WRITE_ONCE(sr->conduit, NULL);
+ 	}
+ 	if (rcu_access_pointer(sr->topo))
+ 		ppe_sr_publish(sr, NULL);
+@@ -718,6 +724,7 @@ int ppe_sr_arm(struct ppe_offload_priv *priv, const struct ppe_sr_arm_args *args
+ 	struct net_device *conduit = NULL;
+ 	struct ppe_sr_topo_pub *pub;
+ 	struct ppe_sr_buf *b;
++	bool offers;
+ 	int ret;
+ 
+ 	ASSERT_RTNL();
+@@ -738,13 +745,20 @@ int ppe_sr_arm(struct ppe_offload_priv *priv, const struct ppe_sr_arm_args *args
+ 		ret = ppe_sr_arm_prepare(sr, args, &a, b, pub, &conduit, why);
+ 	if (!ret) {
+ 		/* Held for the claim (A4); let go by the settle if it ends off. */
+-		sr->conduit = conduit;
++		WRITE_ONCE(sr->conduit, conduit);
+ 		netdev_hold(conduit, &sr->conduit_tracker, GFP_KERNEL);
+ 		strscpy(sr->conduit_name, conduit->name, sizeof(sr->conduit_name));
++		/* Offers go on only once the topology is published: an offer
++		 * judged at ACTIVE always finds one.
++		 */
++		offers = a.offers;
++		a.offers = false;
+ 		ret = ppe_sr_eng_arm(&sr->eng, &sr->io, &a, why);
+ 		if (!ret) {
+ 			ppe_sr_publish(sr, pub);
+ 			pub = NULL;
++			if (offers)
++				ppe_sr_eng_offers(&sr->eng, &sr->io, true);
+ 		}
+ 	}
+ 	ppe_sr_settle(sr);
+@@ -949,7 +963,7 @@ void ppe_sr_netdev_event(struct ppe_offload_priv *priv, unsigned long event,
+ 	if (trigger == PPE_SR_T_CONDUIT_GONE) {
+ 		if (ppe_sr_eng_conduit_gone(&sr->eng, &sr->io) && sr->conduit) {
+ 			netdev_put(sr->conduit, &sr->conduit_tracker);
+-			sr->conduit = NULL;
++			WRITE_ONCE(sr->conduit, NULL);
+ 		}
+ 	} else if (trigger >= 0) {
+ 		ppe_sr_disarm(priv, trigger);
+@@ -996,6 +1010,128 @@ void ppe_sr_switchdev_event(struct ppe_offload_priv *priv, struct net_device *de
+ 		ppe_sr_queue_resync(sr);
+ }
+ 
++#if IS_ENABLED(CONFIG_NET_DSA)
++/**
++ * ppe_sr_offer_pre() - Steps 1 and 2 of an S-R offer (WP2-DESIGN §3.4,
++ * §4.1).
++ * @priv: The offload.
++ * @t: The offer's ticket (ppe_sr_eng_ticket()).
++ * @dev: The DSA user port the flow enters through (an upload) or leaves
++ * through (a download).
++ * @o: The offer: @o->dir, @o->tagged and @o->vid filled in by the caller;
++ * the port, whether its conduit is the S-R one and whether it forwards are
++ * filled in here, then judged (ppe_sr_eng_offer_pre()).
++ *
++ * Under RCU; the flow rule holds @dev. Lockless: a hint, which may decline
++ * or delay the offer but never accepts it (ppe_sr_offer_lock() does). The
++ * conduit's state word is read on the port's own conduit, and only when
++ * that is the S-R one. Declines are counted.
++ *
++ * Return: 0, -EAGAIN (DIRTY), -EOPNOTSUPP (declined, @o->why says why).
++ */
++int ppe_sr_offer_pre(struct ppe_offload_priv *priv, const struct ppe_sr_ticket *t,
++		     struct net_device *dev, struct ppe_sr_offer *o)
++{
++	struct ppe_sr *sr = ppe_offload_sr(priv);
++	const struct ppe_sr_topo_pub *pub;
++	struct net_device *conduit = NULL;
++	struct dsa_port *dp;
++	unsigned long at;
++	int word = -1, ret;
++
++	dp = dsa_port_from_netdev(dev);
++	if (IS_ERR(dp)) {
++		o->why = PPE_SR_W_NOT_SR_CONDUIT;
++		ppe_sr_count_decline(sr, o->why);
++		return -EOPNOTSUPP;
++	}
++	o->port = min_t(unsigned int, dp->index, U8_MAX);
++	if (dp->cpu_dp)
++		conduit = dp->cpu_dp->conduit;
++	o->conduit_ok = conduit && conduit == READ_ONCE(sr->conduit);
++	o->stp_fwd = netif_running(dev) && READ_ONCE(dp->stp_state) == BR_STATE_FORWARDING;
++	if (o->conduit_ok)
++		word = ppe_sr_td_word(rtl8_4s_conduit_td(conduit), &at);
++	pub = rcu_dereference(sr->topo);
++	ret = ppe_sr_eng_offer_pre(&sr->eng, t, pub ? &pub->topo : NULL, word, o);
++	if (ret)
++		ppe_sr_count_decline(sr, o->why);
++
++	return ret;
++}
++#else
++int ppe_sr_offer_pre(struct ppe_offload_priv *priv, const struct ppe_sr_ticket *t,
++		     struct net_device *dev, struct ppe_sr_offer *o)
++{
++	o->why = PPE_SR_W_NOT_SR_CONDUIT;
++
++	return -EOPNOTSUPP;
++}
++#endif
++
++/**
++ * ppe_sr_offer_lock() - Step 5 of an S-R offer: decide it (WP2-DESIGN §3.4,
++ * §4.1).
++ * @priv: The offload.
++ * @t: The offer's ticket.
++ * @o: The offer as ppe_sr_offer_pre() passed it; an upload's identity slot
++ * and L3 interface are set if it is accepted.
++ *
++ * Under the lock, before the offer writes hardware: the ticket, the port's
++ * dirty marks, the switch's state word read now, the class derived again
++ * on the topology as it is now, and an upload's live identity (see
++ * ppe_sr_eng_offer_lock()). A switch out of step queues the disarm (D17).
++ * Declines are counted.
++ *
++ * Return: 0, -EAGAIN (something moved since the offer was judged), or
++ * -EOPNOTSUPP (declined, @o->why says why).
++ */
++int ppe_sr_offer_lock(struct ppe_offload_priv *priv, const struct ppe_sr_ticket *t,
++		      struct ppe_sr_offer *o)
++{
++	struct ppe_sr *sr = ppe_offload_sr(priv);
++	const struct ppe_sr_topo_pub *pub;
++	int ret;
++
++	lockdep_assert_held(sr->lock);
++
++	pub = rcu_dereference_protected(sr->topo, lockdep_is_held(sr->lock));
++	ret = ppe_sr_eng_offer_lock(&sr->eng, t, pub ? &pub->topo : NULL, ppe_sr_word(sr, NULL),
++				    o);
++	if (o->lost)
++		schedule_work(&sr->lost_work);
++	if (ret)
++		ppe_sr_count_decline(sr, o->why);
++
++	return ret;
++}
++
++/**
++ * ppe_sr_offer_accepted() - Count an S-R offer the offload programmed.
++ * @priv: The offload.
++ * @o: The offer, as ppe_sr_offer_lock() accepted it.
++ *
++ * Under the lock.
++ */
++void ppe_sr_offer_accepted(struct ppe_offload_priv *priv, const struct ppe_sr_offer *o)
++{
++	struct ppe_sr *sr = ppe_offload_sr(priv);
++	struct ppe_sr_id_acc *acc;
++
++	lockdep_assert_held(sr->lock);
++
++	if (o->dir < ARRAY_SIZE(sr->accepted))
++		sr->accepted[o->dir]++;
++	if (o->dir != PPE_SR_UP || o->slot >= PPE_SR_ID_MAX)
++		return;
++	acc = &sr->acc[o->slot];
++	if (!ppe_sr_class_eq(&acc->cls, &o->cls)) {
++		acc->cls = o->cls;
++		acc->up = 0;
++	}
++	acc->up++;
++}
++
+ /* Apply topology and scope changes once complete (WP2-DESIGN §5.2): RTNL,
+  * then the lock; on the FDB workqueue, after the change that queued it.
+  */
+@@ -1159,6 +1295,8 @@ void ppe_sr_init(struct ppe_sr *sr, struct ppe_offload_priv *priv, struct ppe_de
+ 	sr->reboot_nb.notifier_call = ppe_sr_reboot;
+ 	for (i = 0; i < PPE_SR_W_NUM; i++)
+ 		atomic_long_set(&sr->decline[i], 0);
++	for (i = 0; i < PPE_SR_ID_MAX; i++)
++		INIT_LIST_HEAD(&sr->flows[i]);
+ }
+ 
+ /**
+@@ -1200,7 +1338,7 @@ void ppe_sr_destroy(struct ppe_sr *sr)
+ 	cancel_work_sync(&sr->lost_work);
+ 	if (sr->conduit) {
+ 		netdev_put(sr->conduit, &sr->conduit_tracker);
+-		sr->conduit = NULL;
++		WRITE_ONCE(sr->conduit, NULL);
+ 	}
+ 	topo = rcu_replace_pointer(sr->topo, NULL, true);
+ 	if (topo)
+@@ -1229,9 +1367,9 @@ void ppe_sr_boot_check(struct ppe_sr *sr, u8 ppe_port)
+  * @priv: The offload.
+  * @scope: The new scope, copied; NULL for none (nothing in scope).
+  *
+- * Under RTNL; takes the lock. While armed every flow goes (0465/0466 drop
+- * only those the new scope excludes), offers wait, and the resync makes
+- * the identities follow.
++ * Under RTNL; takes the lock. While armed the S-R flows the new scope
++ * excludes go, no offer judged under the old scope is added, and the
++ * resync makes the identities follow.
+  *
+  * Return: 0, -EINVAL for a malformed scope, -ENOMEM.
+  */
+@@ -1254,8 +1392,7 @@ int ppe_sr_scope_set(struct ppe_offload_priv *priv, const struct ppe_sr_scope *s
+ 
+ 	mutex_lock(sr->lock);
+ 	old = rcu_replace_pointer(sr->scope, pub, lockdep_is_held(sr->lock));
+-	queue = ppe_sr_eng_topo_event(&sr->eng, &sr->io, PPE_SR_PORTS_ALL, false);
+-	ppe_sr_eng_bump(&sr->eng);
++	queue = ppe_sr_eng_scope_event(&sr->eng, &sr->io);
+ 	ppe_sr_settle(sr);
+ 	mutex_unlock(sr->lock);
+ 
+@@ -1277,7 +1414,9 @@ int ppe_sr_scope_set(struct ppe_offload_priv *priv, const struct ppe_sr_scope *s
+  * destination.
+  * @dir: enum ppe_sr_dir.
+  *
+- * Lockless (RCU). No scope denies.
++ * Lockless (RCU), or under the lock for what is in force now. No scope
++ * denies; without qcom_ppe.sr_u_uploads an upload of a U class is not in
++ * scope.
+  *
+  * Return: true if in scope.
+  */
+@@ -1288,12 +1427,10 @@ bool ppe_sr_scope_ok(struct ppe_offload_priv *priv, const struct ppe_sr_class *c
+ 	const struct ppe_sr_scope_pub *pub;
+ 	bool ok;
+ 
+-	if (dir == PPE_SR_UP && cls->form == PPE_SR_U && !READ_ONCE(ppe_sr_u_uploads))
+-		return false;
+-
+ 	rcu_read_lock();
+ 	pub = rcu_dereference(sr->scope);
+-	ok = pub && ppe_sr_scope_has(&pub->scope, cls) && ppe_sr_scope_client(&pub->scope, client);
++	ok = ppe_sr_scope_allows(pub ? &pub->scope : NULL, cls, client, dir,
++				 READ_ONCE(ppe_sr_u_uploads));
+ 	rcu_read_unlock();
+ 
+ 	return ok;
+@@ -1368,12 +1505,15 @@ void ppe_sr_status_fill(struct ppe_offload_priv *priv, struct ppe_sr_status *st)
+ 
+ 		if (!id->used)
+ 			continue;
+-		st->id[st->nid++] = (struct ppe_sr_status_id){ .cls = id->cls, .live = id->live,
+-							       .xlt = id->xlt,
+-							       .l3_if = id->l3_if };
++		st->id[st->nid++] = (struct ppe_sr_status_id){
++			.cls = id->cls, .live = id->live, .xlt = id->xlt, .l3_if = id->l3_if,
++			.up = list_count_nodes(&sr->flows[s]),
++			.acc_up = ppe_sr_class_eq(&sr->acc[s].cls, &id->cls) ? sr->acc[s].up : 0,
++		};
+ 	}
+ 	for (i = 0; i < PPE_SR_W_NUM; i++)
+ 		st->decline[i] = atomic_long_read(&sr->decline[i]);
++	memcpy(st->accepted, sr->accepted, sizeof(st->accepted));
+ 	memcpy(st->trig, eng->trig, sizeof(st->trig));
+ 	st->arm_ok = eng->arm_ok;
+ 	memcpy(st->arm_refused, eng->arm_refused, sizeof(st->arm_refused));
+@@ -1394,15 +1534,17 @@ void ppe_sr_status_fill(struct ppe_offload_priv *priv, struct ppe_sr_status *st)
+  *
+  * Takes the lock. Reads registers, every XLT rule among them: idle only,
+  * never under load. Each mismatch is shown and logged ("sr: verify
+- * MISMATCH"), and disarms (VERIFY) while ACTIVE.
++ * MISMATCH"), and disarms (VERIFY) while ACTIVE. The upload flows are
++ * checked against their identities too (WP2-DESIGN §3.5, §4.8 invariants
++ * 4 and 7), from memory.
+  *
+  * Return: 0.
+  */
+ int ppe_sr_hw_show(struct ppe_offload_priv *priv, struct seq_file *m)
+ {
+ 	struct ppe_sr *sr = ppe_offload_sr(priv);
++	unsigned int s, n, bad;
+ 	struct ppe_sr_id_cnt c;
+-	unsigned int s;
+ 	int ret;
+ 
+ 	mutex_lock(sr->lock);
+@@ -1417,6 +1559,15 @@ int ppe_sr_hw_show(struct ppe_offload_priv *priv, struct seq_file *m)
+ 	else
+ 		seq_printf(m, "verify %s\n", ret ? "error" : "match");
+ 
++	bad = ppe_offload_sr_flows_check(priv, &n);
++	seq_printf(m, "flows up %u %s\n", n, bad ? "MISMATCH" : "match");
++	if (bad) {
++		pr_err("ppe_offload: sr: verify MISMATCH flows: %u of %u upload flow(s) not on their identity\n",
++		       bad, n);
++		if (sr->eng.seq.state == PPE_SR_S_ACTIVE)
++			ppe_sr_eng_disarm(&sr->eng, &sr->io, PPE_SR_T_VERIFY);
++	}
++
+ 	for (s = 0; s < PPE_SR_ID_MAX; s++) {
+ 		const struct ppe_sr_id *id = &sr->eng.seq.id[s];
+ 
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_sr.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr.h
+@@ -107,6 +107,16 @@ enum ppe_sr_dir {
+ 	PPE_SR_DN
+ };
+ 
++/* What a tracked flow is to S-R (WP2-DESIGN §6.2's sr_mode of a flow
++ * entry): nothing (profile E, or a flow that does not cross the switch), an
++ * upload keyed on an identity, a download to a switch port.
++ */
++enum ppe_sr_flow {
++	PPE_SR_FLOW_NONE,
++	PPE_SR_FLOW_UP,
++	PPE_SR_FLOW_DN
++};
++
+ /* @deadline: jiffies at which the S-R mode disarms by itself; capped at
+  * the switch's own deadline less PPE_SR_DEADLINE_MARGIN_S.
+  * @offers: Accept offers right after arming.
+@@ -126,8 +136,10 @@ struct ppe_device;
+ struct ppe_offload_priv;
+ struct ppe_sr;
+ struct ppe_sr_class;
++struct ppe_sr_offer;
+ struct ppe_sr_scope;
+ struct ppe_sr_status;
++struct ppe_sr_ticket;
+ struct ppe_sr_topo_in;
+ struct seq_file;
+ struct workqueue_struct;
+@@ -162,6 +174,11 @@ void ppe_sr_stats_check(struct ppe_sr *sr);
+ void ppe_sr_netdev_event(struct ppe_offload_priv *priv, unsigned long event,
+ 			 struct net_device *dev);
+ void ppe_sr_switchdev_event(struct ppe_offload_priv *priv, struct net_device *dev);
++int ppe_sr_offer_pre(struct ppe_offload_priv *priv, const struct ppe_sr_ticket *t,
++		     struct net_device *dev, struct ppe_sr_offer *o);
++int ppe_sr_offer_lock(struct ppe_offload_priv *priv, const struct ppe_sr_ticket *t,
++		      struct ppe_sr_offer *o);
++void ppe_sr_offer_accepted(struct ppe_offload_priv *priv, const struct ppe_sr_offer *o);
+ 
+ /* The S-R kernel API (WP2-DESIGN §6.2), which WP3's controls drive. */
+ int ppe_sr_arm(struct ppe_offload_priv *priv, const struct ppe_sr_arm_args *args,
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_sr_eng.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_eng.c
+@@ -21,11 +21,19 @@
+  * stuck flow, before writing anything more: released and off at A5, FAULT
+  * elsewhere. Any other latch inside a sequence is held until it returns,
+  * and is FAULT then if the state is still neither OFF nor FAULT.
++ *
++ * S-R offers (§3.4 steps 1, 2 and 5): ppe_sr_eng_offer_pre() judges one
++ * lockless, on the topology published to offers; what it reads of the
++ * engine (the dirty marks, the port mask) may delay or decline the offer,
++ * never accept it. ppe_sr_eng_offer_lock() decides under the lock, which
++ * orders every write of what it reads, the class derived again on the
++ * topology as it is then.
+  */
+ #ifndef RTL8_4S_PURE
+ #define RTL8_4S_PURE
+ #endif
+ #include <asm/barrier.h>
++#include <linux/bits.h>
+ #include <linux/build_bug.h>
+ #include <linux/compiler.h>
+ #include <linux/errno.h>
+@@ -196,6 +204,133 @@ bool ppe_sr_eng_ticket_ok(const struct ppe_sr_eng *eng, const struct ppe_sr_tick
+ 	return READ_ONCE(eng->gen) == t->gen && eng->seq.state == want;
+ }
+ 
++/* The class of an offer on @topo, and a download's MTU cap. */
++static enum ppe_sr_why eng_offer_class(const struct ppe_sr_topo *topo,
++				       const struct ppe_sr_offer *o, struct ppe_sr_class *cls,
++				       u32 *mtu_cap)
++{
++	*mtu_cap = 0;
++	if (o->dir == PPE_SR_DN)
++		return ppe_sr_class_dn(topo, o->port, o->tagged, o->vid, cls, mtu_cap);
++
++	return ppe_sr_class_up(topo, o->port, o->tagged, o->vid, cls);
++}
++
++/* Whether @port awaits its resync. */
++static bool eng_port_dirty(u8 dirty, u16 dirty_ports, u8 port)
++{
++	return dirty || (port < PPE_SR_PORTS && (dirty_ports & BIT(port)));
++}
++
++/**
++ * ppe_sr_eng_offer_pre() - Judge an S-R offer without the lock (WP2-DESIGN
++ * §3.4 steps 1 and 2, §4.1).
++ * @eng: The engine.
++ * @t: The offer's ticket (ppe_sr_eng_ticket()).
++ * @topo: The topology published to offers, as read under RCU; NULL for none.
++ * @word: The rtl8_4s state word of the port's conduit, -1 for no switch (or
++ * not the S-R conduit).
++ * @o: The offer, @o->dir to @o->stp_fwd filled in; @o->cls and @o->mtu_cap
++ * are set if it passes, @o->why always.
++ *
++ * Lockless: what it reads of @eng is a hint, which may decline or delay an
++ * offer but never accepts one; ppe_sr_eng_offer_lock() decides.
++ *
++ * Return: 0, -EAGAIN while the port's topology awaits its resync (DIRTY),
++ * -EOPNOTSUPP to decline: S-R not active (SR_NOT_ACTIVE, also when the
++ * switch does not say ACTIVE), another conduit (NOT_SR_CONDUIT), a port
++ * outside the S-R port mask (PORT_NOT_ARMED), not forwarding (STP), or the
++ * resolver's reason for no class.
++ */
++int ppe_sr_eng_offer_pre(const struct ppe_sr_eng *eng, const struct ppe_sr_ticket *t,
++			 const struct ppe_sr_topo *topo, int word, struct ppe_sr_offer *o)
++{
++	u16 s_ports;
++
++	o->why = PPE_SR_W_SR_NOT_ACTIVE;
++	if (t->mode != PPE_SR_MODE_SR)
++		return -EOPNOTSUPP;
++	o->why = PPE_SR_W_DIRTY;
++	if (eng_port_dirty(READ_ONCE(eng->dirty), READ_ONCE(eng->dirty_ports), o->port))
++		return -EAGAIN;
++	o->why = PPE_SR_W_NOT_SR_CONDUIT;
++	if (!o->conduit_ok)
++		return -EOPNOTSUPP;
++	o->why = PPE_SR_W_SR_NOT_ACTIVE;
++	if (word < 0 || rtl8_4s_word_state(word) != RTL8_4S_ST_ACTIVE)
++		return -EOPNOTSUPP;
++	o->why = PPE_SR_W_PORT_NOT_ARMED;
++	s_ports = READ_ONCE(eng->s_ports);
++	if (o->port >= PPE_SR_PORTS || !(s_ports & BIT(o->port)))
++		return -EOPNOTSUPP;
++	o->why = PPE_SR_W_STP;
++	if (!o->stp_fwd)
++		return -EOPNOTSUPP;
++	o->why = eng_offer_class(topo, o, &o->cls, &o->mtu_cap);
++
++	return o->why == PPE_SR_W_OK ? 0 : -EOPNOTSUPP;
++}
++
++/**
++ * ppe_sr_eng_offer_lock() - Decide an S-R offer under the lock (WP2-DESIGN
++ * §3.4 step 5, §4.1).
++ * @eng: The engine.
++ * @t: The offer's ticket.
++ * @topo: The topology published to offers, read under the lock; NULL for
++ * none.
++ * @word: The rtl8_4s state word of the S-R conduit, read now; -1 for no
++ * switch.
++ * @o: The offer as ppe_sr_eng_offer_pre() passed it; an upload's @o->slot
++ * and @o->l3_if are set if it is accepted, @o->why and @o->lost always.
++ *
++ * Under the lock, which orders every write of what it reads (the state,
++ * the generation, the dirty marks, the topology and the identities): the
++ * ticket must still hold, the port must not await a resync, the switch
++ * must say ACTIVE, the class must come out of this topology as it came out
++ * of the one the offer was judged on (a download's MTU cap too), and an
++ * upload's class must have a live identity. A switch found out of step asks
++ * for the disarm (@o->lost, once until it ran).
++ *
++ * Return: 0, -EAGAIN if something moved since the offer was judged (the
++ * ticket: SR_TRANSITION; the port's topology: DIRTY), -EOPNOTSUPP to
++ * decline (SR_NOT_ACTIVE, NO_IDENTITY).
++ */
++int ppe_sr_eng_offer_lock(struct ppe_sr_eng *eng, const struct ppe_sr_ticket *t,
++			  const struct ppe_sr_topo *topo, int word, struct ppe_sr_offer *o)
++{
++	struct ppe_sr_class cls;
++	u32 mtu_cap;
++	int slot;
++
++	o->lost = false;
++	o->why = PPE_SR_W_SR_TRANSITION;
++	if (t->mode != PPE_SR_MODE_SR || !ppe_sr_eng_ticket_ok(eng, t))
++		return -EAGAIN;
++	o->why = PPE_SR_W_DIRTY;
++	if (eng_port_dirty(eng->dirty, eng->dirty_ports, o->port))
++		return -EAGAIN;
++	o->why = PPE_SR_W_SR_NOT_ACTIVE;
++	if (word < 0 || rtl8_4s_word_state(word) != RTL8_4S_ST_ACTIVE) {
++		o->lost = ppe_sr_eng_lost(eng, word);
++		return -EOPNOTSUPP;
++	}
++	o->why = PPE_SR_W_DIRTY;
++	if (eng_offer_class(topo, o, &cls, &mtu_cap) != PPE_SR_W_OK ||
++	    !ppe_sr_class_eq(&cls, &o->cls) || mtu_cap != o->mtu_cap)
++		return -EAGAIN;
++	if (o->dir == PPE_SR_UP) {
++		o->why = PPE_SR_W_NO_IDENTITY;
++		slot = ppe_sr_seq_id_find(&eng->seq, &cls);
++		if (slot < 0)
++			return -EOPNOTSUPP;
++		o->slot = slot;
++		o->l3_if = eng->seq.id[slot].l3_if;
++	}
++	o->why = PPE_SR_W_OK;
++
++	return 0;
++}
++
+ static void eng_enter(struct ppe_sr_eng *eng)
+ {
+ 	eng->in_seq++;
+@@ -377,11 +512,11 @@ int ppe_sr_eng_arm(struct ppe_sr_eng *eng, const struct ppe_sr_io *io,
+ 		llo = id->l3_if < llo ? id->l3_if : llo;
+ 		lhi = id->l3_if > lhi ? id->l3_if : lhi;
+ 	}
+-	eng->s_ports = a->cfg.s_ports;
++	WRITE_ONCE(eng->s_ports, a->cfg.s_ports);
+ 	eng->bridge_ifindex = a->bridge_ifindex;
+ 	eng->deadline = a->deadline;
+-	eng->dirty = 0;
+-	eng->dirty_ports = 0;
++	WRITE_ONCE(eng->dirty, 0);
++	WRITE_ONCE(eng->dirty_ports, 0);
+ 	eng->recopy = 0;
+ 	eng->lost_queued = 0;
+ 	eng->conduit_gone = 0;
+@@ -470,8 +605,8 @@ int ppe_sr_eng_disarm(struct ppe_sr_eng *eng, const struct ppe_sr_io *io,
+ 	if (ret || eng->seq.state != PPE_SR_S_OFF)
+ 		return ret ? ret : -EIO;
+ 
+-	eng->dirty = 0;
+-	eng->dirty_ports = 0;
++	WRITE_ONCE(eng->dirty, 0);
++	WRITE_ONCE(eng->dirty_ports, 0);
+ 	eng->recopy = 0;
+ 	eng->lost_queued = 0;
+ 	eng->deadline = 0;
+@@ -510,9 +645,9 @@ bool ppe_sr_eng_topo_event(struct ppe_sr_eng *eng, const struct ppe_sr_io *io, u
+ 		ports = PPE_SR_PORTS_ALL;
+ 	}
+ 	if (ports == PPE_SR_PORTS_ALL)
+-		eng->dirty = 1;
++		WRITE_ONCE(eng->dirty, 1);
+ 	else
+-		eng->dirty_ports |= ports;
++		WRITE_ONCE(eng->dirty_ports, eng->dirty_ports | ports);
+ 	ppe_sr_eng_bump(eng);
+ 
+ 	eng_enter(eng);
+@@ -525,6 +660,37 @@ bool ppe_sr_eng_topo_event(struct ppe_sr_eng *eng, const struct ppe_sr_io *io, u
+ 	return eng_armed(eng->seq.state);
+ }
+ 
++/**
++ * ppe_sr_eng_scope_event() - The scope changed (WP2-DESIGN §6.2, D2).
++ * @eng: The engine.
++ * @io: The flows, for the flush.
++ *
++ * Under the lock, the new scope in force. Bumps the generation, so that no
++ * offer judged under the old scope is added; while READY or ACTIVE drops
++ * the S-R flows the new scope excludes (one that stays is FAULT). The
++ * identities follow at the resync; an offer for a class newly in scope
++ * declines NO_IDENTITY until then.
++ *
++ * Return: whether a resync is to be queued (READY or ACTIVE after it).
++ */
++bool ppe_sr_eng_scope_event(struct ppe_sr_eng *eng, const struct ppe_sr_io *io)
++{
++	unsigned int stuck;
++
++	ppe_sr_eng_bump(eng);
++	if (!eng_armed(eng->seq.state))
++		return false;
++
++	eng_enter(eng);
++	stuck = io->flush(io->ctx, PPE_SR_FLUSH_SCOPE, 0);
++	eng_leave(eng, io);
++	if (stuck)
++		ppe_sr_seq_fault(&eng->seq, io, PPE_SR_F_STUCK_FLOW, PPE_SR_STEP_FLUSH_SCOPE,
++				 -EBUSY);
++
++	return eng_armed(eng->seq.state);
++}
++
+ /**
+  * ppe_sr_eng_resync() - Apply a topology or scope change (WP2-DESIGN §5.2).
+  * @eng: The engine.
+@@ -554,8 +720,8 @@ int ppe_sr_eng_resync(struct ppe_sr_eng *eng, const struct ppe_sr_io *io,
+ 	*declined = 0;
+ 	switch (eng->seq.state) {
+ 	case PPE_SR_S_OFF:
+-		eng->dirty = 0;
+-		eng->dirty_ports = 0;
++		WRITE_ONCE(eng->dirty, 0);
++		WRITE_ONCE(eng->dirty_ports, 0);
+ 		eng->recopy = 0;
+ 		return 0;
+ 	case PPE_SR_S_FAULT:
+@@ -582,8 +748,8 @@ int ppe_sr_eng_resync(struct ppe_sr_eng *eng, const struct ppe_sr_io *io,
+ 		return ret;
+ 	}
+ 
+-	eng->dirty = 0;
+-	eng->dirty_ports = 0;
++	WRITE_ONCE(eng->dirty, 0);
++	WRITE_ONCE(eng->dirty_ports, 0);
+ 	eng->recopy = 0;
+ 	eng->resyncs++;
+ 	eng->resync_declined += *declined;
+@@ -845,6 +1011,28 @@ bool ppe_sr_scope_client(const struct ppe_sr_scope *scope, __be32 client)
+ 	return false;
+ }
+ 
++/**
++ * ppe_sr_scope_allows() - Whether an offer is in scope (WP2-DESIGN §3.4
++ * step 4).
++ * @scope: The scope, or NULL (none: nothing is).
++ * @cls: The flow's class.
++ * @client: The LAN host: an upload's source, a download's translated
++ * destination.
++ * @dir: enum ppe_sr_dir.
++ * @u_uploads: U classes have upload identities (qcom_ppe.sr_u_uploads);
++ * without, an upload of a U class is not in scope, a download still is.
++ *
++ * Return: true if the class is listed and the client is.
++ */
++bool ppe_sr_scope_allows(const struct ppe_sr_scope *scope, const struct ppe_sr_class *cls,
++			 __be32 client, int dir, bool u_uploads)
++{
++	if (dir == PPE_SR_UP && cls->form == PPE_SR_U && !u_uploads)
++		return false;
++
++	return ppe_sr_scope_has(scope, cls) && ppe_sr_scope_client(scope, client);
++}
++
+ struct eng_plan_ctx {
+ 	const struct ppe_sr_scope *scope;
+ 	bool u_uploads;
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_sr_eng.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_eng.h
+@@ -10,8 +10,8 @@
+  * lock, RTNL, RCU, the conduit's reference, the rtl8_4s state word, regmap,
+  * works and notifiers), and a desk harness drives it on a mock. Every
+  * function taking a struct ppe_sr_eng runs under the offload lock
+- * (priv->lock), but ppe_sr_eng_gen(), ppe_sr_eng_state() and
+- * ppe_sr_eng_ticket(), which are lockless.
++ * (priv->lock), but ppe_sr_eng_gen(), ppe_sr_eng_state(),
++ * ppe_sr_eng_ticket() and ppe_sr_eng_offer_pre(), which are lockless.
+  */
+ 
+ #ifndef __PPE_SR_ENG_H__
+@@ -80,6 +80,46 @@ struct ppe_sr_ticket {
+ 	u8 mode;
+ };
+ 
++/**
++ * struct ppe_sr_offer - An S-R offer (WP2-DESIGN §3.4 steps 1, 2 and 5;
++ * §4.1).
++ * @dir: enum ppe_sr_dir.
++ * @port: The switch port the flow enters through (upload) or leaves
++ * through (download).
++ * @tagged: The upload is keyed on an 802.1Q VLAN, which it pops; the
++ * download pushes one.
++ * @vid: That VLAN.
++ * @conduit_ok: The port's conduit is the S-R conduit.
++ * @stp_fwd: The port is up and forwarding.
++ * @why: Set to why it is declined or retried (enum ppe_sr_why), PPE_SR_W_OK
++ * if not.
++ * @cls: Set to its class.
++ * @mtu_cap: Set to the largest PMTU a download of that class may have; 0 for
++ * an upload.
++ * @slot: Upload: set under the lock to its identity's slot.
++ * @l3_if: Upload: set under the lock to its identity's L3 interface, the
++ * flow's SRC_L3_IF.
++ * @lost: Set under the lock when the switch was found out of step with an
++ * active S-R mode: the caller queues the disarm (WP2-DESIGN D17).
++ *
++ * The caller fills in @dir to @stp_fwd; ppe_sr_eng_offer_pre() judges it
++ * lockless, ppe_sr_eng_offer_lock() again under the lock, which decides.
++ */
++struct ppe_sr_offer {
++	u8 dir;
++	u8 port;
++	bool tagged;
++	u16 vid;
++	bool conduit_ok;
++	bool stp_fwd;
++	u8 why;
++	struct ppe_sr_class cls;
++	u32 mtu_cap;
++	u8 slot;
++	u8 l3_if;
++	bool lost;
++};
++
+ /**
+  * struct ppe_sr_last - The last arm or disarm, for status.
+  * @arm: An arm (else a disarm).
+@@ -109,8 +149,8 @@ struct ppe_sr_last {
+  * state change, a topology event, a resync, a scope change, a publish);
+  * read lockless with acquire (ppe_sr_eng_gen()).
+  * @dirty: The topology of every port may have changed: offers wait for
+- * the resync.
+- * @dirty_ports: The switch ports whose topology may have changed.
++ * the resync. Stored with WRITE_ONCE() for ppe_sr_eng_offer_pre().
++ * @dirty_ports: The switch ports whose topology may have changed; likewise.
+  * @recopy: The conduit's L3 interface changed: the resync rewrites every
+  * identity's copy.
+  * @inert_fail: The boot check found S-R registers not at their base: S-R
+@@ -123,7 +163,7 @@ struct ppe_sr_last {
+  * when it returns, if its flush did not report it (ppe_sr_eng_flush_stuck()).
+  * @degraded_in_seq: Such a latch happened.
+  * @latched: Degraded latches seen, for ppe_sr_eng_flush_stuck().
+- * @s_ports: The switch's S-R port mask, fixed at arm.
++ * @s_ports: The switch's S-R port mask, fixed at arm; likewise.
+  * @bridge_ifindex: The S-R bridge, fixed at arm; 0 for none.
+  * @deadline: Jiffies at which the S-R mode is to be disarmed (WP3).
+  * @flushed: Flows the io's flush dropped since the transition began (the
+@@ -195,6 +235,10 @@ void ppe_sr_eng_on_state(struct ppe_sr_eng *eng, u8 from, u8 to);
+ 
+ enum ppe_sr_why ppe_sr_eng_ticket(const struct ppe_sr_eng *eng, struct ppe_sr_ticket *t);
+ bool ppe_sr_eng_ticket_ok(const struct ppe_sr_eng *eng, const struct ppe_sr_ticket *t);
++int ppe_sr_eng_offer_pre(const struct ppe_sr_eng *eng, const struct ppe_sr_ticket *t,
++			 const struct ppe_sr_topo *topo, int word, struct ppe_sr_offer *o);
++int ppe_sr_eng_offer_lock(struct ppe_sr_eng *eng, const struct ppe_sr_ticket *t,
++			  const struct ppe_sr_topo *topo, int word, struct ppe_sr_offer *o);
+ 
+ int ppe_sr_eng_refuse(struct ppe_sr_eng *eng, const struct ppe_sr_io *io, enum ppe_sr_why why,
+ 		      int err, const char *what);
+@@ -210,6 +254,7 @@ unsigned int ppe_sr_eng_flush_stuck(const struct ppe_sr_eng *eng, u32 latched,
+ 				    unsigned int stuck);
+ bool ppe_sr_eng_topo_event(struct ppe_sr_eng *eng, const struct ppe_sr_io *io, u16 ports,
+ 			   bool recopy);
++bool ppe_sr_eng_scope_event(struct ppe_sr_eng *eng, const struct ppe_sr_io *io);
+ int ppe_sr_eng_resync(struct ppe_sr_eng *eng, const struct ppe_sr_io *io,
+ 		      const struct ppe_sr_class *plan, unsigned int n, struct ppe_sr_op *ops,
+ 		      unsigned int *declined);
+@@ -224,6 +269,8 @@ int ppe_sr_eng_boot_check(struct ppe_sr_eng *eng, const struct ppe_sr_io *io, u8
+ int ppe_sr_scope_check(const struct ppe_sr_scope *scope);
+ bool ppe_sr_scope_has(const struct ppe_sr_scope *scope, const struct ppe_sr_class *cls);
+ bool ppe_sr_scope_client(const struct ppe_sr_scope *scope, __be32 client);
++bool ppe_sr_scope_allows(const struct ppe_sr_scope *scope, const struct ppe_sr_class *cls,
++			 __be32 client, int dir, bool u_uploads);
+ unsigned int ppe_sr_eng_plan(const struct ppe_sr_topo *topo, const struct ppe_sr_scope *scope,
+ 			     bool u_uploads, struct ppe_sr_class *plan, unsigned int max,
+ 			     unsigned int *wanted);
+@@ -237,6 +284,7 @@ int ppe_sr_deadline_fwd(unsigned long now, unsigned long cur, unsigned long want
+ 
+ #include <linux/atomic.h>
+ #include <linux/if.h>
++#include <linux/list.h>
+ #include <linux/netdevice.h>
+ #include <linux/notifier.h>
+ #include <linux/rcupdate.h>
+@@ -261,6 +309,17 @@ struct ppe_sr_scope_pub {
+ 	struct ppe_sr_scope scope;
+ };
+ 
++/**
++ * struct ppe_sr_id_acc - Uploads accepted on an identity slot.
++ * @cls: The class they were accepted for: a slot taken by another class
++ * starts again from 0.
++ * @up: Their number.
++ */
++struct ppe_sr_id_acc {
++	struct ppe_sr_class cls;
++	u32 up;
++};
++
+ /**
+  * struct ppe_sr - The S-R mode of the PPE flow offload (WP2-DESIGN §6.2).
+  * @eng: The mode itself (ppe_sr_eng.c); under @lock.
+@@ -287,6 +346,12 @@ struct ppe_sr_scope_pub {
+  * lines go there too.
+  * @decline: Offers declined, by enum ppe_sr_why (the offer path counts
+  * them outside the lock).
++ * @flows: The upload flows keyed on the identity in each slot, linked by
++ * their flow entry from before its hardware add until it is forgotten
++ * (WP2-DESIGN §3.4 step 6); a flow left on one after its FLUSH_ID pins
++ * the identity (FAULT). Under @lock.
++ * @acc: Uploads accepted, by identity slot; under @lock.
++ * @accepted: Offers accepted, by enum ppe_sr_dir; under @lock.
+  */
+ struct ppe_sr {
+ 	struct ppe_sr_eng eng;
+@@ -305,6 +370,9 @@ struct ppe_sr {
+ 	struct notifier_block reboot_nb;
+ 	struct seq_file *show;
+ 	atomic_long_t decline[PPE_SR_W_NUM];
++	struct list_head flows[PPE_SR_ID_MAX];
++	struct ppe_sr_id_acc acc[PPE_SR_ID_MAX];
++	u64 accepted[2];
+ };
+ 
+ /**
+@@ -313,12 +381,16 @@ struct ppe_sr {
+  * @live: Offers may key flows on it.
+  * @xlt: Its XLT entry and counter.
+  * @l3_if: Its ingress L3 interface.
++ * @up: Upload flows keyed on it now.
++ * @acc_up: Uploads accepted on it.
+  */
+ struct ppe_sr_status_id {
+ 	struct ppe_sr_class cls;
+ 	u8 live;
+ 	u8 xlt;
+ 	u8 l3_if;
++	u32 up;
++	u32 acc_up;
+ };
+ 
+ /**
+@@ -341,6 +413,7 @@ struct ppe_sr_status_id {
+  * @nid: Entries of @id.
+  * @id: The identities.
+  * @decline: Offers declined, by enum ppe_sr_why.
++ * @accepted: Offers accepted, by enum ppe_sr_dir.
+  * @trig: Disarms, by enum ppe_sr_trigger.
+  * @arm_ok: Arms that reached READY.
+  * @arm_refused: Arms refused or failed, by enum ppe_sr_why.
+@@ -371,6 +444,7 @@ struct ppe_sr_status {
+ 	unsigned int nid;
+ 	struct ppe_sr_status_id id[PPE_SR_ID_MAX];
+ 	u64 decline[PPE_SR_W_NUM];
++	u64 accepted[2];
+ 	u32 trig[PPE_SR_T_NUM];
+ 	u32 arm_ok;
+ 	u32 arm_refused[PPE_SR_W_NUM];
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_sr_seq.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_seq.c
+@@ -102,6 +102,7 @@ static const char * const ppe_sr_step_names[PPE_SR_STEP_NUM] = {
+ 	[PPE_SR_STEP_ADD] = "add",
+ 	[PPE_SR_STEP_FLUSH_PORT] = "flush_port",
+ 	[PPE_SR_STEP_HOOK] = "hook",
++	[PPE_SR_STEP_FLUSH_SCOPE] = "flush_scope",
+ };
+ 
+ /**
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_sr_seq.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_seq.h
+@@ -74,17 +74,20 @@ enum ppe_sr_step {
+ 	PPE_SR_STEP_ADD,
+ 	PPE_SR_STEP_FLUSH_PORT,
+ 	PPE_SR_STEP_HOOK,
++	PPE_SR_STEP_FLUSH_SCOPE,
+ 	PPE_SR_STEP_NUM
+ };
+ 
+ /* What struct ppe_sr_io::flush drops: every flow; the upload flows of the
+- * identity in slot @arg; the flows of the switch ports in mask @arg, both
+- * directions.
++ * identity in slot @arg; the S-R flows of the switch ports in mask @arg,
++ * both directions; the S-R flows the scope now in force excludes (the
++ * engine's, ppe_sr_eng_scope_event()).
+  */
+ enum ppe_sr_flush {
+ 	PPE_SR_FLUSH_ALL,
+ 	PPE_SR_FLUSH_ID,
+-	PPE_SR_FLUSH_PORTS
++	PPE_SR_FLUSH_PORTS,
++	PPE_SR_FLUSH_SCOPE
+ };
+ 
+ /* Diff operations (ppe_sr_diff()), see ppe_sr_seq_exec(). */
