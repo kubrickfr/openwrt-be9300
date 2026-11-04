@@ -1,0 +1,1188 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: rtl8_4s awareness and the S-R
+ topology resolver
+
+With rtl8_4s bound, the RTL8372N can label the frames it hands the CPU
+with an 802.1ad S-tag naming the ingress port (3900 + p), in front of
+the client's own C-tag, if any. That lets the PPE in front of the
+conduit tell uploads apart by switch port and VLAN, and address a
+download to a port and VLAN with an S-tag (3910 + p) and a C-tag: the
+S-R mode, which later patches add. This one adds what both directions
+share, the topology resolver, with no caller yet, and lets profile E
+run under rtl8_4s.
+
+Profile E: rtl8_4s transmits with rtl8_4's 8 byte head tag, armed
+switch or not, so the head tag emulation of the download nexthops is
+the same. ppe_offload_dsa_egress() and the conduit lookup at enable
+accept either tagger. The S-R mode will own the egress S-TPID while it
+is not off, and E is then to stay off; until it exists, E runs as with
+rtl8_4. Uploads from either tagger are still declined.
+
+The resolver (ppe_sr_topo.c) is pure: no kernel call, so that it is
+tested in user space on fake bridges. For a usable port p of the S-R
+bridge (in the switch's S-R port mask, bridged by the switch in that
+bridge with its VLAN filtering, in no LAG, with no VLAN upper) it makes:
+
+- U(p) = (p, untagged, u) iff p egresses untagged in exactly one VLAN
+  u, its PVID is u, the bridge itself is a member of u (BRENTRY), and u
+  has an L3 device whose MAC address is the conduit's;
+- T(p, v) = (p, tagged, v) iff p is an egress-tagged member of v, the
+  bridge itself is a member of v, and v has such an L3 device.
+
+VID 0, 4095 and the rtl8_4s reserved VIDs 3900-3919 never make a class.
+An upload without a VLAN key, or a download without a VLAN push, is
+U(p)'s; one keyed on, or pushing, VLAN v is T(p, v)'s. Otherwise the
+resolver says why: an unusable port, an invalid or reserved VID, no L3
+device, not a member, the other form, no or two untagged VLANs, a PVID
+mismatch, the bridge not a member, or an L3 device with another MAC.
+A download also gets its MTU cap: the smallest of the port's, the
+bridge's, the L3 device's and the conduit's MTU less the 8 bytes of
+the two tags. The classes in a scope, at most 48, are the identities
+to program.
+
+The L3 devices are the bridge's running 802.1Q uppers and the bridge
+itself, if running, for its PVID; devices of one VID are merged, and
+only the 32 lowest VIDs are kept (the rest decline as having none).
+The S-R bridge is the one bridge the ports of the mask are in; with
+two, no port is usable.
+
+ppe_sr.c reads all of that under RTNL (ppe_sr_topo_collect()) and
+answers the resolver's membership questions from br_vlan_get_info()
+(ppe_sr_topo_vinfo()). The bridge has no exported walk of a port's
+VLANs, so every VID of every usable port is asked, once per resolve.
+
+Signed-off-by: François Guerraz <kubrick@fgv6.net>
+---
+ drivers/net/ethernet/qualcomm/ppe/Makefile      |    2 
+ drivers/net/ethernet/qualcomm/ppe/ppe_offload.c |   21 +
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr.c      |  214 ++++++++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr.h      |  123 ++++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_topo.c |  505 +++++++++++++++++++++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_topo.h |  203 +++++++++
+ 6 files changed, 1062 insertions(+), 6 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/Makefile
++++ b/drivers/net/ethernet/qualcomm/ppe/Makefile
+@@ -7,7 +7,7 @@ obj-$(CONFIG_QCOM_PPE) += qcom-ppe.o
+ qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o
+ qcom-ppe-objs += ppe_flow.o ppe_flow_ipv4.o ppe_host.o ppe_host_ipv4.o ppe_host_pool.o \
+ 		 ppe_nexthop.o ppe_nexthop_pool.o ppe_l3_if.o ppe_pub_ip.o ppe_pub_ip_pool.o \
+-		 ppe_offload.o
++		 ppe_offload.o ppe_sr.o ppe_sr_topo.o
+ 
+ #EDMA
+ qcom-ppe-objs += edma.o edma_cfg_rx.o edma_cfg_tx.o edma_debugfs.o edma_port.o edma_rx.o edma_tx.o edma_ethtool.o
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -64,8 +64,8 @@
+  *   switch does not offload for it, a VLAN-aware bridge port outside
+  *   VLAN 1 (ppe_offload_dsa_vlan_ok()), a port behind a LAG conduit, a
+  *   VLAN push on top of an unbridged or VLAN-unaware port, a tagger other
+- *   than rtl8_4, and a conduit whose egress TPIDs are not set up for the
+- *   emulated head tag are all declined.
++ *   than rtl8_4 or rtl8_4s, and a conduit whose egress TPIDs are not set
++ *   up for the emulated head tag are all declined.
+  *   Where the inserts name the port outright (rtl8_4), a client that
+  *   its own bridge later learns on another of its ports
+  *   has its flows re-pointed there, see ppe_offload_fdb_event().
+@@ -192,6 +192,9 @@
+ #include <linux/regmap.h>
+ #include <linux/rtnetlink.h>
+ #include <net/dsa.h>
++#if IS_ENABLED(CONFIG_NET_DSA)
++#include <linux/dsa/rtl8_4s.h>
++#endif
+ #include <linux/rhashtable.h>
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+@@ -1252,7 +1255,12 @@ static int ppe_offload_dsa_egress(struct ppe_offload_priv *priv, struct net_devi
+ 	if (bridge && READ_ONCE(dp->stp_state) != BR_STATE_FORWARDING)
+ 		return ppe_offload_decline("odev=%s not forwarding", netdev_name(odev));
+ 
+-	if (tag_ops->proto != DSA_TAG_PROTO_RTL8_4)
++	/* rtl8_4s transmits with rtl8_4's head tag (net/dsa/tag_rtl8_4.c),
++	 * armed switch or not, so profile E emulates it the same way. The S-R
++	 * mode will own the egress S-TPID while it is not off: E only while
++	 * it is off (WP2-DESIGN D10), which is always so far.
++	 */
++	if (tag_ops->proto != DSA_TAG_PROTO_RTL8_4 && tag_ops->proto != DSA_TAG_PROTO_RTL8_4S)
+ 		return ppe_offload_decline("odev=%s tagger %d unsupported", netdev_name(odev),
+ 					    tag_ops->proto);
+ 	if (!ppe_offload_rtl8_4_egress_ready(priv, conduit))
+@@ -5099,14 +5107,17 @@ static int ppe_offload_program_port(struct net_device *netdev, void *arg)
+ }
+ 
+ #if IS_ENABLED(CONFIG_NET_DSA)
+-/* Note the PPE port of an EDMA port that is an rtl8_4 conduit. Under RTNL. */
++/* Note the PPE port of an EDMA port that is an rtl8_4 or rtl8_4s conduit
++ * (both transmit with the rtl8_4 head tag). Under RTNL.
++ */
+ static int ppe_offload_find_rtl8_4_conduit(struct net_device *netdev, void *arg)
+ {
+ 	struct edma_port_priv *port_priv = netdev_priv(netdev);
+ 	u32 *port = arg;
+ 
+ 	if (!*port && netdev_uses_dsa(netdev) && netdev->dsa_ptr->tag_ops &&
+-	    netdev->dsa_ptr->tag_ops->proto == DSA_TAG_PROTO_RTL8_4)
++	    (netdev->dsa_ptr->tag_ops->proto == DSA_TAG_PROTO_RTL8_4 ||
++	     netdev->dsa_ptr->tag_ops->proto == DSA_TAG_PROTO_RTL8_4S))
+ 		*port = port_priv->ppe_port->port_id;
+ 
+ 	return 0;
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr.c
+@@ -0,0 +1,214 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * S-R mode of the PPE flow offload, kernel side (WP2-DESIGN). So far the
++ * RTNL glue of the topology resolver: ppe_sr_topo_collect() reads the DSA,
++ * bridge and VLAN state the pure resolver (ppe_sr_topo.c) works on, and
++ * ppe_sr_topo_vinfo() answers its membership questions from the bridge.
++ */
++
++#include <linux/bits.h>
++#include <linux/build_bug.h>
++#include <linux/errno.h>
++#include <linux/etherdevice.h>
++#include <linux/if_bridge.h>
++#include <linux/if_ether.h>
++#include <linux/if_vlan.h>
++#include <linux/netdevice.h>
++#include <linux/of.h>
++#include <linux/rtnetlink.h>
++#include <linux/string.h>
++#include <net/dsa.h>
++#if IS_ENABLED(CONFIG_NET_DSA)
++#include <linux/dsa/rtl8_4s.h>
++#endif
++
++#include "ppe_sr.h"
++#include "ppe_sr_topo.h"
++
++static_assert(PPE_SR_VI_PVID == BRIDGE_VLAN_INFO_PVID);
++static_assert(PPE_SR_VI_UNTAGGED == BRIDGE_VLAN_INFO_UNTAGGED);
++static_assert(PPE_SR_VI_BRENTRY == BRIDGE_VLAN_INFO_BRENTRY);
++
++/**
++ * ppe_sr_topo_vinfo() - The resolver's membership oracle (struct ppe_sr_vops).
++ * @ctx: A struct ppe_sr_topo_ctx filled in the same RTNL section.
++ * @port: A switch port, or PPE_SR_VI_BRIDGE for the bridge itself.
++ * @vid: The VLAN.
++ * @flags: Set to the PPE_SR_VI_* flags of the membership.
++ *
++ * Under RTNL (br_vlan_get_info()).
++ *
++ * Return: 0 if a member, -ENOENT if not (or no such port), another
++ * negative error code if the device is not a bridge or bridge port.
++ */
++int ppe_sr_topo_vinfo(void *ctx, int port, u16 vid, u16 *flags)
++{
++	struct ppe_sr_topo_ctx *c = ctx;
++	struct bridge_vlan_info vinfo;
++	struct net_device *dev;
++	int ret;
++
++	ASSERT_RTNL();
++
++	if (port == PPE_SR_VI_BRIDGE)
++		dev = c->bridge;
++	else if (port >= 0 && port < PPE_SR_PORTS)
++		dev = c->user[port];
++	else
++		return -EINVAL;
++	if (!dev)
++		return -ENOENT;
++
++	ret = br_vlan_get_info(dev, vid, &vinfo);
++	if (ret)
++		return ret;
++	*flags = vinfo.flags & (PPE_SR_VI_PVID | PPE_SR_VI_UNTAGGED | PPE_SR_VI_BRENTRY);
++
++	return 0;
++}
++
++#if IS_ENABLED(CONFIG_NET_DSA)
++/* Whether @dev has a VLAN upper (802.1Q or 802.1ad). Under RTNL. */
++static bool ppe_sr_has_vlan_upper(struct net_device *dev)
++{
++	struct net_device *upper;
++	struct list_head *iter;
++
++	netdev_for_each_upper_dev_rcu(dev, upper, iter)
++		if (is_vlan_dev(upper))
++			return true;
++
++	return false;
++}
++
++/* Add the L3 devices of the S-R bridge @br to @in: its running 802.1Q
++ * uppers, and the bridge itself, if running, for its PVID. Under RTNL.
++ */
++static void ppe_sr_collect_l3(const struct net_device *conduit, struct net_device *br,
++			      struct ppe_sr_topo_in *in)
++{
++	struct ppe_sr_l3_in l3;
++	struct net_device *upper;
++	struct list_head *iter;
++	u16 pvid;
++
++	netdev_for_each_upper_dev_rcu(br, upper, iter) {
++		if (!is_vlan_dev(upper) || vlan_dev_vlan_proto(upper) != htons(ETH_P_8021Q) ||
++		    !netif_running(upper))
++			continue;
++		l3.vid = vlan_dev_vlan_id(upper);
++		l3.is_bridge = 0;
++		l3.mac_ok = ether_addr_equal(upper->dev_addr, conduit->dev_addr);
++		l3.mtu = READ_ONCE(upper->mtu);
++		ppe_sr_topo_l3_add(in, &l3);
++	}
++
++	if (netif_running(br) && !br_vlan_get_pvid(br, &pvid) && pvid) {
++		l3.vid = pvid;
++		l3.is_bridge = 1;
++		l3.mac_ok = ether_addr_equal(br->dev_addr, conduit->dev_addr);
++		l3.mtu = READ_ONCE(br->mtu);
++		ppe_sr_topo_l3_add(in, &l3);
++	}
++}
++
++/**
++ * ppe_sr_topo_collect() - Read what the S-R topology is resolved from.
++ * @conduit: The rtl8_4s conduit.
++ * @s_ports: The switch's S-R port mask (rtl8_4s_tagger_data::s_ports, read
++ * in the same RTNL section).
++ * @bridge_ifindex: The S-R bridge chosen at arm, 0 to choose it now (the one
++ * bridge the ports of @s_ports are in, see ppe_sr_topo_bridge_pick()).
++ * @in: Filled in for ppe_sr_topo_build().
++ * @ctx: Filled in for ppe_sr_topo_vinfo(), the oracle to build with.
++ *
++ * Under RTNL, which ppe_sr_topo_build() must run under too, in the same
++ * section: neither holds a reference. No S-R bridge (none, or two at arm)
++ * gives an input in which no port is usable.
++ *
++ * Return: 0, or -ENODEV if @conduit is not an rtl8_4s conduit.
++ */
++int ppe_sr_topo_collect(struct net_device *conduit, u16 s_ports, int bridge_ifindex,
++			struct ppe_sr_topo_in *in, struct ppe_sr_topo_ctx *ctx)
++{
++	int brid[PPE_SR_PORTS] = {};
++	struct net_device *br = NULL;
++	struct dsa_port *cpu_dp, *dp;
++	struct dsa_switch *ds;
++	u16 proto;
++	int pick;
++
++	ASSERT_RTNL();
++
++	memset(in, 0, sizeof(*in));
++	memset(ctx, 0, sizeof(*ctx));
++
++	if (!netdev_uses_dsa(conduit))
++		return -ENODEV;
++	cpu_dp = conduit->dsa_ptr;
++	if (!cpu_dp->tag_ops || cpu_dp->tag_ops->proto != DSA_TAG_PROTO_RTL8_4S)
++		return -ENODEV;
++	ds = cpu_dp->ds;
++
++	in->s_ports = s_ports & GENMASK(PPE_SR_PORTS - 1, 0);
++	in->conduit_mtu = READ_ONCE(conduit->mtu);
++
++	dsa_switch_for_each_user_port(dp, ds) {
++		struct net_device *pbr;
++
++		if (dp->index >= PPE_SR_PORTS || !(in->s_ports & BIT(dp->index)) ||
++		    dp->cpu_dp != cpu_dp || !dp->user)
++			continue;
++		ctx->user[dp->index] = dp->user;
++		pbr = dsa_port_bridge_dev_get(dp);
++		brid[dp->index] = pbr ? pbr->ifindex : 0;
++	}
++
++	pick = ppe_sr_topo_bridge_pick(brid, in->s_ports, bridge_ifindex);
++	if (pick) {
++		dsa_switch_for_each_user_port(dp, ds) {
++			if (dp->index < PPE_SR_PORTS && ctx->user[dp->index] &&
++			    brid[dp->index] == pick) {
++				br = dsa_port_bridge_dev_get(dp);
++				break;
++			}
++		}
++	}
++
++	if (br) {
++		ctx->bridge = br;
++		in->br_mtu = READ_ONCE(br->mtu);
++		in->br_ok = br_vlan_enabled(br) && !br_vlan_get_proto(br, &proto) &&
++			    proto == ETH_P_8021Q && ds->dev &&
++			    of_device_is_compatible(ds->dev->of_node, "realtek,rtl8372n");
++	}
++
++	dsa_switch_for_each_user_port(dp, ds) {
++		struct ppe_sr_port_in *pi;
++
++		if (dp->index >= PPE_SR_PORTS || !ctx->user[dp->index])
++			continue;
++		pi = &in->port[dp->index];
++		pi->present = 1;
++		pi->bridged_hw = br && brid[dp->index] == pick;
++		pi->filtering_eq = br && dsa_port_is_vlan_filtering(dp) == br_vlan_enabled(br);
++		pi->lag = !!dp->lag;
++		pi->has_upper = ppe_sr_has_vlan_upper(dp->user);
++		pi->mtu = READ_ONCE(dp->user->mtu);
++	}
++
++	if (br && in->br_ok)
++		ppe_sr_collect_l3(conduit, br, in);
++
++	return 0;
++}
++#else
++int ppe_sr_topo_collect(struct net_device *conduit, u16 s_ports, int bridge_ifindex,
++			struct ppe_sr_topo_in *in, struct ppe_sr_topo_ctx *ctx)
++{
++	memset(in, 0, sizeof(*in));
++	memset(ctx, 0, sizeof(*ctx));
++
++	return -ENODEV;
++}
++#endif
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr.h
+@@ -0,0 +1,123 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * S-R mode of the PPE flow offload: uploads from the RTL8372N classified
++ * by the S-tag the rtl8_4s tagger's switch puts on them (port) and their
++ * C-tag (VLAN), and downloads addressed to a port and VLAN with an S-tag
++ * and a C-tag (WP2-DESIGN).
++ *
++ * The first part of this header is pure (enums and plain structs) and
++ * compiles in user space with -DPPE_SR_PURE, for the desk harnesses; the
++ * second part needs the kernel.
++ */
++
++#ifndef __PPE_SR_H__
++#define __PPE_SR_H__
++
++#include <linux/types.h>
++
++/* Switch ports S-R can address: the rtl8_4s port indices 0..9
++ * (RTL8_4S_NUM_PORTS, asserted in ppe_sr_topo.c).
++ */
++#define PPE_SR_PORTS	10
++/* L3 devices of the S-R bridge the resolver keeps: the lowest VIDs. */
++#define PPE_SR_L3_MAX	32
++/* Identities (an XLT rule and an L3 interface each) at most. */
++#define PPE_SR_ID_MAX	48
++
++/* Why a class, an offer or an arm is declined or refused. PPE_SR_W_OK is
++ * none. The resolver's reasons come first (ppe_sr_class_up() and
++ * ppe_sr_class_dn()), then the offer path's, then the arm refusals.
++ */
++enum ppe_sr_why {
++	PPE_SR_W_OK,
++	PPE_SR_W_PORT_UNUSABLE,
++	PPE_SR_W_VID_RESERVED,
++	PPE_SR_W_VID_INVALID,
++	PPE_SR_W_NOT_MEMBER,
++	PPE_SR_W_FORM,
++	PPE_SR_W_UNTAG_NONE,
++	PPE_SR_W_UNTAG_AMBIGUOUS,
++	PPE_SR_W_PVID_MISMATCH,
++	PPE_SR_W_BR_NOT_MEMBER,
++	PPE_SR_W_NO_L3,
++	PPE_SR_W_L3_MAC,
++	PPE_SR_W_SR_NOT_ACTIVE,
++	PPE_SR_W_SR_TRANSITION,
++	PPE_SR_W_DIRTY,
++	PPE_SR_W_NOT_SR_CONDUIT,
++	PPE_SR_W_PORT_NOT_ARMED,
++	PPE_SR_W_STP,
++	PPE_SR_W_NO_IDENTITY,
++	PPE_SR_W_SCOPE,
++	PPE_SR_W_DNAT_FROM_LAN,
++	PPE_SR_W_LAN_TO_LAN,
++	PPE_SR_W_HW,
++	PPE_SR_W_NOTHING,
++	PPE_SR_W_BUDGET,
++	PPE_SR_W_SWITCH_NOT_READY,
++	PPE_SR_W_PRECHECK,
++	PPE_SR_W_NUM
++};
++
++/* What made the S-R mode go back to off. */
++enum ppe_sr_trigger {
++	PPE_SR_T_CONTROL,
++	PPE_SR_T_DEADLINE,
++	PPE_SR_T_GUARD,
++	PPE_SR_T_OFFLOAD_OFF,
++	PPE_SR_T_UNLOAD,
++	PPE_SR_T_REBOOT,
++	PPE_SR_T_CONDUIT_DOWN,
++	PPE_SR_T_CONDUIT_GONE,
++	PPE_SR_T_USER_GONE,
++	PPE_SR_T_BRIDGE_GONE,
++	PPE_SR_T_SWITCH_NOT_READY,
++	PPE_SR_T_TRIP,
++	PPE_SR_T_VERIFY,
++	PPE_SR_T_NUM
++};
++
++/* Why the S-R mode latched FAULT. */
++enum ppe_sr_fault {
++	PPE_SR_F_NONE,
++	PPE_SR_F_STUCK_FLOW,
++	PPE_SR_F_REVERT_MISMATCH,
++	PPE_SR_F_ROLLBACK_FAILED,
++	PPE_SR_F_NOT_INERT_AT_BOOT
++};
++
++/* @deadline: jiffies at which the S-R mode disarms by itself.
++ * @offers: Accept offers right after arming.
++ */
++struct ppe_sr_arm_args {
++	unsigned long deadline;
++	bool offers;
++};
++
++const char *ppe_sr_why_name(enum ppe_sr_why why);
++
++#ifndef PPE_SR_PURE
++
++struct net_device;
++struct ppe_sr_topo_in;
++
++/**
++ * struct ppe_sr_topo_ctx - What ppe_sr_topo_vinfo() looks VLANs up on.
++ * @bridge: The S-R bridge, NULL for none.
++ * @user: The user netdevice of each switch port in the S-R port mask.
++ *
++ * Filled by ppe_sr_topo_collect() and valid only within the RTNL section
++ * it was filled in: it holds no reference.
++ */
++struct ppe_sr_topo_ctx {
++	struct net_device *bridge;
++	struct net_device *user[PPE_SR_PORTS];
++};
++
++int ppe_sr_topo_collect(struct net_device *conduit, u16 s_ports, int bridge_ifindex,
++			struct ppe_sr_topo_in *in, struct ppe_sr_topo_ctx *ctx);
++int ppe_sr_topo_vinfo(void *ctx, int port, u16 vid, u16 *flags);
++
++#endif /* !PPE_SR_PURE */
++
++#endif /* __PPE_SR_H__ */
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_topo.c
+@@ -0,0 +1,505 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * S-R topology resolver (WP2-DESIGN §2), see ppe_sr_topo.h. Kept free of
++ * kernel calls so that the desk harness (sr/wp2/harness/topo) drives it on
++ * fake bridges: ppe_sr.c binds the membership oracle to br_vlan_get_info()
++ * and fills struct ppe_sr_topo_in from the DSA, bridge and VLAN state.
++ *
++ * Reason order for a VLAN v asked of port p: an unusable port, then an
++ * invalid or reserved VID, then a VID without an L3 device (NO_L3: nothing
++ * of this router can route it, whatever the membership), then p's
++ * membership (NOT_MEMBER, FORM), the bridge's (BR_NOT_MEMBER) and the L3
++ * device's MAC address (L3_MAC). U(p) is judged on its own: the count of
++ * egress-untagged VLANs, the PVID, then u like any VLAN.
++ */
++#ifndef RTL8_4S_PURE
++#define RTL8_4S_PURE
++#endif
++#include <linux/bits.h>
++#include <linux/errno.h>
++#include <linux/types.h>
++#include <linux/dsa/rtl8_4s.h>
++#ifdef PPE_SR_PURE
++#include <assert.h>
++#else
++#include <linux/build_bug.h>
++#endif
++
++#include "ppe_sr.h"
++#include "ppe_sr_topo.h"
++
++#define PPE_SR_ARRAY_SIZE(a)	(sizeof(a) / sizeof((a)[0]))
++#define PPE_SR_VID_MAX		4094
++#define PPE_SR_PORT_MASK	((u16)(BIT(PPE_SR_PORTS) - 1))
++
++static_assert(PPE_SR_PORTS == RTL8_4S_NUM_PORTS);
++static_assert(PPE_SR_PORTS <= 16);	/* u16 port masks */
++static_assert(PPE_SR_PORTS * PPE_SR_L3_MAX <= PPE_SR_CLS_MAX);
++static_assert(PPE_SR_ID_MAX <= 64);
++
++static const char * const ppe_sr_why_names[PPE_SR_W_NUM] = {
++	[PPE_SR_W_OK] = "ok",
++	[PPE_SR_W_PORT_UNUSABLE] = "port_unusable",
++	[PPE_SR_W_VID_RESERVED] = "vid_reserved",
++	[PPE_SR_W_VID_INVALID] = "vid_invalid",
++	[PPE_SR_W_NOT_MEMBER] = "not_member",
++	[PPE_SR_W_FORM] = "form",
++	[PPE_SR_W_UNTAG_NONE] = "untag_none",
++	[PPE_SR_W_UNTAG_AMBIGUOUS] = "untag_ambiguous",
++	[PPE_SR_W_PVID_MISMATCH] = "pvid_mismatch",
++	[PPE_SR_W_BR_NOT_MEMBER] = "br_not_member",
++	[PPE_SR_W_NO_L3] = "no_l3",
++	[PPE_SR_W_L3_MAC] = "l3_mac",
++	[PPE_SR_W_SR_NOT_ACTIVE] = "sr_not_active",
++	[PPE_SR_W_SR_TRANSITION] = "sr_transition",
++	[PPE_SR_W_DIRTY] = "dirty",
++	[PPE_SR_W_NOT_SR_CONDUIT] = "not_sr_conduit",
++	[PPE_SR_W_PORT_NOT_ARMED] = "port_not_armed",
++	[PPE_SR_W_STP] = "stp",
++	[PPE_SR_W_NO_IDENTITY] = "no_identity",
++	[PPE_SR_W_SCOPE] = "scope",
++	[PPE_SR_W_DNAT_FROM_LAN] = "dnat_from_lan",
++	[PPE_SR_W_LAN_TO_LAN] = "lan_to_lan",
++	[PPE_SR_W_HW] = "hw",
++	[PPE_SR_W_NOTHING] = "nothing",
++	[PPE_SR_W_BUDGET] = "budget",
++	[PPE_SR_W_SWITCH_NOT_READY] = "switch_not_ready",
++	[PPE_SR_W_PRECHECK] = "precheck",
++};
++
++/**
++ * ppe_sr_why_name() - Name of a decline or refusal reason.
++ * @why: The reason.
++ *
++ * Return: a lower-case name for status files and logs, "?" if unknown.
++ */
++const char *ppe_sr_why_name(enum ppe_sr_why why)
++{
++	if ((unsigned int)why < PPE_SR_ARRAY_SIZE(ppe_sr_why_names) && ppe_sr_why_names[why])
++		return ppe_sr_why_names[why];
++	return "?";
++}
++
++static bool ppe_sr_vid_ok(u16 vid)
++{
++	return vid >= 1 && vid <= PPE_SR_VID_MAX;
++}
++
++/* Index of @vid in the sorted @l3, or where it would go. */
++static unsigned int ppe_sr_l3_in_pos(const struct ppe_sr_topo_in *in, u16 vid)
++{
++	unsigned int lo = 0, hi = in->nl3;
++
++	while (lo < hi) {
++		unsigned int mid = lo + (hi - lo) / 2;
++
++		if (in->l3[mid].vid < vid)
++			lo = mid + 1;
++		else
++			hi = mid;
++	}
++	return lo;
++}
++
++/**
++ * ppe_sr_topo_l3_add() - Add an L3 device of the S-R bridge to the input.
++ * @in: The input being collected.
++ * @l3: The device: its VID, whether it is the bridge itself, whether its MAC
++ * address is the conduit's, and its MTU.
++ *
++ * Keeps @in->l3 sorted by VID and holding the PPE_SR_L3_MAX lowest VIDs,
++ * setting @in->l3_truncated when one had to be left out. Devices of one VID
++ * are merged into one entry with the smallest MTU, a MAC that is the
++ * conduit's only if every one's is, and @is_bridge if any is the bridge.
++ * VID 0 (priority tags) and VIDs above 4094 are not VLANs: ignored.
++ */
++void ppe_sr_topo_l3_add(struct ppe_sr_topo_in *in, const struct ppe_sr_l3_in *l3)
++{
++	struct ppe_sr_l3_in *e;
++	unsigned int i, j;
++
++	if (!ppe_sr_vid_ok(l3->vid) || in->nl3 > PPE_SR_L3_MAX)
++		return;
++
++	i = ppe_sr_l3_in_pos(in, l3->vid);
++	if (i < in->nl3 && in->l3[i].vid == l3->vid) {
++		e = &in->l3[i];
++		if (l3->mtu < e->mtu)
++			e->mtu = l3->mtu;
++		e->mac_ok = e->mac_ok && l3->mac_ok;
++		e->is_bridge = e->is_bridge || l3->is_bridge;
++		return;
++	}
++
++	if (in->nl3 == PPE_SR_L3_MAX) {
++		in->l3_truncated = 1;
++		if (i == PPE_SR_L3_MAX)
++			return;
++		in->nl3--;	/* the highest VID goes */
++	}
++	for (j = in->nl3; j > i; j--)
++		in->l3[j] = in->l3[j - 1];
++	e = &in->l3[i];
++	e->vid = l3->vid;
++	e->is_bridge = !!l3->is_bridge;
++	e->mac_ok = !!l3->mac_ok;
++	e->mtu = l3->mtu;
++	in->nl3++;
++}
++
++/**
++ * ppe_sr_topo_bridge_pick() - Which bridge is the S-R bridge.
++ * @br: An opaque non-zero ID of the bridge each switch port is in, 0 for
++ * none (a standalone port, or a port the switch leaves to software).
++ * @s_ports: The S-R port mask.
++ * @fixed: The S-R bridge chosen at arm, 0 when choosing now.
++ *
++ * At arm the S-R bridge is the one bridge the ports of @s_ports are in.
++ * When they are in two or more, none is chosen: every port is then
++ * unusable and nothing is offloaded, rather than one bridge being picked
++ * over another. After arm the bridge stays @fixed, and a port that is not
++ * in it is unusable.
++ *
++ * Return: the S-R bridge's ID, 0 for none.
++ */
++int ppe_sr_topo_bridge_pick(const int br[PPE_SR_PORTS], u16 s_ports, int fixed)
++{
++	unsigned int p;
++	int pick = 0;
++
++	if (fixed)
++		return fixed;
++
++	for (p = 0; p < PPE_SR_PORTS; p++) {
++		if (!(s_ports & BIT(p)) || !br[p])
++			continue;
++		if (pick && br[p] != pick)
++			return 0;
++		pick = br[p];
++	}
++	return pick;
++}
++
++static const struct ppe_sr_topo_l3 *ppe_sr_topo_l3_find(const struct ppe_sr_topo *topo, u16 vid)
++{
++	unsigned int lo = 0, hi = topo->nl3;
++
++	while (lo < hi) {
++		unsigned int mid = lo + (hi - lo) / 2;
++
++		if (topo->l3[mid].vid == vid)
++			return &topo->l3[mid];
++		if (topo->l3[mid].vid < vid)
++			lo = mid + 1;
++		else
++			hi = mid;
++	}
++	return NULL;
++}
++
++static bool ppe_sr_topo_has(const struct ppe_sr_topo *topo, const struct ppe_sr_class *c)
++{
++	unsigned int lo = 0, hi = topo->ncls;
++
++	while (lo < hi) {
++		unsigned int mid = lo + (hi - lo) / 2;
++		int d = ppe_sr_class_cmp(&topo->cls[mid], c);
++
++		if (!d)
++			return true;
++		if (d < 0)
++			lo = mid + 1;
++		else
++			hi = mid;
++	}
++	return false;
++}
++
++/* Why (p, @form, @l3's VLAN) is no class, PPE_SR_W_OK if it is one. */
++static enum ppe_sr_why ppe_sr_l3_why(const struct ppe_sr_topo_l3 *l3, u8 p, u8 form)
++{
++	u8 want = form == PPE_SR_U ? PPE_SR_M_UNTAGGED : PPE_SR_M_TAGGED;
++
++	if (rtl8_4s_vid_reserved(l3->vid))
++		return PPE_SR_W_VID_RESERVED;
++	if (l3->member[p] == PPE_SR_M_NONE)
++		return PPE_SR_W_NOT_MEMBER;
++	if (l3->member[p] != want)
++		return PPE_SR_W_FORM;
++	if (!l3->br_member)
++		return PPE_SR_W_BR_NOT_MEMBER;
++	if (!l3->mac_ok)
++		return PPE_SR_W_L3_MAC;
++	return PPE_SR_W_OK;
++}
++
++static int ppe_sr_topo_add(struct ppe_sr_topo *topo, u8 p, u8 form, u16 vid)
++{
++	struct ppe_sr_class *c;
++
++	/* Cannot happen (PPE_SR_CLS_MAX); refuse rather than overflow. */
++	if (topo->ncls >= PPE_SR_ARRAY_SIZE(topo->cls))
++		return -ENOSPC;
++	c = &topo->cls[topo->ncls++];
++	c->port = p;
++	c->form = form;
++	c->vid = vid;
++	return 0;
++}
++
++/* Scan port @p's VLANs: the egress-untagged ones (count, first), its PVID,
++ * and its membership in each L3 VLAN; then its classes, U(p) first and the
++ * T(p, v) by VID, so that @topo->cls stays sorted.
++ */
++static int ppe_sr_topo_port(struct ppe_sr_topo *topo, const struct ppe_sr_vops *vops, u8 p)
++{
++	struct ppe_sr_topo_port *tp = &topo->port[p];
++	unsigned int n_untag = 0, i;
++	u16 vid, u = 0, pvid = 0;
++	const struct ppe_sr_topo_l3 *l3;
++	int ret;
++
++	for (vid = 1, i = 0; vid <= PPE_SR_VID_MAX; vid++) {
++		u16 flags = 0;
++
++		ret = vops->vinfo(vops->ctx, p, vid, &flags);
++		if (ret == -ENOENT)
++			continue;
++		if (ret)
++			return ret;
++		if (flags & PPE_SR_VI_UNTAGGED) {
++			if (!n_untag)
++				u = vid;
++			if (n_untag < 2)
++				n_untag++;
++		}
++		if (flags & PPE_SR_VI_PVID)
++			pvid = vid;
++		while (i < topo->nl3 && topo->l3[i].vid < vid)
++			i++;
++		if (i < topo->nl3 && topo->l3[i].vid == vid)
++			topo->l3[i].member[p] = flags & PPE_SR_VI_UNTAGGED ?
++						PPE_SR_M_UNTAGGED : PPE_SR_M_TAGGED;
++	}
++
++	if (!n_untag) {
++		tp->why_u = PPE_SR_W_UNTAG_NONE;
++	} else if (n_untag > 1) {
++		tp->why_u = PPE_SR_W_UNTAG_AMBIGUOUS;
++	} else if (pvid != u) {
++		tp->why_u = PPE_SR_W_PVID_MISMATCH;
++	} else if (rtl8_4s_vid_reserved(u)) {
++		tp->why_u = PPE_SR_W_VID_RESERVED;
++	} else {
++		l3 = ppe_sr_topo_l3_find(topo, u);
++		tp->why_u = l3 ? ppe_sr_l3_why(l3, p, PPE_SR_U) : PPE_SR_W_NO_L3;
++	}
++	if (tp->why_u == PPE_SR_W_OK) {
++		tp->u = u;
++		ret = ppe_sr_topo_add(topo, p, PPE_SR_U, u);
++		if (ret)
++			return ret;
++	}
++
++	for (i = 0; i < topo->nl3; i++) {
++		if (ppe_sr_l3_why(&topo->l3[i], p, PPE_SR_T) != PPE_SR_W_OK)
++			continue;
++		ret = ppe_sr_topo_add(topo, p, PPE_SR_T, topo->l3[i].vid);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++static u32 ppe_sr_min(u32 a, u32 b)
++{
++	return a < b ? a : b;
++}
++
++/**
++ * ppe_sr_topo_build() - Resolve the classes of the S-R bridge.
++ * @in: The bridge, its ports and its L3 devices (ppe_sr_topo_collect()).
++ * @vops: The membership oracle over the same bridge.
++ * @topo: Filled in; @topo->gen is left 0 for the publisher to set.
++ *
++ * Asks @vops about every VID of every usable port, and about the bridge
++ * itself for every L3 VLAN. Under RTNL in the kernel, like the collection
++ * of @in, so that both see one bridge state.
++ *
++ * Return: 0, -EINVAL if @in is malformed (an L3 table not sorted, with
++ * duplicates or too long), or the oracle's error. @topo is undefined on
++ * error.
++ */
++int ppe_sr_topo_build(const struct ppe_sr_topo_in *in, const struct ppe_sr_vops *vops,
++		      struct ppe_sr_topo *topo)
++{
++	u32 conduit_cap;
++	unsigned int i;
++	u8 p;
++	int ret;
++
++	__builtin_memset(topo, 0, sizeof(*topo));
++
++	if (in->nl3 > PPE_SR_L3_MAX)
++		return -EINVAL;
++	for (i = 0; i < in->nl3; i++)
++		if (!ppe_sr_vid_ok(in->l3[i].vid) || (i && in->l3[i].vid <= in->l3[i - 1].vid))
++			return -EINVAL;
++
++	topo->s_ports = in->s_ports & PPE_SR_PORT_MASK;
++	topo->l3_truncated = !!in->l3_truncated;
++	for (p = 0; p < PPE_SR_PORTS; p++)
++		topo->port[p].why_u = PPE_SR_W_PORT_UNUSABLE;
++	if (!in->br_ok)
++		return 0;
++
++	for (p = 0; p < PPE_SR_PORTS; p++) {
++		const struct ppe_sr_port_in *pi = &in->port[p];
++
++		if ((topo->s_ports & BIT(p)) && pi->present && pi->bridged_hw &&
++		    pi->filtering_eq && !pi->lag && !pi->has_upper)
++			topo->usable |= BIT(p);
++	}
++
++	topo->nl3 = in->nl3;
++	for (i = 0; i < in->nl3; i++) {
++		struct ppe_sr_topo_l3 *l3 = &topo->l3[i];
++		u16 flags = 0;
++
++		l3->vid = in->l3[i].vid;
++		l3->mac_ok = !!in->l3[i].mac_ok;
++		l3->mtu = in->l3[i].mtu;
++		ret = vops->vinfo(vops->ctx, PPE_SR_VI_BRIDGE, l3->vid, &flags);
++		if (ret && ret != -ENOENT)
++			return ret;
++		l3->br_member = !ret && (flags & PPE_SR_VI_BRENTRY);
++	}
++
++	conduit_cap = in->conduit_mtu > PPE_SR_TAGS_LEN ? in->conduit_mtu - PPE_SR_TAGS_LEN : 0;
++	for (p = 0; p < PPE_SR_PORTS; p++) {
++		if (!(topo->usable & BIT(p)))
++			continue;
++		topo->port[p].why_u = PPE_SR_W_OK;
++		topo->port[p].mtu_cap = ppe_sr_min(ppe_sr_min(in->port[p].mtu, in->br_mtu),
++						   conduit_cap);
++		ret = ppe_sr_topo_port(topo, vops, p);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++/* The class of port @port in VLAN @vid if @tagged, else its U class. */
++static enum ppe_sr_why ppe_sr_class_get(const struct ppe_sr_topo *topo, u8 port, bool tagged,
++					u16 vid, struct ppe_sr_class *cls)
++{
++	const struct ppe_sr_topo_l3 *l3;
++	struct ppe_sr_class c;
++	enum ppe_sr_why why;
++
++	if (!topo || port >= PPE_SR_PORTS || !(topo->usable & BIT(port)))
++		return PPE_SR_W_PORT_UNUSABLE;
++
++	if (!tagged) {
++		if (!topo->port[port].u)
++			return topo->port[port].why_u;
++		vid = topo->port[port].u;
++	} else if (!ppe_sr_vid_ok(vid)) {
++		return PPE_SR_W_VID_INVALID;
++	} else if (rtl8_4s_vid_reserved(vid)) {
++		return PPE_SR_W_VID_RESERVED;
++	}
++
++	c.port = port;
++	c.form = tagged ? PPE_SR_T : PPE_SR_U;
++	c.vid = vid;
++	if (ppe_sr_topo_has(topo, &c)) {
++		*cls = c;
++		return PPE_SR_W_OK;
++	}
++
++	/* Not a class: say why. A U(p) the port records is always one. */
++	l3 = ppe_sr_topo_l3_find(topo, vid);
++	if (!l3)
++		return PPE_SR_W_NO_L3;
++	why = ppe_sr_l3_why(l3, port, c.form);
++	return why == PPE_SR_W_OK ? PPE_SR_W_NO_L3 : why;
++}
++
++/**
++ * ppe_sr_class_up() - The class of an upload.
++ * @topo: The published topology; NULL declines.
++ * @port: The switch port the flow enters through.
++ * @keyed: The flow is keyed on an 802.1Q VLAN (and pops it).
++ * @key_vid: That VLAN.
++ * @cls: Set to the class on success.
++ *
++ * Return: PPE_SR_W_OK, or why the flow has no class.
++ */
++enum ppe_sr_why ppe_sr_class_up(const struct ppe_sr_topo *topo, u8 port, bool keyed,
++				u16 key_vid, struct ppe_sr_class *cls)
++{
++	return ppe_sr_class_get(topo, port, keyed, key_vid, cls);
++}
++
++/**
++ * ppe_sr_class_dn() - The class of a download, and its MTU cap.
++ * @topo: The published topology; NULL declines.
++ * @port: The switch port the flow leaves through.
++ * @push: The flow pushes an 802.1Q VLAN.
++ * @push_vid: That VLAN.
++ * @cls: Set to the class on success.
++ * @mtu_cap: Set on success to the largest PMTU the flow may have: the
++ * port's cap (struct ppe_sr_topo_port) and the class's L3 device's MTU.
++ *
++ * Return: PPE_SR_W_OK, or why the flow has no class.
++ */
++enum ppe_sr_why ppe_sr_class_dn(const struct ppe_sr_topo *topo, u8 port, bool push,
++				u16 push_vid, struct ppe_sr_class *cls, u32 *mtu_cap)
++{
++	const struct ppe_sr_topo_l3 *l3;
++	struct ppe_sr_class c;
++	enum ppe_sr_why why;
++
++	why = ppe_sr_class_get(topo, port, push, push_vid, &c);
++	if (why != PPE_SR_W_OK)
++		return why;
++	l3 = ppe_sr_topo_l3_find(topo, c.vid);
++	if (!l3)
++		return PPE_SR_W_NO_L3;	/* cannot happen: every class has one */
++	*cls = c;
++	*mtu_cap = ppe_sr_min(topo->port[port].mtu_cap, l3->mtu);
++	return PPE_SR_W_OK;
++}
++
++/**
++ * ppe_sr_topo_plan() - The classes to give an identity: those in scope.
++ * @topo: The topology.
++ * @in_scope: Whether a class is in scope; NULL puts none in scope.
++ * @ctx: Passed to @in_scope.
++ * @plan: Filled with the classes in scope, in @topo->cls order.
++ * @max: Room in @plan (PPE_SR_ID_MAX for the identities).
++ * @wanted: Set to the number of classes in scope, which may exceed @max:
++ * arm refuses such a plan (BUDGET), a resync applies what fits.
++ *
++ * Return: the number of classes written to @plan, at most @max.
++ */
++unsigned int ppe_sr_topo_plan(const struct ppe_sr_topo *topo,
++			      bool (*in_scope)(const void *ctx, const struct ppe_sr_class *cls),
++			      const void *ctx, struct ppe_sr_class *plan, unsigned int max,
++			      unsigned int *wanted)
++{
++	unsigned int i, n = 0;
++
++	*wanted = 0;
++	if (!topo || !in_scope)
++		return 0;
++	for (i = 0; i < topo->ncls; i++) {
++		if (!in_scope(ctx, &topo->cls[i]))
++			continue;
++		if (n < max)
++			plan[n++] = topo->cls[i];
++		(*wanted)++;
++	}
++	return n;
++}
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_topo.h
+@@ -0,0 +1,203 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * S-R topology resolver (WP2-DESIGN §2): which (port, form, VLAN) classes
++ * the S-R bridge has, shared by uploads and downloads, and the reason when
++ * a flow's port and VLAN make none. Pure: no kernel call, so that a desk
++ * harness compiles ppe_sr_topo.c with -DPPE_SR_PURE. The bridge state comes
++ * in as struct ppe_sr_topo_in, which ppe_sr_topo_collect() fills under RTNL,
++ * and through the membership oracle struct ppe_sr_vops.
++ *
++ * For a usable port p of the S-R bridge (in the switch's S-R port mask,
++ * bridged by the switch in that bridge, with its VLAN filtering, in no LAG
++ * and with no VLAN upper):
++ *
++ * - U(p) = (p, untagged, u) exists iff p egresses untagged in exactly one
++ *   VLAN u, its PVID is u, the bridge itself is a member of u (BRENTRY) and
++ *   u has an L3 device whose MAC address is the conduit's;
++ * - T(p, v) = (p, tagged, v) exists iff p is an egress-tagged member of v,
++ *   the bridge itself is a member of v and v has such an L3 device.
++ *
++ * No class ever has VID 0, 4095 or one of the rtl8_4s reserved VIDs
++ * 3900-3919. An upload without a VLAN key, and a download without a VLAN
++ * push, is U(p)'s; one keyed on, or pushing, VLAN v is T(p, v)'s.
++ */
++
++#ifndef __PPE_SR_TOPO_H__
++#define __PPE_SR_TOPO_H__
++
++#include <linux/types.h>
++
++#include "ppe_sr.h"
++
++/* Classes at most: every port with one class per L3 device, plus one. U(p)
++ * takes an L3 device of its own, so at most PPE_SR_PORTS * PPE_SR_L3_MAX
++ * are ever made; the array cannot overflow.
++ */
++#define PPE_SR_CLS_MAX		(PPE_SR_PORTS * (PPE_SR_L3_MAX + 1))
++/* The S-tag and the C-tag of an S-R download on the conduit's wire. */
++#define PPE_SR_TAGS_LEN		8
++
++/* The flags the membership oracle returns: the BRIDGE_VLAN_INFO_* bits of
++ * the same name (ppe_sr.c asserts the values).
++ */
++#define PPE_SR_VI_PVID		0x0002
++#define PPE_SR_VI_UNTAGGED	0x0004
++#define PPE_SR_VI_BRENTRY	0x0020
++/* The port argument of the oracle that names the bridge itself. */
++#define PPE_SR_VI_BRIDGE	(-1)
++
++enum ppe_sr_form {
++	PPE_SR_U,
++	PPE_SR_T
++};
++
++/* A port's membership in an L3 VLAN, as the resolver found it. */
++enum ppe_sr_member {
++	PPE_SR_M_NONE,
++	PPE_SR_M_TAGGED,
++	PPE_SR_M_UNTAGGED
++};
++
++/* The identity key: switch port, enum ppe_sr_form, VLAN. */
++struct ppe_sr_class {
++	u8 port;
++	u8 form;
++	u16 vid;
++};
++
++/* An L3 device of the S-R bridge: a VLAN upper of it with protocol 802.1Q,
++ * or the bridge itself for its PVID (@is_bridge). @mac_ok: its MAC address
++ * is the conduit's. Several devices of one VID are merged into one entry by
++ * ppe_sr_topo_l3_add().
++ */
++struct ppe_sr_l3_in {
++	u16 vid;
++	u8 is_bridge;
++	u8 mac_ok;
++	u32 mtu;
++};
++
++/* @present: a DSA user port of the conduit's switch, index below
++ * PPE_SR_PORTS, in the S-R port mask.
++ * @bridged_hw: the switch bridges it in the S-R bridge.
++ * @filtering_eq: its VLAN filtering in the switch equals the bridge's.
++ * @lag: it is in a LAG.
++ * @has_upper: its user netdevice has a VLAN upper.
++ * @mtu: its user netdevice's MTU.
++ */
++struct ppe_sr_port_in {
++	u8 present;
++	u8 bridged_hw;
++	u8 filtering_eq;
++	u8 lag;
++	u8 has_upper;
++	u32 mtu;
++};
++
++/* @s_ports: the switch's S-R port mask, fixed at arm.
++ * @br_ok: the S-R bridge exists, is VLAN-aware with protocol 802.1Q, and the
++ * switch is an RTL8372N.
++ * @l3_truncated: more than PPE_SR_L3_MAX L3 devices: only the lowest VIDs
++ * were kept (ppe_sr_topo_l3_add()).
++ * @br_mtu: the bridge's MTU.
++ * @conduit_mtu: the conduit's MTU.
++ * @nl3: entries of @l3, sorted by VID, without duplicates.
++ * @l3: the L3 devices, see struct ppe_sr_l3_in.
++ * @port: the switch ports, by index.
++ */
++struct ppe_sr_topo_in {
++	u16 s_ports;
++	u8 br_ok;
++	u8 l3_truncated;
++	u32 br_mtu;
++	u32 conduit_mtu;
++	unsigned int nl3;
++	struct ppe_sr_l3_in l3[PPE_SR_L3_MAX];
++	struct ppe_sr_port_in port[PPE_SR_PORTS];
++};
++
++/* The membership oracle: @vinfo answers for switch port @port, or for the
++ * bridge itself when @port is PPE_SR_VI_BRIDGE, whether it is a member of
++ * VLAN @vid: -ENOENT if not, else 0 with the PPE_SR_VI_* flags in @flags.
++ * Any other error fails ppe_sr_topo_build().
++ */
++struct ppe_sr_vops {
++	void *ctx;
++	int (*vinfo)(void *ctx, int port, u16 vid, u16 *flags);
++};
++
++/* An L3 VLAN as the resolver found it: @br_member, the bridge itself is a
++ * member (BRENTRY); @member, each usable port's enum ppe_sr_member.
++ */
++struct ppe_sr_topo_l3 {
++	u16 vid;
++	u8 br_member;
++	u8 mac_ok;
++	u32 mtu;
++	u8 member[PPE_SR_PORTS];
++};
++
++/* @u: U(p)'s VID, 0 when there is no U(p).
++ * @why_u: why there is no U(p) (enum ppe_sr_why), PPE_SR_W_OK if there is.
++ * @mtu_cap: the smallest of the port's, the bridge's and the conduit's
++ * MTU less PPE_SR_TAGS_LEN; 0 for an unusable port.
++ */
++struct ppe_sr_topo_port {
++	u16 u;
++	u8 why_u;
++	u32 mtu_cap;
++};
++
++/* The topology, published to the offer path by RCU (WP2-DESIGN §2.1).
++ * @gen: the S-R generation it was published under (set by the publisher).
++ * @s_ports: the S-R port mask it was built for.
++ * @usable: the usable ports among them.
++ * @port: per switch port, see struct ppe_sr_topo_port.
++ * @ncls: entries of @cls.
++ * @cls: every class, sorted by (port, form, VID).
++ * @l3_truncated: copied from struct ppe_sr_topo_in.
++ * @nl3: entries of @l3.
++ * @l3: the L3 VLANs, sorted by VID.
++ */
++struct ppe_sr_topo {
++	u32 gen;
++	u16 s_ports;
++	u16 usable;
++	struct ppe_sr_topo_port port[PPE_SR_PORTS];
++	unsigned int ncls;
++	struct ppe_sr_class cls[PPE_SR_CLS_MAX];
++	u8 l3_truncated;
++	unsigned int nl3;
++	struct ppe_sr_topo_l3 l3[PPE_SR_L3_MAX];
++};
++
++static inline int ppe_sr_class_cmp(const struct ppe_sr_class *a, const struct ppe_sr_class *b)
++{
++	if (a->port != b->port)
++		return a->port < b->port ? -1 : 1;
++	if (a->form != b->form)
++		return a->form < b->form ? -1 : 1;
++	if (a->vid != b->vid)
++		return a->vid < b->vid ? -1 : 1;
++	return 0;
++}
++
++static inline bool ppe_sr_class_eq(const struct ppe_sr_class *a, const struct ppe_sr_class *b)
++{
++	return !ppe_sr_class_cmp(a, b);
++}
++
++void ppe_sr_topo_l3_add(struct ppe_sr_topo_in *in, const struct ppe_sr_l3_in *l3);
++int ppe_sr_topo_bridge_pick(const int br[PPE_SR_PORTS], u16 s_ports, int fixed);
++int ppe_sr_topo_build(const struct ppe_sr_topo_in *in, const struct ppe_sr_vops *vops,
++		      struct ppe_sr_topo *topo);
++enum ppe_sr_why ppe_sr_class_up(const struct ppe_sr_topo *topo, u8 port, bool keyed,
++				u16 key_vid, struct ppe_sr_class *cls);
++enum ppe_sr_why ppe_sr_class_dn(const struct ppe_sr_topo *topo, u8 port, bool push,
++				u16 push_vid, struct ppe_sr_class *cls, u32 *mtu_cap);
++unsigned int ppe_sr_topo_plan(const struct ppe_sr_topo *topo,
++			      bool (*in_scope)(const void *ctx, const struct ppe_sr_class *cls),
++			      const void *ctx, struct ppe_sr_class *plan, unsigned int max,
++			      unsigned int *wanted);
++
++#endif /* __PPE_SR_TOPO_H__ */
