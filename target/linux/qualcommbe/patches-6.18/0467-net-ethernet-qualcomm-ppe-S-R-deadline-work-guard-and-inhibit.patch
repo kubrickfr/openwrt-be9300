@@ -1,0 +1,1489 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: S-R deadline work, guard and
+ inhibit
+
+The S-R mode needs a way back to software that does not depend on
+userspace, a stop that wins over an arm it overlaps, and a disarm that
+works while RTNL or the parameter lock is held for long. This patch adds
+them to the mode engine and its kernel binding; the control files that
+drive them come next.
+
+A delayed work keeps the PPE's deadline (WP3-DESIGN D7). While the mode
+is READY or ACTIVE it takes the offload lock only, checks that the
+rtl8_4s switch is in step with it, then the deadline
+(ppe_sr_eng_tick(), pure): a switch that left READY or is gone disarms
+(SWITCH_NOT_READY) as the statistics-time check would, a deadline reached
+disarms (DEADLINE), a deadline found past the switch's own less 30 s is
+clamped to it. Otherwise it comes back after the time left, 30 s at
+most, so that a switch out of step is noticed with no traffic. An arm and
+a renewal kick it; once the mode is off or in FAULT it is cancelled, and
+the offload's stop waits for it.
+
+A control disarm and the guard inhibit arms before they take the lock
+(D8): an arm refuses with EPERM (INHIBIT) once it sees the inhibit, after
+a barrier, under the lock. Only an uninhibit naming the inhibit's
+generation lifts it (ESTALE otherwise), so a stop that overlaps an enable
+wins and only an enable started after it can undo it. The flag and its
+generation share one atomic word, so that an uninhibit and a concurrent
+inhibit cannot leave the generation bumped with the flag clear.
+
+The guard (D9) inhibits, then waits for the lock 2 s at most by the
+clock, not by a count of 10 ms sleeps, which lasts twice as long at HZ
+100, and disarms (GUARD); it takes neither the parameter lock nor RTNL.
+The reboot notifier shares the bounded wait.
+
+From before the arm's claim until the mode is off again, the PPE holds a
+reference on the module of the switch's driver (D16): rtl8372n_dsa cannot
+be unloaded while S-R may be live in hardware, FAULT included. The arm
+also refuses while the system is not running (ESHUTDOWN), returns the
+offers step's error rather than dropping it, and refuses an arm without
+a deadline (EINVAL) or with less than 60 s left (ERANGE) with the new
+reason DEADLINE. A scope swap that leaves a flow behind returns EIO; the
+last transition records the flows it could not drop, offers off
+included; the status gains the inhibit, the module reference, the
+switch's deadline, the scope, the renewals and the control and guard
+counters, and keeps the PPE's deadline for READY and ACTIVE only; the
+idle verify ends with a verdict line.
+
+Nothing calls the new controls yet.
+
+Signed-off-by: François Guerraz <kubrick@fgv6.net>
+---
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr.c      |  407 +++++++++++++++++++++--
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr.h      |   26 +
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_eng.c  |  161 ++++++++-
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_eng.h  |  306 ++++++++++++-----
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_topo.c |    2 
+ 5 files changed, 754 insertions(+), 148 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_sr.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr.c
+@@ -25,6 +25,17 @@
+  * byte of the rtl8_4s state word, through the contract header's helpers,
+  * on a tagger data pointer looked up per use under RCU on the held conduit
+  * (rtl8_4s_conduit_td()) and never kept; NULL is a switch gone.
++ *
++ * WP3's controls (WP3-DESIGN §4): the deadline work (the lock only) keeps
++ * the PPE's deadline and checks the switch is in step at least every
++ * PPE_SR_DEADLINE_STEP_S while READY or ACTIVE. A control disarm and the
++ * guard inhibit arms before they take the lock, so that a stop overlapping
++ * an arm wins; only an uninhibit naming the inhibit's generation lifts it.
++ * The guard takes neither the parameter lock nor RTNL, and waits for the
++ * lock for PPE_SR_LOCK_WAIT_S at most, by the clock. From the arm's claim
++ * until the mode is off again (FAULT keeps it), a reference on the switch
++ * driver's module is held: the switch driver cannot be unloaded while S-R
++ * may be live in hardware (D16).
+  */
+ 
+ #include <asm/barrier.h>
+@@ -38,7 +49,9 @@
+ #include <linux/if_ether.h>
+ #include <linux/if_vlan.h>
+ #include <linux/jiffies.h>
++#include <linux/kernel.h>
+ #include <linux/lockdep.h>
++#include <linux/module.h>
+ #include <linux/moduleparam.h>
+ #include <linux/mutex.h>
+ #include <linux/netdevice.h>
+@@ -75,11 +88,10 @@ module_param_named(sr_u_uploads, ppe_sr_u_uploads, bool, 0444);
+ MODULE_PARM_DESC(sr_u_uploads,
+ 		 "S-R: give untagged-port classes an upload identity keyed on EtherType 0x0800 (default 1)");
+ 
+-/* The reboot notifier waits this long at most for the lock: every
+- * PPE_SR_REBOOT_WAIT_MS for PPE_SR_REBOOT_TRIES tries.
++/* The reboot notifier and the guard wait this long at most for the lock,
++ * by the clock (ppe_sr_lock_bounded()).
+  */
+-#define PPE_SR_REBOOT_WAIT_MS	10
+-#define PPE_SR_REBOOT_TRIES	200
++#define PPE_SR_LOCK_WAIT_S	2
+ 
+ /* What an arm or a resync resolves the topology into. */
+ struct ppe_sr_buf {
+@@ -92,6 +104,7 @@ struct ppe_sr_buf {
+ static_assert(PPE_SR_VI_PVID == BRIDGE_VLAN_INFO_PVID);
+ static_assert(PPE_SR_VI_UNTAGGED == BRIDGE_VLAN_INFO_UNTAGGED);
+ static_assert(PPE_SR_VI_BRENTRY == BRIDGE_VLAN_INFO_BRENTRY);
++static_assert(PPE_SR_IFNAMSIZ == IFNAMSIZ);
+ 
+ /**
+  * ppe_sr_topo_vinfo() - The resolver's membership oracle (struct ppe_sr_vops).
+@@ -325,6 +338,28 @@ static struct rtl8_4s_tagger_data *ppe_sr_td(struct ppe_sr *sr)
+ {
+ 	return sr->conduit ? rtl8_4s_conduit_td(sr->conduit) : NULL;
+ }
++
++/* D16: a reference on the module of the driver bound to @conduit's switch.
++ * Under RTNL and the lock, at the arm, with the conduit's dsa_ptr valid in
++ * this RTNL section (the switch is bound: its teardown takes RTNL).
++ */
++static int ppe_sr_sw_hold(struct ppe_sr *sr, struct net_device *conduit)
++{
++	struct dsa_port *cpu_dp = conduit->dsa_ptr;
++	struct device_driver *drv;
++
++	if (sr->sw_ref)
++		return 0;
++	if (!cpu_dp || !cpu_dp->ds || !cpu_dp->ds->dev)
++		return -ENODEV;
++	drv = READ_ONCE(cpu_dp->ds->dev->driver);
++	if (!drv || !try_module_get(drv->owner))
++		return -ENODEV;
++	sr->sw_mod = drv->owner;
++	sr->sw_ref = true;
++
++	return 0;
++}
+ #else
+ struct rtl8_4s_tagger_data;
+ 
+@@ -354,8 +389,60 @@ static struct rtl8_4s_tagger_data *ppe_sr_td(struct ppe_sr *sr)
+ {
+ 	return NULL;
+ }
++
++static int ppe_sr_sw_hold(struct ppe_sr *sr, struct net_device *conduit)
++{
++	return -ENODEV;
++}
+ #endif
+ 
++/* Drop the switch driver's module reference, if held. Under the lock, or
++ * with nothing else left (ppe_sr_destroy()).
++ */
++static void ppe_sr_sw_put(struct ppe_sr *sr)
++{
++	if (!sr->sw_ref)
++		return;
++	module_put(sr->sw_mod);
++	sr->sw_mod = NULL;
++	sr->sw_ref = false;
++}
++
++/* Inhibit arms (WP3-DESIGN D8): set bit 0 and bump the generation above it,
++ * in one fully ordered step. Lockless: a control disarm and the guard do
++ * this before they take the lock, so that an arm taking it after them is
++ * refused (ppe_sr_arm() reads the word after a barrier, under the lock).
++ */
++static void ppe_sr_inhibit(struct ppe_sr *sr)
++{
++	int old = atomic_read(&sr->inhibit);
++
++	while (!atomic_try_cmpxchg(&sr->inhibit, &old,
++				   (int)(((((u32)old >> 1) + 1) << 1) | 1)))
++		;
++	/* The inhibit before whatever the caller does next (the lock it
++	 * waits for); pairs with the barrier in ppe_sr_arm()'s lock section.
++	 */
++	smp_mb();
++}
++
++/* Whether arms are inhibited, and the generation in force. Lockless. */
++static bool ppe_sr_inhibited(struct ppe_sr *sr, u32 *gen)
++{
++	u32 w = (u32)atomic_read(&sr->inhibit);
++
++	if (gen)
++		*gen = w >> 1;
++
++	return w & 1;
++}
++
++/* Run the deadline work now: it computes its own next wake. */
++static void ppe_sr_deadline_kick(struct ppe_sr *sr)
++{
++	mod_delayed_work(system_dfl_wq, &sr->deadline_work, 0);
++}
++
+ /* The state word now, -1 for no switch. Memory only. */
+ static int ppe_sr_word(struct ppe_sr *sr, unsigned long *disarm_at)
+ {
+@@ -503,8 +590,9 @@ static void ppe_sr_publish(struct ppe_sr *sr, struct ppe_sr_topo_pub *pub)
+ }
+ 
+ /* After every engine call, under the lock: a degraded latch from the
+- * sequences is the offload's; once the mode is off again the conduit is let
+- * go and the topology withdrawn (D9).
++ * sequences is the offload's; in FAULT or off the deadline work has nothing
++ * left to do; once the mode is off again the switch driver's module and the
++ * conduit are let go and the topology withdrawn (D9, WP3-DESIGN D16).
+  */
+ static void ppe_sr_settle(struct ppe_sr *sr)
+ {
+@@ -514,8 +602,12 @@ static void ppe_sr_settle(struct ppe_sr *sr)
+ 		sr->eng.seq.degrade = false;
+ 		ppe_offload_set_degraded(sr->priv);
+ 	}
++	if (sr->eng.seq.state == PPE_SR_S_FAULT)
++		cancel_delayed_work(&sr->deadline_work);
+ 	if (sr->eng.seq.state != PPE_SR_S_OFF)
+ 		return;
++	cancel_delayed_work(&sr->deadline_work);
++	ppe_sr_sw_put(sr);
+ 	if (sr->conduit) {
+ 		netdev_put(sr->conduit, &sr->conduit_tracker);
+ 		WRITE_ONCE(sr->conduit, NULL);
+@@ -660,14 +752,15 @@ static int ppe_sr_arm_prepare(struct ppe_sr *sr, const struct ppe_sr_arm_args *a
+ 	a->cfg.sw_gen = READ_ONCE(td->sw_gen);
+ 	a->cfg.s_ports = READ_ONCE(td->s_ports);
+ 
+-	*why = PPE_SR_W_PRECHECK;
++	*why = PPE_SR_W_DEADLINE;
+ 	ret = ppe_sr_deadline_cap(jiffies, args->deadline, disarm_at,
+ 				  PPE_SR_DEADLINE_MARGIN_S * HZ, PPE_SR_DEADLINE_MIN_S * HZ,
+ 				  &a->deadline);
+ 	if (ret)
+-		return ppe_sr_eng_refuse(&sr->eng, &sr->io, *why, -EINVAL,
++		return ppe_sr_eng_refuse(&sr->eng, &sr->io, *why, -ERANGE,
+ 					 "deadline: less than 60 s left before the switch's own less 30 s");
+ 
++	*why = PPE_SR_W_PRECHECK;
+ 	ret = ppe_sr_topo_collect(conduit, a->cfg.s_ports, 0, &b->in, &b->ctx);
+ 	if (!ret)
+ 		ret = ppe_sr_topo_build(&b->in, &vops, &pub->topo);
+@@ -713,12 +806,19 @@ static int ppe_sr_arm_prepare(struct ppe_sr *sr, const struct ppe_sr_arm_args *a
+  *
+  * Under RTNL; takes the lock. Never claims on its own initiative: only this
+  * (WP3's control) starts S-R (D16). Every refusal is counted and logged
+- * ("ppe_offload: sr: refused ...").
++ * ("ppe_offload: sr: refused ..."). Inhibited arms are refused first
++ * (WP3-DESIGN D8), and none runs unless the system is running (G16). From
++ * before the claim, a reference on the switch driver's module is held
++ * until the mode is off again (WP3-DESIGN D16). Once READY the deadline
++ * work is kicked; a refused offers step is returned, the mode staying
++ * READY (or FAULT).
+  *
+- * Return: 0 (READY, or ACTIVE with offers), -EBUSY (PRECHECK or
+- * SWITCH_NOT_READY), -EIO (FAULT, a stuck flow, a failed rollback),
+- * -ENOSPC (BUDGET), -ENODEV (no conduit or switch), -EALREADY (not off),
+- * -EINVAL (NOTHING, or no or too short a deadline), -ENOMEM.
++ * Return: 0 (READY, or ACTIVE with offers), -EPERM (INHIBIT), -ESHUTDOWN
++ * (PRECHECK: not running), -EBUSY (PRECHECK or SWITCH_NOT_READY; or the
++ * offers step), -EIO (FAULT, a stuck flow, a failed rollback),
++ * -ENOSPC (BUDGET), -ENODEV (no conduit, switch or switch driver module),
++ * -EALREADY (not off), -EINVAL (NOTHING; DEADLINE: none), -ERANGE
++ * (DEADLINE: less than PPE_SR_DEADLINE_MIN_S left), -ENOMEM.
+  */
+ int ppe_sr_arm(struct ppe_offload_priv *priv, const struct ppe_sr_arm_args *args,
+ 	       enum ppe_sr_why *why)
+@@ -744,9 +844,21 @@ int ppe_sr_arm(struct ppe_offload_priv *priv, const struct ppe_sr_arm_args *args
+ 	}
+ 
+ 	mutex_lock(sr->lock);
+-	ret = ppe_sr_eng_arm_check(&sr->eng, &sr->io, args->deadline, why);
++	/* Pairs with ppe_sr_inhibit(): a stop that inhibited before this lock
++	 * section is seen here.
++	 */
++	smp_mb();
++	ret = ppe_sr_eng_arm_gate(&sr->eng, &sr->io, ppe_sr_inhibited(sr, NULL),
++				  system_state == SYSTEM_RUNNING, why);
++	if (!ret)
++		ret = ppe_sr_eng_arm_check(&sr->eng, &sr->io, args->deadline, why);
+ 	if (!ret)
+ 		ret = ppe_sr_arm_prepare(sr, args, &a, b, pub, &conduit, why);
++	if (!ret && ppe_sr_sw_hold(sr, conduit)) {
++		*why = PPE_SR_W_PRECHECK;
++		ret = ppe_sr_eng_refuse(&sr->eng, &sr->io, *why, -ENODEV,
++					"switch driver going away");
++	}
+ 	if (!ret) {
+ 		/* Held for the claim (A4); let go by the settle if it ends off. */
+ 		WRITE_ONCE(sr->conduit, conduit);
+@@ -762,10 +874,12 @@ int ppe_sr_arm(struct ppe_offload_priv *priv, const struct ppe_sr_arm_args *args
+ 			ppe_sr_publish(sr, pub);
+ 			pub = NULL;
+ 			if (offers)
+-				ppe_sr_eng_offers(&sr->eng, &sr->io, true);
++				ret = ppe_sr_eng_offers(&sr->eng, &sr->io, true);
+ 		}
+ 	}
+ 	ppe_sr_settle(sr);
++	if (sr->eng.seq.state == PPE_SR_S_READY || sr->eng.seq.state == PPE_SR_S_ACTIVE)
++		ppe_sr_deadline_kick(sr);
+ 	mutex_unlock(sr->lock);
+ 
+ free:
+@@ -1279,6 +1393,26 @@ static void ppe_sr_lost_work(struct work_struct *work)
+ 	mutex_unlock(sr->lock);
+ }
+ 
++/* The deadline work (WP3-DESIGN D7, §4.5): the lock only. Each step checks
++ * the switch is in step, then the deadline (ppe_sr_eng_tick()), and comes
++ * back after the time left, PPE_SR_DEADLINE_STEP_S at most, while READY or
++ * ACTIVE.
++ */
++static void ppe_sr_deadline_work(struct work_struct *work)
++{
++	struct ppe_sr *sr = container_of(to_delayed_work(work), struct ppe_sr, deadline_work);
++	unsigned long disarm_at, delay = 0;
++	int word, stop;
++
++	mutex_lock(sr->lock);
++	word = ppe_sr_word(sr, &disarm_at);
++	stop = ppe_sr_eng_tick(&sr->eng, &sr->io, word, jiffies, disarm_at, HZ, &delay);
++	ppe_sr_settle(sr);
++	if (!stop)
++		mod_delayed_work(system_dfl_wq, &sr->deadline_work, delay);
++	mutex_unlock(sr->lock);
++}
++
+ /**
+  * ppe_sr_stats_check() - The statistics-time switch check (WP2-DESIGN D17).
+  * @sr: The S-R mode.
+@@ -1297,19 +1431,21 @@ void ppe_sr_stats_check(struct ppe_sr *sr)
+ 		schedule_work(&sr->lost_work);
+ }
+ 
+-/* mutex_trylock() every PPE_SR_REBOOT_WAIT_MS, PPE_SR_REBOOT_TRIES times at
+- * most. The harness sr/wp2/harness/mode compiles this verbatim.
++/* mutex_trylock() about every 10 ms until PPE_SR_LOCK_WAIT_S have passed,
++ * by the clock (WP3-DESIGN D9: a count of sleeps would last twice as long
++ * at HZ 100). The harnesses sr/wp2/harness/mode and sr/wp3/harness/ppe
++ * compile this verbatim.
+  */
+ static bool ppe_sr_lock_bounded(struct mutex *lock)
+ {
+-	unsigned int i;
++	unsigned long end = jiffies + PPE_SR_LOCK_WAIT_S * HZ;
+ 
+-	for (i = 0; ; i++) {
++	for (;;) {
+ 		if (mutex_trylock(lock))
+ 			return true;
+-		if (i == PPE_SR_REBOOT_TRIES)
++		if (time_after(jiffies, end))
+ 			return false;
+-		msleep(PPE_SR_REBOOT_WAIT_MS);
++		usleep_range(10000, 11000);
+ 	}
+ }
+ 
+@@ -1367,7 +1503,17 @@ void ppe_sr_init(struct ppe_sr *sr, struct ppe_offload_priv *priv, struct ppe_de
+ 	RCU_INIT_POINTER(sr->scope, NULL);
+ 	INIT_WORK(&sr->resync_work, ppe_sr_resync_work);
+ 	INIT_WORK(&sr->lost_work, ppe_sr_lost_work);
++	INIT_DELAYED_WORK(&sr->deadline_work, ppe_sr_deadline_work);
+ 	sr->reboot_nb.notifier_call = ppe_sr_reboot;
++	atomic_set(&sr->inhibit, 0);
++	atomic_set(&sr->ctl_last, 0);
++	atomic_set(&sr->guard_n, 0);
++	atomic_set(&sr->guard_last, 0);
++	atomic_set(&sr->guard_busy, 0);
++	for (i = 0; i < PPE_SR_V_NUM; i++) {
++		atomic_set(&sr->ctl_ok[i], 0);
++		atomic_set(&sr->ctl_err[i], 0);
++	}
+ 	for (i = 0; i < PPE_SR_W_NUM; i++)
+ 		atomic_long_set(&sr->decline[i], 0);
+ 	for (i = 0; i < PPE_SR_ID_MAX; i++)
+@@ -1395,6 +1541,7 @@ void ppe_sr_stop(struct ppe_sr *sr)
+ 	unregister_reboot_notifier(&sr->reboot_nb);
+ 	cancel_work_sync(&sr->resync_work);
+ 	cancel_work_sync(&sr->lost_work);
++	cancel_delayed_work_sync(&sr->deadline_work);
+ }
+ 
+ /**
+@@ -1402,7 +1549,8 @@ void ppe_sr_stop(struct ppe_sr *sr)
+  * @sr: The S-R mode, with no offer, work or notifier left.
+  *
+  * In FAULT the claim stays until reboot; the conduit's reference has gone
+- * with its unregister (ppe_sr_netdev_event()), else it goes here.
++ * with its unregister (ppe_sr_netdev_event()), else it goes here, as does
++ * the one on the switch driver's module.
+  */
+ void ppe_sr_destroy(struct ppe_sr *sr)
+ {
+@@ -1411,6 +1559,8 @@ void ppe_sr_destroy(struct ppe_sr *sr)
+ 
+ 	cancel_work_sync(&sr->resync_work);
+ 	cancel_work_sync(&sr->lost_work);
++	cancel_delayed_work_sync(&sr->deadline_work);
++	ppe_sr_sw_put(sr);
+ 	if (sr->conduit) {
+ 		netdev_put(sr->conduit, &sr->conduit_tracker);
+ 		WRITE_ONCE(sr->conduit, NULL);
+@@ -1446,13 +1596,16 @@ void ppe_sr_boot_check(struct ppe_sr *sr, u8 ppe_port)
+  * excludes go, no offer judged under the old scope is added, and the
+  * resync makes the identities follow.
+  *
+- * Return: 0, -EINVAL for a malformed scope, -ENOMEM.
++ * Return: 0, -EINVAL for a malformed scope, -ENOMEM, or -EIO if a flow the
++ * new scope excludes could not be dropped: the scope is in force, and the
++ * mode in FAULT (WP3-DESIGN G5).
+  */
+ int ppe_sr_scope_set(struct ppe_offload_priv *priv, const struct ppe_sr_scope *scope)
+ {
+ 	struct ppe_sr *sr = ppe_offload_sr(priv);
+ 	struct ppe_sr_scope_pub *pub = NULL, *old;
+-	bool queue;
++	bool queue, fault;
++	u8 before;
+ 
+ 	ASSERT_RTNL();
+ 
+@@ -1466,8 +1619,11 @@ int ppe_sr_scope_set(struct ppe_offload_priv *priv, const struct ppe_sr_scope *s
+ 	}
+ 
+ 	mutex_lock(sr->lock);
++	before = sr->eng.seq.state;
+ 	old = rcu_replace_pointer(sr->scope, pub, lockdep_is_held(sr->lock));
++	sr->scope_gen++;
+ 	queue = ppe_sr_eng_scope_event(&sr->eng, &sr->io);
++	fault = before != PPE_SR_S_FAULT && sr->eng.seq.state == PPE_SR_S_FAULT;
+ 	ppe_sr_settle(sr);
+ 	mutex_unlock(sr->lock);
+ 
+@@ -1478,7 +1634,36 @@ int ppe_sr_scope_set(struct ppe_offload_priv *priv, const struct ppe_sr_scope *s
+ 	pr_info("ppe_offload: sr: scope %u class(es), %s\n", scope ? scope->ncls : 0,
+ 		!scope ? "no client" : scope->any_client ? "any client" : "listed clients");
+ 
+-	return 0;
++	return fault ? -EIO : 0;
++}
++
++/**
++ * ppe_sr_scope_get() - The scope in force, for the scope file.
++ * @priv: The offload.
++ * @scope: Set to a copy of the scope, if there is one.
++ * @gen: Set to the scope swaps so far.
++ * @u_uploads: Set to whether U classes get identities.
++ *
++ * Under the lock. Memory only.
++ *
++ * Return: true if a scope is set (none: nothing is in scope).
++ */
++bool ppe_sr_scope_get(struct ppe_offload_priv *priv, struct ppe_sr_scope *scope, u32 *gen,
++		      bool *u_uploads)
++{
++	struct ppe_sr *sr = ppe_offload_sr(priv);
++	const struct ppe_sr_scope_pub *pub;
++
++	lockdep_assert_held(sr->lock);
++
++	*gen = sr->scope_gen;
++	*u_uploads = READ_ONCE(ppe_sr_u_uploads);
++	pub = rcu_dereference_protected(sr->scope, lockdep_is_held(sr->lock));
++	if (!pub)
++		return false;
++	*scope = pub->scope;
++
++	return true;
+ }
+ 
+ /**
+@@ -1517,7 +1702,9 @@ bool ppe_sr_scope_ok(struct ppe_offload_priv *priv, const struct ppe_sr_class *c
+  * @deadline: The new deadline, in jiffies.
+  *
+  * Under the lock. Capped at the switch's own deadline (as the switch has it
+- * now, read under RCU on the held conduit) less PPE_SR_DEADLINE_MARGIN_S.
++ * now, read under RCU on the held conduit) less PPE_SR_DEADLINE_MARGIN_S:
++ * renewals come after the switch's own (WP3-DESIGN D6). A renewal is
++ * counted and kicks the deadline work.
+  *
+  * Return: 0, -EINVAL unless READY or ACTIVE, -ENODEV without a switch,
+  * -ERANGE if the capped deadline would not be later than the current one.
+@@ -1539,22 +1726,135 @@ int ppe_sr_deadline_set(struct ppe_offload_priv *priv, unsigned long deadline)
+ 	if (ret)
+ 		return ret;
+ 	sr->eng.deadline = dl;
++	sr->eng.deadline_clamped = 0;
++	sr->renewals++;
++	ppe_sr_deadline_kick(sr);
+ 
+ 	return 0;
+ }
+ 
++/**
++ * ppe_sr_disarm_ctl() - The control file's disarm (WP3-DESIGN §4.2).
++ * @priv: The offload.
++ *
++ * Inhibits arms first, without any lock, so that an arm that has not taken
++ * the lock yet is refused (D8); then takes the lock, killably, and disarms
++ * (CONTROL). The inhibit stays until ppe_sr_uninhibit().
++ *
++ * Return: 0 (off), -EIO (FAULT), -EINTR if killed while waiting.
++ */
++int ppe_sr_disarm_ctl(struct ppe_offload_priv *priv)
++{
++	struct ppe_sr *sr = ppe_offload_sr(priv);
++	int ret;
++
++	ppe_sr_inhibit(sr);
++	if (mutex_lock_killable(sr->lock))
++		return -EINTR;
++	ret = ppe_sr_disarm(priv, PPE_SR_T_CONTROL);
++	mutex_unlock(sr->lock);
++
++	return ret;
++}
++
++/**
++ * ppe_sr_uninhibit() - Lift the inhibit of a generation (WP3-DESIGN D8).
++ * @priv: The offload.
++ * @gen: The generation read before deciding to lift it (status
++ * inhibit_gen).
++ *
++ * Under the lock, killably. Lifted only if no control disarm or guard
++ * inhibited again since @gen was read: a stop that overlapped an enable
++ * wins, and only an enable started after it may lift it.
++ *
++ * Return: 0 (lifted, or not inhibited), -ESTALE if the generation moved,
++ * -EINTR if killed while waiting.
++ */
++int ppe_sr_uninhibit(struct ppe_offload_priv *priv, u32 gen)
++{
++	struct ppe_sr *sr = ppe_offload_sr(priv);
++	int old, ret = 0;
++
++	if (mutex_lock_killable(sr->lock))
++		return -EINTR;
++	old = atomic_read(&sr->inhibit);
++	do {
++		if ((u32)old >> 1 != gen) {
++			ret = -ESTALE;
++			break;
++		}
++		if (!(old & 1))
++			break;
++	} while (!atomic_try_cmpxchg(&sr->inhibit, &old, old & ~1));
++	mutex_unlock(sr->lock);
++
++	return ret;
++}
++
++/**
++ * ppe_sr_guard() - The guard file (WP3-DESIGN §4.4).
++ * @priv: The offload.
++ *
++ * Inhibits arms, then waits PPE_SR_LOCK_WAIT_S at most, by the clock, for
++ * the lock, and disarms (GUARD). Takes neither the parameter lock nor RTNL:
++ * it works while either is held for long. Counted, and said ("sr: guard").
++ *
++ * Return: 0 (off), -EIO (FAULT), -EBUSY if the lock stayed busy.
++ */
++int ppe_sr_guard(struct ppe_offload_priv *priv)
++{
++	struct ppe_sr *sr = ppe_offload_sr(priv);
++	int ret;
++
++	ppe_sr_inhibit(sr);
++	if (ppe_sr_lock_bounded(sr->lock)) {
++		ret = ppe_sr_disarm(priv, PPE_SR_T_GUARD);
++		mutex_unlock(sr->lock);
++	} else {
++		atomic_inc(&sr->guard_busy);
++		ret = -EBUSY;
++	}
++	atomic_inc(&sr->guard_n);
++	atomic_set(&sr->guard_last, ret);
++	pr_warn("ppe_offload: sr: guard: %d\n", ret);
++
++	return ret;
++}
++
++/**
++ * ppe_sr_ctl_note() - Count a control verb's result.
++ * @priv: The offload.
++ * @verb: enum ppe_sr_verb.
++ * @ret: Its result.
++ *
++ * Lockless.
++ */
++void ppe_sr_ctl_note(struct ppe_offload_priv *priv, enum ppe_sr_verb verb, int ret)
++{
++	struct ppe_sr *sr = ppe_offload_sr(priv);
++
++	if ((unsigned int)verb >= PPE_SR_V_NUM)
++		return;
++	atomic_inc(ret ? &sr->ctl_err[verb] : &sr->ctl_ok[verb]);
++	atomic_set(&sr->ctl_last, (int)((verb + 1) | ((u32)-ret << 8)));
++}
++
+ /**
+  * ppe_sr_status_fill() - The S-R mode from memory (WP2-DESIGN §6.5).
+  * @priv: The offload.
+  * @st: Filled in.
+  *
+- * Under the lock. Reads no register: safe under load.
++ * Under the lock. Reads no register: safe under load. The offload's own
++ * flags (struct ppe_sr_status::off_enabled and the next two) are left to
++ * the caller.
+  */
+ void ppe_sr_status_fill(struct ppe_offload_priv *priv, struct ppe_sr_status *st)
+ {
+ 	struct ppe_sr *sr = ppe_offload_sr(priv);
+ 	const struct ppe_sr_eng *eng = &sr->eng;
+-	u32 dn[PPE_SR_ID_MAX];
++	const struct ppe_sr_scope_pub *scope;
++	unsigned long disarm_at;
++	u32 dn[PPE_SR_ID_MAX], w;
+ 	unsigned int s, i;
+ 	bool acc;
+ 
+@@ -1563,7 +1863,9 @@ void ppe_sr_status_fill(struct ppe_offload_priv *priv, struct ppe_sr_status *st)
+ 	ppe_offload_sr_dn_counts(priv, dn);
+ 	memset(st, 0, sizeof(*st));
+ 	st->state = eng->seq.state;
+-	st->td_word = ppe_sr_word(sr, NULL);
++	st->td_word = ppe_sr_word(sr, &disarm_at);
++	st->inhibit = ppe_sr_inhibited(sr, &st->inhibit_gen);
++	st->sw_ref = sr->sw_ref;
+ 	strscpy(st->conduit, sr->conduit_name, sizeof(st->conduit));
+ 	st->held = !!sr->conduit;
+ 	st->ppe_port = eng->seq.cfg.ppe_port;
+@@ -1575,9 +1877,23 @@ void ppe_sr_status_fill(struct ppe_offload_priv *priv, struct ppe_sr_status *st)
+ 	st->dirty_ports = eng->dirty_ports;
+ 	st->inert_fail = eng->inert_fail;
+ 	st->u_uploads = READ_ONCE(ppe_sr_u_uploads);
+-	st->scoped = !!rcu_access_pointer(sr->scope);
+-	if (eng->deadline && eng->seq.state != PPE_SR_S_OFF)
++	scope = rcu_dereference_protected(sr->scope, lockdep_is_held(sr->lock));
++	st->scoped = !!scope;
++	st->scope_gen = sr->scope_gen;
++	if (scope) {
++		st->scope_cls = scope->scope.ncls;
++		st->scope_any = scope->scope.any_client;
++		st->scope_clients = scope->scope.nclients;
++	}
++	/* G11: only READY and ACTIVE keep a deadline. */
++	if (eng->seq.state == PPE_SR_S_READY || eng->seq.state == PPE_SR_S_ACTIVE) {
++		st->has_deadline = true;
+ 		st->deadline_in_s = (long)(eng->deadline - jiffies) / HZ;
++	}
++	if (sr->conduit && st->td_word >= 0 && disarm_at) {
++		st->has_sw_deadline = true;
++		st->sw_deadline_in_s = (long)(disarm_at - jiffies) / HZ;
++	}
+ 	for (s = 0; s < PPE_SR_ID_MAX; s++) {
+ 		const struct ppe_sr_id *id = &eng->seq.id[s];
+ 
+@@ -1585,7 +1901,8 @@ void ppe_sr_status_fill(struct ppe_offload_priv *priv, struct ppe_sr_status *st)
+ 			continue;
+ 		acc = ppe_sr_class_eq(&sr->acc[s].cls, &id->cls);
+ 		st->id[st->nid++] = (struct ppe_sr_status_id){
+-			.cls = id->cls, .live = id->live, .xlt = id->xlt, .l3_if = id->l3_if,
++			.cls = id->cls, .slot = s, .live = id->live, .xlt = id->xlt,
++			.l3_if = id->l3_if,
+ 			.up = list_count_nodes(&sr->flows[s]), .dn = dn[s],
+ 			.acc_up = acc ? sr->acc[s].up : 0, .acc_dn = acc ? sr->acc[s].dn : 0,
+ 		};
+@@ -1605,6 +1922,17 @@ void ppe_sr_status_fill(struct ppe_offload_priv *priv, struct ppe_sr_status *st)
+ 	st->resync_declined = eng->resync_declined;
+ 	st->moved = sr->moved;
+ 	st->move_dropped = sr->move_dropped;
++	for (i = 0; i < PPE_SR_V_NUM; i++) {
++		st->ctl_ok[i] = atomic_read(&sr->ctl_ok[i]);
++		st->ctl_err[i] = atomic_read(&sr->ctl_err[i]);
++	}
++	w = (u32)atomic_read(&sr->ctl_last);
++	st->ctl_last_verb = (int)(w & 0xff) - 1;
++	st->ctl_last_ret = -(int)(w >> 8);
++	st->guard_n = atomic_read(&sr->guard_n);
++	st->guard_last = atomic_read(&sr->guard_last);
++	st->guard_busy = atomic_read(&sr->guard_busy);
++	st->renewals = sr->renewals;
+ }
+ 
+ /**
+@@ -1618,7 +1946,9 @@ void ppe_sr_status_fill(struct ppe_offload_priv *priv, struct ppe_sr_status *st)
+  * MISMATCH"), and disarms (VERIFY) while ACTIVE. The S-R flows are checked
+  * too, from memory: the uploads against their identities, the downloads
+  * against their classes (WP2-DESIGN §3.5, §4.1, §4.8 invariants 2, 4 and
+- * 7).
++ * 7). The last line is the verdict (WP3-DESIGN G14): "verdict MISMATCH" if
++ * anything did not match, else "verdict error" if a read failed, else
++ * "verdict none" when nothing is armed, else "verdict match".
+  *
+  * Return: 0.
+  */
+@@ -1627,6 +1957,7 @@ int ppe_sr_hw_show(struct ppe_offload_priv *priv, struct seq_file *m)
+ 	struct ppe_sr *sr = ppe_offload_sr(priv);
+ 	unsigned int s, up, dn, bad;
+ 	struct ppe_sr_id_cnt c;
++	bool read_err = false;
+ 	int ret;
+ 
+ 	mutex_lock(sr->lock);
+@@ -1657,6 +1988,7 @@ int ppe_sr_hw_show(struct ppe_offload_priv *priv, struct seq_file *m)
+ 			continue;
+ 		if (ppe_sr_seq_id_counters(&sr->eng.seq, &sr->io, s, &c)) {
+ 			seq_printf(m, "id %u: counters not read\n", s);
++			read_err = true;
+ 			continue;
+ 		}
+ 		seq_printf(m, "id %u p %u form %c vid %u xlt %u l3_if %u live %u xlt_pkts %llu xlt_bytes %llu rt_in_pkts %llu rt_in_bytes %llu rt_eg_pkts %llu rt_eg_bytes %llu\n",
+@@ -1667,5 +1999,14 @@ int ppe_sr_hw_show(struct ppe_offload_priv *priv, struct seq_file *m)
+ 	ppe_sr_settle(sr);
+ 	mutex_unlock(sr->lock);
+ 
++	if (ret == -EBADMSG || bad)
++		seq_puts(m, "verdict MISMATCH\n");
++	else if ((ret && ret != -ENOENT) || read_err)
++		seq_puts(m, "verdict error\n");
++	else if (ret == -ENOENT)
++		seq_puts(m, "verdict none\n");
++	else
++		seq_puts(m, "verdict match\n");
++
+ 	return 0;
+ }
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_sr.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr.h
+@@ -26,7 +26,9 @@
+ 
+ /* Why a class, an offer or an arm is declined or refused. PPE_SR_W_OK is
+  * none. The resolver's reasons come first (ppe_sr_class_up() and
+- * ppe_sr_class_dn()), then the offer path's, then the arm refusals.
++ * ppe_sr_class_dn()), then the offer path's, then the arm refusals: an arm
++ * inhibited by a control disarm or the guard (INHIBIT), and one without a
++ * deadline or with too short a one (DEADLINE), last.
+  */
+ enum ppe_sr_why {
+ 	PPE_SR_W_OK,
+@@ -57,6 +59,8 @@ enum ppe_sr_why {
+ 	PPE_SR_W_BUDGET,
+ 	PPE_SR_W_SWITCH_NOT_READY,
+ 	PPE_SR_W_PRECHECK,
++	PPE_SR_W_INHIBIT,
++	PPE_SR_W_DEADLINE,
+ 	PPE_SR_W_NUM
+ };
+ 
+@@ -118,6 +122,18 @@ enum ppe_sr_flow {
+ 	PPE_SR_FLOW_DN
+ };
+ 
++/* The verbs of the S-R control file (debugfs offload_sr, WP3-DESIGN §4.2),
++ * counted by ppe_sr_ctl_note().
++ */
++enum ppe_sr_verb {
++	PPE_SR_V_ARM,
++	PPE_SR_V_OFFERS,
++	PPE_SR_V_DEADLINE,
++	PPE_SR_V_DISARM,
++	PPE_SR_V_UNINHIBIT,
++	PPE_SR_V_NUM
++};
++
+ /* @deadline: jiffies at which the S-R mode disarms by itself; capped at
+  * the switch's own deadline less PPE_SR_DEADLINE_MARGIN_S.
+  * @offers: Accept offers right after arming.
+@@ -191,7 +207,15 @@ int ppe_sr_offers(struct ppe_offload_priv *priv, bool on);
+ int ppe_sr_disarm(struct ppe_offload_priv *priv, enum ppe_sr_trigger trigger);
+ int ppe_sr_disarm_locked_by(struct ppe_offload_priv *priv, enum ppe_sr_trigger trigger);
+ int ppe_sr_scope_set(struct ppe_offload_priv *priv, const struct ppe_sr_scope *scope);
++bool ppe_sr_scope_get(struct ppe_offload_priv *priv, struct ppe_sr_scope *scope, u32 *gen,
++		      bool *u_uploads);
+ int ppe_sr_deadline_set(struct ppe_offload_priv *priv, unsigned long deadline);
++
++/* WP3's controls (WP3-DESIGN §4.2-§4.5). */
++int ppe_sr_disarm_ctl(struct ppe_offload_priv *priv);
++int ppe_sr_uninhibit(struct ppe_offload_priv *priv, u32 gen);
++int ppe_sr_guard(struct ppe_offload_priv *priv);
++void ppe_sr_ctl_note(struct ppe_offload_priv *priv, enum ppe_sr_verb verb, int ret);
+ void ppe_sr_topo_event(struct ppe_offload_priv *priv, u32 ports);
+ void ppe_sr_status_fill(struct ppe_offload_priv *priv, struct ppe_sr_status *st);
+ int ppe_sr_hw_show(struct ppe_offload_priv *priv, struct seq_file *m);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_sr_eng.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_eng.c
+@@ -29,6 +29,15 @@
+  * orders every write of what it reads, the class derived again on the
+  * topology as it is then.
+  *
++ * The deadline (WP3-DESIGN D7, §4.5): ppe_sr_eng_tick() is the deadline
++ * work's step. While READY or ACTIVE it disarms when the switch is found
++ * out of step (SWITCH_NOT_READY, as the lost work does) or the deadline is
++ * reached (DEADLINE), and otherwise says how long to wait: never more than
++ * PPE_SR_DEADLINE_STEP_S, so that a switch that left READY is noticed even
++ * with no statistics request. ppe_sr_eng_arm_gate() is the arm's first
++ * refusal: inhibited (a control disarm or the guard came first) or the
++ * system no longer running.
++ *
+  * S-R downloads (§4.1, D8, D9): the class alone gives the tag inserts
+  * (ppe_sr_dn_tags()), an S-tag naming the port and a C-tag naming the
+  * class's VLAN, and caps the PMTU; a client the bridge learns on another
+@@ -528,14 +537,19 @@ void ppe_sr_eng_degraded(struct ppe_sr_eng *eng, const struct ppe_sr_io *io)
+  * @stuck: The flows the flush could not drop.
+  *
+  * Under the lock. A degraded latch during the flush counts as a flow left
+- * behind (D13), so that the sequence stops as for a stuck flow.
++ * behind (D13), so that the sequence stops as for a stuck flow. The count
++ * is added to @eng->stuck, which the transition records (struct
++ * ppe_sr_last).
+  *
+  * Return: the count to report.
+  */
+-unsigned int ppe_sr_eng_flush_stuck(const struct ppe_sr_eng *eng, u32 latched,
+-				    unsigned int stuck)
++unsigned int ppe_sr_eng_flush_stuck(struct ppe_sr_eng *eng, u32 latched, unsigned int stuck)
+ {
+-	return stuck + (eng->latched != latched);
++	unsigned int n = stuck + (eng->latched != latched);
++
++	eng->stuck += n;
++
++	return n;
+ }
+ 
+ /**
+@@ -553,19 +567,51 @@ int ppe_sr_eng_refuse(struct ppe_sr_eng *eng, const struct ppe_sr_io *io, enum p
+ {
+ 	if ((unsigned int)why < PPE_SR_W_NUM)
+ 		eng->arm_refused[why]++;
+-	eng->last = (struct ppe_sr_last){ .arm = 1, .why = why, .err = err };
++	eng->last = (struct ppe_sr_last){ .kind = PPE_SR_LAST_ARM, .arm = 1, .why = why,
++					  .err = err };
+ 	eng_log(io, PPE_SR_LOG_WARN, "refused: arm %s (%d): %s", ppe_sr_why_name(why), err, what);
+ 
+ 	return err;
+ }
+ 
++/**
++ * ppe_sr_eng_arm_gate() - The arm's first refusals (WP3-DESIGN D8, G16).
++ * @eng: The engine.
++ * @io: For the log.
++ * @inhibit: A control disarm or the guard inhibited arms, and no
++ * uninhibit of its generation followed.
++ * @running: The system is running (not booting, not going down).
++ * @why: Set to INHIBIT or PRECHECK when refused.
++ *
++ * Under the lock, before ppe_sr_eng_arm_check(): a stop that came before
++ * the arm took the lock wins over it, and nothing arms while the system
++ * goes down (the reboot notifier has disarmed by then, or tried to).
++ *
++ * Return: 0, -EPERM (INHIBIT) or -ESHUTDOWN (PRECHECK), counted and said.
++ */
++int ppe_sr_eng_arm_gate(struct ppe_sr_eng *eng, const struct ppe_sr_io *io, bool inhibit,
++			bool running, enum ppe_sr_why *why)
++{
++	if (inhibit) {
++		*why = PPE_SR_W_INHIBIT;
++		return ppe_sr_eng_refuse(eng, io, *why, -EPERM,
++					 "inhibited by a control disarm or the guard");
++	}
++	if (!running) {
++		*why = PPE_SR_W_PRECHECK;
++		return ppe_sr_eng_refuse(eng, io, *why, -ESHUTDOWN, "system not running");
++	}
++
++	return 0;
++}
++
+ /**
+  * ppe_sr_eng_arm_check() - The arm's memory prechecks that are the
+  * engine's (A0).
+  * @eng: The engine.
+  * @io: For the log.
+  * @deadline: The arm's deadline.
+- * @why: Set to PPE_SR_W_PRECHECK.
++ * @why: Set to PPE_SR_W_PRECHECK, or PPE_SR_W_DEADLINE without a deadline.
+  *
+  * Return: 0, -EIO in FAULT, -EALREADY unless off, -EBUSY after a failed
+  * boot check, -EINVAL without a deadline; each refusal counted and said.
+@@ -581,8 +627,10 @@ int ppe_sr_eng_arm_check(struct ppe_sr_eng *eng, const struct ppe_sr_io *io,
+ 	if (eng->inert_fail)
+ 		return ppe_sr_eng_refuse(eng, io, *why, -EBUSY,
+ 					 "S-R registers were not at their base at enable");
+-	if (!deadline)
++	if (!deadline) {
++		*why = PPE_SR_W_DEADLINE;
+ 		return ppe_sr_eng_refuse(eng, io, *why, -EINVAL, "no deadline");
++	}
+ 
+ 	return 0;
+ }
+@@ -604,7 +652,8 @@ int ppe_sr_eng_arm_check(struct ppe_sr_eng *eng, const struct ppe_sr_io *io,
+  * ppe_sr_eng_arm_check() or ppe_sr_seq_arm() (-EINVAL with @why NOTHING
+  * for no class in scope, -ENOSPC with BUDGET for more than PPE_SR_ID_MAX
+  * or a truncated L3 device list), each counted and said. A refused offers
+- * step leaves the arm READY.
++ * step leaves the arm READY (or FAULT) and returns its error
++ * (ppe_sr_eng_offers()), @why OK: the arm itself is not undone.
+  */
+ int ppe_sr_eng_arm(struct ppe_sr_eng *eng, const struct ppe_sr_io *io,
+ 		   const struct ppe_sr_eng_arm *a, enum ppe_sr_why *why)
+@@ -629,6 +678,7 @@ int ppe_sr_eng_arm(struct ppe_sr_eng *eng, const struct ppe_sr_io *io,
+ 
+ 	t0 = eng_ms(io);
+ 	eng->flushed = 0;
++	eng->stuck = 0;
+ 	eng_enter(eng);
+ 	ret = ppe_sr_seq_arm(&eng->seq, io, &a->cfg, a->plan, a->n, why);
+ 	eng_leave(eng, io);
+@@ -639,8 +689,9 @@ int ppe_sr_eng_arm(struct ppe_sr_eng *eng, const struct ppe_sr_io *io,
+ 	if (ret) {
+ 		if ((unsigned int)*why < PPE_SR_W_NUM)
+ 			eng->arm_refused[*why]++;
+-		eng->last = (struct ppe_sr_last){ .arm = 1, .why = *why, .err = ret,
+-						  .ms = eng_ms(io) - t0, .flushed = eng->flushed };
++		eng->last = (struct ppe_sr_last){ .kind = PPE_SR_LAST_ARM, .arm = 1, .why = *why,
++						  .err = ret, .ms = eng_ms(io) - t0,
++						  .flushed = eng->flushed, .stuck = eng->stuck };
+ 		eng_log(io, PPE_SR_LOG_WARN, "refused: arm %s (%d), state %s",
+ 			ppe_sr_why_name(*why), ret, ppe_sr_state_name(eng->seq.state));
+ 		return ret;
+@@ -659,19 +710,21 @@ int ppe_sr_eng_arm(struct ppe_sr_eng *eng, const struct ppe_sr_io *io,
+ 	WRITE_ONCE(eng->s_ports, a->cfg.s_ports);
+ 	eng->bridge_ifindex = a->bridge_ifindex;
+ 	eng->deadline = a->deadline;
++	eng->deadline_clamped = 0;
+ 	WRITE_ONCE(eng->dirty, 0);
+ 	WRITE_ONCE(eng->dirty_ports, 0);
+ 	eng->recopy = 0;
+ 	eng->lost_queued = 0;
+ 	eng->conduit_gone = 0;
+ 	eng->arm_ok++;
+-	eng->last = (struct ppe_sr_last){ .arm = 1, .why = PPE_SR_W_OK, .ms = eng_ms(io) - t0,
+-					  .flushed = eng->flushed };
++	eng->last = (struct ppe_sr_last){ .kind = PPE_SR_LAST_ARM, .arm = 1, .why = PPE_SR_W_OK,
++					  .ms = eng_ms(io) - t0, .flushed = eng->flushed,
++					  .stuck = eng->stuck };
+ 	eng_log(io, PPE_SR_LOG_INFO, "armed ids %u xlt %u-%u l3_if %u-%u flushed %u ms %u",
+ 		eng->seq.nid, xlo, xhi, llo, lhi, eng->last.flushed, eng->last.ms);
+ 
+ 	if (a->offers)
+-		ppe_sr_eng_offers(eng, io, true);
++		return ppe_sr_eng_offers(eng, io, true);
+ 
+ 	return 0;
+ }
+@@ -682,7 +735,9 @@ int ppe_sr_eng_arm(struct ppe_sr_eng *eng, const struct ppe_sr_io *io,
+  * @io: The state word and the flows.
+  * @on: READY to ACTIVE, or ACTIVE to READY with every flow dropped.
+  *
+- * Under the lock.
++ * Under the lock. Turning offers off is recorded as the last transition
++ * (struct ppe_sr_last, PPE_SR_LAST_OFFERS_OFF), with the flows it dropped
++ * and those it could not.
+  *
+  * Return: 0 (also when already so), -EINVAL unless READY or ACTIVE, -EBUSY
+  * if the switch refuses ACTIVE, -EIO in or into FAULT.
+@@ -690,16 +745,26 @@ int ppe_sr_eng_arm(struct ppe_sr_eng *eng, const struct ppe_sr_io *io,
+ int ppe_sr_eng_offers(struct ppe_sr_eng *eng, const struct ppe_sr_io *io, bool on)
+ {
+ 	u8 before = eng->seq.state;
++	unsigned long t0;
+ 	int ret;
+ 
+ 	if (before == PPE_SR_S_FAULT)
+ 		return -EIO;
++	t0 = eng_ms(io);
+ 	eng->flushed = 0;
++	eng->stuck = 0;
+ 	eng_enter(eng);
+ 	ret = ppe_sr_seq_offers(&eng->seq, io, on);
+ 	eng_leave(eng, io);
+ 	if (eng->seq.state == PPE_SR_S_FAULT)
+-		return -EIO;
++		ret = -EIO;
++	if (!on && before == PPE_SR_S_ACTIVE)
++		eng->last = (struct ppe_sr_last){ .kind = PPE_SR_LAST_OFFERS_OFF,
++						  .trigger = PPE_SR_T_CONTROL, .err = ret,
++						  .ms = eng_ms(io) - t0, .flushed = eng->flushed,
++						  .stuck = eng->stuck };
++	if (eng->seq.state == PPE_SR_S_FAULT)
++		return ret;
+ 	if (!ret && eng->seq.state != before)
+ 		eng_log(io, PPE_SR_LOG_INFO, "offers %s flushed %u", on ? "on" : "off",
+ 			eng->flushed);
+@@ -741,11 +806,13 @@ int ppe_sr_eng_disarm(struct ppe_sr_eng *eng, const struct ppe_sr_io *io,
+ 		eng->trig[trigger]++;
+ 	t0 = eng_ms(io);
+ 	eng->flushed = 0;
++	eng->stuck = 0;
+ 	eng_enter(eng);
+ 	ret = ppe_sr_seq_disarm(&eng->seq, io);
+ 	eng_leave(eng, io);
+-	eng->last = (struct ppe_sr_last){ .trigger = trigger, .err = ret, .ms = eng_ms(io) - t0,
+-					  .flushed = eng->flushed };
++	eng->last = (struct ppe_sr_last){ .kind = PPE_SR_LAST_DISARM, .trigger = trigger,
++					  .err = ret, .ms = eng_ms(io) - t0,
++					  .flushed = eng->flushed, .stuck = eng->stuck };
+ 	if (ret || eng->seq.state != PPE_SR_S_OFF)
+ 		return ret ? ret : -EIO;
+ 
+@@ -1028,6 +1095,66 @@ int ppe_sr_eng_lost_work(struct ppe_sr_eng *eng, const struct ppe_sr_io *io, int
+ 	return ppe_sr_eng_disarm(eng, io, PPE_SR_T_SWITCH_NOT_READY);
+ }
+ 
++/**
++ * ppe_sr_eng_tick() - One step of the deadline work (WP3-DESIGN D7, §4.5).
++ * @eng: The engine.
++ * @io: Register access, flows and the state word.
++ * @word: The rtl8_4s state word read now, -1 for no switch.
++ * @now: Jiffies now.
++ * @disarm_at: The switch's own deadline, read with @word (0 for none).
++ * @hz: Jiffies per second.
++ * @delay: Set to the jiffies to wait for the next step when 0 is returned:
++ * the time left, at most PPE_SR_DEADLINE_STEP_S.
++ *
++ * Under the lock. Only READY and ACTIVE have a deadline to keep. A switch
++ * out of step with the state (it left READY, or is gone) disarms
++ * (SWITCH_NOT_READY, ppe_sr_eng_lost_work()). A deadline past the switch's
++ * own less PPE_SR_DEADLINE_MARGIN_S is clamped to it (said once): the PPE
++ * releases before the switch's deadline comes, so that the switch need not
++ * yield. A deadline reached disarms (DEADLINE). Every comparison holds
++ * across a jiffies wrap.
++ *
++ * Return: 1 when the work is to stop (not armed, or a disarm ran, whatever
++ * its result), 0 to step again after @delay.
++ */
++int ppe_sr_eng_tick(struct ppe_sr_eng *eng, const struct ppe_sr_io *io, int word,
++		    unsigned long now, unsigned long disarm_at, unsigned long hz,
++		    unsigned long *delay)
++{
++	unsigned long cap, left;
++
++	if (!eng_armed(eng->seq.state))
++		return 1;
++	if (!ppe_sr_eng_td_fits(eng->seq.state, word)) {
++		ppe_sr_eng_lost_work(eng, io, word);
++		return 1;
++	}
++
++	cap = disarm_at - PPE_SR_DEADLINE_MARGIN_S * hz;
++	if (!cap)
++		cap--;
++	if (disarm_at && eng_before(cap, eng->deadline)) {
++		eng->deadline = cap;
++		if (!eng->deadline_clamped) {
++			eng->deadline_clamped = 1;
++			eng_log(io, PPE_SR_LOG_WARN,
++				"deadline clamped to %u s before the switch's own",
++				PPE_SR_DEADLINE_MARGIN_S);
++		}
++	}
++
++	if (!eng->deadline || !eng_before(now, eng->deadline)) {
++		eng_log(io, PPE_SR_LOG_INFO, "deadline reached, disarming");
++		ppe_sr_eng_disarm(eng, io, PPE_SR_T_DEADLINE);
++		return 1;
++	}
++
++	left = eng->deadline - now;
++	*delay = left < PPE_SR_DEADLINE_STEP_S * hz ? left : PPE_SR_DEADLINE_STEP_S * hz;
++
++	return 0;
++}
++
+ /**
+  * ppe_sr_eng_rebind() - Whether a port's L3 binding may be written
+  * (WP2-DESIGN §5.3).
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_sr_eng.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_eng.h
+@@ -28,10 +28,12 @@
+ 
+ /* The PPE's deadline ends at least this long before the switch's own
+  * (rtl8_4s_tagger_data::disarm_at), and an arm leaves it at least
+- * PPE_SR_DEADLINE_MIN_S (WP2-DESIGN §6.4, WP1-DESIGN:41).
++ * PPE_SR_DEADLINE_MIN_S (WP2-DESIGN §6.4, WP1-DESIGN:41). The deadline work
++ * wakes at least every PPE_SR_DEADLINE_STEP_S while armed (WP3-DESIGN D7).
+  */
+ #define PPE_SR_DEADLINE_MARGIN_S	30
+ #define PPE_SR_DEADLINE_MIN_S		60
++#define PPE_SR_DEADLINE_STEP_S		30
+ 
+ /* A scope lists at most this many classes and client addresses. */
+ #define PPE_SR_SCOPE_CLS_MAX		PPE_SR_CLS_MAX
+@@ -176,17 +178,28 @@ struct ppe_sr_move {
+ 	u8 why;
+ };
+ 
++/* What struct ppe_sr_last records. */
++enum ppe_sr_last_kind {
++	PPE_SR_LAST_NONE,
++	PPE_SR_LAST_ARM,
++	PPE_SR_LAST_DISARM,
++	PPE_SR_LAST_OFFERS_OFF
++};
++
+ /**
+- * struct ppe_sr_last - The last arm or disarm, for status.
+- * @arm: An arm (else a disarm).
+- * @trigger: The disarm's enum ppe_sr_trigger.
++ * struct ppe_sr_last - The last arm, disarm or offers off, for status.
++ * @kind: enum ppe_sr_last_kind; PPE_SR_LAST_NONE before the first.
++ * @arm: An arm (else a disarm or offers off).
++ * @trigger: The disarm's enum ppe_sr_trigger; CONTROL for offers off.
+  * @why: The arm's enum ppe_sr_why.
+  * @err: Its result.
+  * @ms: How long it took.
+  * @flushed: The flows it dropped.
+- * @stuck: The flows it could not drop.
++ * @stuck: The flows it could not drop, as its flushes reported them
++ * (ppe_sr_eng_flush_stuck()).
+  */
+ struct ppe_sr_last {
++	u8 kind;
+ 	u8 arm;
+ 	u8 trigger;
+ 	u8 why;
+@@ -222,8 +235,13 @@ struct ppe_sr_last {
+  * @s_ports: The switch's S-R port mask, fixed at arm; likewise.
+  * @bridge_ifindex: The S-R bridge, fixed at arm; 0 for none.
+  * @deadline: Jiffies at which the S-R mode is to be disarmed (WP3).
++ * @deadline_clamped: The deadline work found @deadline past the switch's
++ * own less PPE_SR_DEADLINE_MARGIN_S and clamped it (said once until the
++ * next arm or renewal).
+  * @flushed: Flows the io's flush dropped since the transition began (the
+  * io adds to it).
++ * @stuck: Flows the io's flush could not drop since then
++ * (ppe_sr_eng_flush_stuck() adds to it).
+  * @arm_ok: Arms that reached READY.
+  * @arm_refused: Arms refused or failed, by enum ppe_sr_why.
+  * @trig: Disarms run, by enum ppe_sr_trigger.
+@@ -248,7 +266,9 @@ struct ppe_sr_eng {
+ 	u16 s_ports;
+ 	int bridge_ifindex;
+ 	unsigned long deadline;
++	u8 deadline_clamped;
+ 	u32 flushed;
++	u32 stuck;
+ 	u32 arm_ok;
+ 	u32 arm_refused[PPE_SR_W_NUM];
+ 	u32 trig[PPE_SR_T_NUM];
+@@ -281,6 +301,148 @@ struct ppe_sr_eng_arm {
+ 	bool offers;
+ };
+ 
++/* The size of struct ppe_sr_status::conduit (IFNAMSIZ, asserted in
++ * ppe_sr.c).
++ */
++#define PPE_SR_IFNAMSIZ		16
++
++/**
++ * struct ppe_sr_status_id - An identity, for status.
++ * @cls: Its class.
++ * @slot: Its slot, which flows name it by.
++ * @live: Offers may key flows on it.
++ * @xlt: Its XLT entry and counter.
++ * @l3_if: Its ingress L3 interface.
++ * @up: Upload flows keyed on it now.
++ * @dn: Download flows of its class now.
++ * @acc_up: Uploads accepted on it.
++ * @acc_dn: Downloads of its class accepted while it was live.
++ */
++struct ppe_sr_status_id {
++	struct ppe_sr_class cls;
++	u8 slot;
++	u8 live;
++	u8 xlt;
++	u8 l3_if;
++	u32 up;
++	u32 dn;
++	u32 acc_up;
++	u32 acc_dn;
++};
++
++/**
++ * struct ppe_sr_status - The S-R mode from memory alone (WP2-DESIGN §6.5,
++ * WP3-DESIGN §4.6).
++ * @state: enum ppe_sr_state.
++ * @td_word: The rtl8_4s state word, one read; -1 without a switch.
++ * @inhibit: Arms are refused until uninhibited (WP3-DESIGN D8).
++ * @inhibit_gen: The inhibit's generation, for ppe_sr_uninhibit().
++ * @sw_ref: A reference on the switch driver's module is held (D16).
++ * @off_enabled: Flow offload is on; filled in by the status file from the
++ * offload (ppe_offload_sr_flags()), as are the next two.
++ * @off_degraded: It latched degraded.
++ * @off_tripped: It tripped.
++ * @conduit: The conduit's name, empty if none was ever armed on.
++ * @held: The conduit is held.
++ * @ppe_port: Its PPE port.
++ * @l3_if: Its L3 interface.
++ * @bridge_ifindex: The S-R bridge.
++ * @s_ports: The switch's S-R port mask, fixed at arm.
++ * @gen: The S-R generation.
++ * @dirty: A topology change of every port awaits its resync.
++ * @dirty_ports: The ports whose change awaits it.
++ * @inert_fail: S-R registers were not at base at enable: refused.
++ * @u_uploads: U classes get identities (qcom_ppe.sr_u_uploads).
++ * @scoped: A scope is set.
++ * @scope_gen: Scope swaps so far.
++ * @scope_cls: The classes in scope.
++ * @scope_any: Every client is in scope.
++ * @scope_clients: Else the clients listed.
++ * @has_deadline: READY or ACTIVE: @deadline_in_s is set.
++ * @deadline_in_s: Seconds to the PPE's deadline then.
++ * @has_sw_deadline: The conduit is held and its switch has a deadline:
++ * @sw_deadline_in_s is set.
++ * @sw_deadline_in_s: Seconds to the switch's deadline then.
++ * @nid: Entries of @id.
++ * @id: The identities.
++ * @decline: Offers declined, by enum ppe_sr_why.
++ * @accepted: Offers accepted, by enum ppe_sr_dir.
++ * @trig: Disarms, by enum ppe_sr_trigger.
++ * @arm_ok: Arms that reached READY.
++ * @arm_refused: Arms refused or failed, by enum ppe_sr_why.
++ * @last: The last arm, disarm or offers off.
++ * @fault: enum ppe_sr_fault.
++ * @fault_step: enum ppe_sr_step it latched at.
++ * @fault_err: Its error.
++ * @ctl_ok: Control verbs that returned 0, by enum ppe_sr_verb.
++ * @ctl_err: Control verbs that failed.
++ * @ctl_last_verb: The last control verb (enum ppe_sr_verb), -1 for none.
++ * @ctl_last_ret: Its result.
++ * @guard_n: Guard writes.
++ * @guard_last: The last one's result.
++ * @guard_busy: Guard writes that gave up waiting for the lock.
++ * @renewals: Deadlines moved later.
++ * @rebind_skipped: Conduit L3 bindings S-R kept from being written.
++ * @resyncs: Resyncs applied.
++ * @resync_declined: Classes resyncs left without an identity.
++ * @moved: S-R downloads that followed a client move.
++ * @move_dropped: S-R downloads dropped on a client move.
++ */
++struct ppe_sr_status {
++	u8 state;
++	int td_word;
++	bool inhibit;
++	u32 inhibit_gen;
++	bool sw_ref;
++	bool off_enabled;
++	bool off_degraded;
++	bool off_tripped;
++	char conduit[PPE_SR_IFNAMSIZ];
++	bool held;
++	u8 ppe_port;
++	u8 l3_if;
++	int bridge_ifindex;
++	u16 s_ports;
++	u32 gen;
++	bool dirty;
++	u16 dirty_ports;
++	bool inert_fail;
++	bool u_uploads;
++	bool scoped;
++	u32 scope_gen;
++	unsigned int scope_cls;
++	bool scope_any;
++	unsigned int scope_clients;
++	bool has_deadline;
++	long deadline_in_s;
++	bool has_sw_deadline;
++	long sw_deadline_in_s;
++	unsigned int nid;
++	struct ppe_sr_status_id id[PPE_SR_ID_MAX];
++	u64 decline[PPE_SR_W_NUM];
++	u64 accepted[2];
++	u32 trig[PPE_SR_T_NUM];
++	u32 arm_ok;
++	u32 arm_refused[PPE_SR_W_NUM];
++	struct ppe_sr_last last;
++	u8 fault;
++	u8 fault_step;
++	int fault_err;
++	u32 ctl_ok[PPE_SR_V_NUM];
++	u32 ctl_err[PPE_SR_V_NUM];
++	int ctl_last_verb;
++	int ctl_last_ret;
++	u32 guard_n;
++	int guard_last;
++	u32 guard_busy;
++	u32 renewals;
++	u32 rebind_skipped;
++	u32 resyncs;
++	u32 resync_declined;
++	u32 moved;
++	u32 move_dropped;
++};
++
+ const char *ppe_sr_trigger_name(unsigned int trigger);
+ 
+ void ppe_sr_eng_init(struct ppe_sr_eng *eng);
+@@ -302,6 +464,8 @@ int ppe_sr_eng_move(const struct ppe_sr_eng *eng, const struct ppe_sr_topo *topo
+ 
+ int ppe_sr_eng_refuse(struct ppe_sr_eng *eng, const struct ppe_sr_io *io, enum ppe_sr_why why,
+ 		      int err, const char *what);
++int ppe_sr_eng_arm_gate(struct ppe_sr_eng *eng, const struct ppe_sr_io *io, bool inhibit,
++			bool running, enum ppe_sr_why *why);
+ int ppe_sr_eng_arm_check(struct ppe_sr_eng *eng, const struct ppe_sr_io *io,
+ 			 unsigned long deadline, enum ppe_sr_why *why);
+ int ppe_sr_eng_arm(struct ppe_sr_eng *eng, const struct ppe_sr_io *io,
+@@ -310,8 +474,7 @@ int ppe_sr_eng_offers(struct ppe_sr_eng *eng, const struct ppe_sr_io *io, bool o
+ int ppe_sr_eng_disarm(struct ppe_sr_eng *eng, const struct ppe_sr_io *io,
+ 		      enum ppe_sr_trigger trigger);
+ void ppe_sr_eng_degraded(struct ppe_sr_eng *eng, const struct ppe_sr_io *io);
+-unsigned int ppe_sr_eng_flush_stuck(const struct ppe_sr_eng *eng, u32 latched,
+-				    unsigned int stuck);
++unsigned int ppe_sr_eng_flush_stuck(struct ppe_sr_eng *eng, u32 latched, unsigned int stuck);
+ bool ppe_sr_eng_topo_event(struct ppe_sr_eng *eng, const struct ppe_sr_io *io, u16 ports,
+ 			   bool recopy);
+ bool ppe_sr_eng_scope_event(struct ppe_sr_eng *eng, const struct ppe_sr_io *io);
+@@ -323,6 +486,9 @@ bool ppe_sr_eng_conduit_gone(struct ppe_sr_eng *eng, const struct ppe_sr_io *io)
+ bool ppe_sr_eng_td_fits(u8 state, int word);
+ bool ppe_sr_eng_lost(struct ppe_sr_eng *eng, int word);
+ int ppe_sr_eng_lost_work(struct ppe_sr_eng *eng, const struct ppe_sr_io *io, int word);
++int ppe_sr_eng_tick(struct ppe_sr_eng *eng, const struct ppe_sr_io *io, int word,
++		    unsigned long now, unsigned long disarm_at, unsigned long hz,
++		    unsigned long *delay);
+ bool ppe_sr_eng_rebind(struct ppe_sr_eng *eng, u32 port);
+ int ppe_sr_eng_boot_check(struct ppe_sr_eng *eng, const struct ppe_sr_io *io, u8 ppe_port);
+ 
+@@ -352,6 +518,7 @@ int ppe_sr_deadline_fwd(unsigned long now, unsigned long cur, unsigned long want
+ 
+ /* The kernel side of the S-R mode (ppe_sr.c); its API is in ppe_sr.h. */
+ 
++struct module;
+ struct mutex;
+ struct ppe_device;
+ struct ppe_offload_priv;
+@@ -402,6 +569,10 @@ struct ppe_sr_id_acc {
+  * @lock), on @wq.
+  * @lost_work: Disarms when a check found the switch out of step with the
+  * state (WP2-DESIGN D17); @lock only.
++ * @deadline_work: While READY or ACTIVE, disarms at the deadline
++ * (DEADLINE), or when the switch is found out of step (SWITCH_NOT_READY);
++ * wakes at least every PPE_SR_DEADLINE_STEP_S. @lock only, on
++ * system_dfl_wq (WP3-DESIGN D7, §4.5).
+  * @reboot_nb: Disarms before the system goes down, so that the switch's
+  * own shutdown finds the PPE off.
+  * @show: While ppe_sr_hw_show() verifies, its output: the sequences' log
+@@ -418,6 +589,25 @@ struct ppe_sr_id_acc {
+  * (WP2-DESIGN D9); under @lock.
+  * @move_dropped: S-R downloads dropped on a client move instead; under
+  * @lock.
++ * @inhibit: Bit 0: arms are refused (WP3-DESIGN D8). Set by a control
++ * disarm and by the guard before they take @lock, cleared only by
++ * ppe_sr_uninhibit() naming the generation in force. Bits 31:1: that
++ * generation, bumped by each set. One atomic word, so that a set and an
++ * uninhibit cannot interleave into a bumped generation with the bit clear.
++ * @sw_mod: The switch driver's module, while @sw_ref.
++ * @sw_ref: A reference on @sw_mod is held: taken at the arm, before its
++ * claim, and dropped once the mode is off again (FAULT keeps it), so that
++ * the switch driver cannot be unloaded while S-R may be live in hardware
++ * (WP3-DESIGN D16). Under @lock.
++ * @scope_gen: Scope swaps (ppe_sr_scope_set()); under @lock.
++ * @renewals: Deadlines moved later (ppe_sr_deadline_set()); under @lock.
++ * @ctl_ok: Control verbs that returned 0, by enum ppe_sr_verb.
++ * @ctl_err: Control verbs that failed.
++ * @ctl_last: The last control verb: its enum ppe_sr_verb + 1 in bits 7:0
++ * (0 for none), its negated result above.
++ * @guard_n: Guard writes.
++ * @guard_last: The last one's result.
++ * @guard_busy: Guard writes that gave up waiting for @lock.
+  */
+ struct ppe_sr {
+ 	struct ppe_sr_eng eng;
+@@ -441,96 +631,18 @@ struct ppe_sr {
+ 	u64 accepted[2];
+ 	u32 moved;
+ 	u32 move_dropped;
+-};
+-
+-/**
+- * struct ppe_sr_status_id - An identity, for status.
+- * @cls: Its class.
+- * @live: Offers may key flows on it.
+- * @xlt: Its XLT entry and counter.
+- * @l3_if: Its ingress L3 interface.
+- * @up: Upload flows keyed on it now.
+- * @dn: Download flows of its class now.
+- * @acc_up: Uploads accepted on it.
+- * @acc_dn: Downloads of its class accepted while it was live.
+- */
+-struct ppe_sr_status_id {
+-	struct ppe_sr_class cls;
+-	u8 live;
+-	u8 xlt;
+-	u8 l3_if;
+-	u32 up;
+-	u32 dn;
+-	u32 acc_up;
+-	u32 acc_dn;
+-};
+-
+-/**
+- * struct ppe_sr_status - The S-R mode from memory alone (WP2-DESIGN §6.5).
+- * @state: enum ppe_sr_state.
+- * @td_word: The rtl8_4s state word, one read; -1 without a switch.
+- * @conduit: The conduit's name, empty if none was ever armed on.
+- * @held: The conduit is held.
+- * @ppe_port: Its PPE port.
+- * @l3_if: Its L3 interface.
+- * @bridge_ifindex: The S-R bridge.
+- * @s_ports: The switch's S-R port mask, fixed at arm.
+- * @gen: The S-R generation.
+- * @dirty: A topology change of every port awaits its resync.
+- * @dirty_ports: The ports whose change awaits it.
+- * @inert_fail: S-R registers were not at base at enable: refused.
+- * @u_uploads: U classes get identities (qcom_ppe.sr_u_uploads).
+- * @scoped: A scope is set.
+- * @deadline_in_s: Seconds to the deadline while armed, else 0.
+- * @nid: Entries of @id.
+- * @id: The identities.
+- * @decline: Offers declined, by enum ppe_sr_why.
+- * @accepted: Offers accepted, by enum ppe_sr_dir.
+- * @trig: Disarms, by enum ppe_sr_trigger.
+- * @arm_ok: Arms that reached READY.
+- * @arm_refused: Arms refused or failed, by enum ppe_sr_why.
+- * @last: The last arm or disarm.
+- * @fault: enum ppe_sr_fault.
+- * @fault_step: enum ppe_sr_step it latched at.
+- * @fault_err: Its error.
+- * @rebind_skipped: Conduit L3 bindings S-R kept from being written.
+- * @resyncs: Resyncs applied.
+- * @resync_declined: Classes resyncs left without an identity.
+- * @moved: S-R downloads that followed a client move.
+- * @move_dropped: S-R downloads dropped on a client move.
+- */
+-struct ppe_sr_status {
+-	u8 state;
+-	int td_word;
+-	char conduit[IFNAMSIZ];
+-	bool held;
+-	u8 ppe_port;
+-	u8 l3_if;
+-	int bridge_ifindex;
+-	u16 s_ports;
+-	u32 gen;
+-	bool dirty;
+-	u16 dirty_ports;
+-	bool inert_fail;
+-	bool u_uploads;
+-	bool scoped;
+-	long deadline_in_s;
+-	unsigned int nid;
+-	struct ppe_sr_status_id id[PPE_SR_ID_MAX];
+-	u64 decline[PPE_SR_W_NUM];
+-	u64 accepted[2];
+-	u32 trig[PPE_SR_T_NUM];
+-	u32 arm_ok;
+-	u32 arm_refused[PPE_SR_W_NUM];
+-	struct ppe_sr_last last;
+-	u8 fault;
+-	u8 fault_step;
+-	int fault_err;
+-	u32 rebind_skipped;
+-	u32 resyncs;
+-	u32 resync_declined;
+-	u32 moved;
+-	u32 move_dropped;
++	struct delayed_work deadline_work;
++	atomic_t inhibit;
++	struct module *sw_mod;
++	bool sw_ref;
++	u32 scope_gen;
++	u32 renewals;
++	atomic_t ctl_ok[PPE_SR_V_NUM];
++	atomic_t ctl_err[PPE_SR_V_NUM];
++	atomic_t ctl_last;
++	atomic_t guard_n;
++	atomic_t guard_last;
++	atomic_t guard_busy;
+ };
+ 
+ #endif /* !PPE_SR_PURE */
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_sr_topo.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_topo.c
+@@ -66,6 +66,8 @@ static const char * const ppe_sr_why_names[PPE_SR_W_NUM] = {
+ 	[PPE_SR_W_BUDGET] = "budget",
+ 	[PPE_SR_W_SWITCH_NOT_READY] = "switch_not_ready",
+ 	[PPE_SR_W_PRECHECK] = "precheck",
++	[PPE_SR_W_INHIBIT] = "inhibit",
++	[PPE_SR_W_DEADLINE] = "deadline",
+ };
+ 
+ /**
