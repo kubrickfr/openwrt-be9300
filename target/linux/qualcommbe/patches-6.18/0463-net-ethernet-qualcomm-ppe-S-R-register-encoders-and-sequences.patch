@@ -1,0 +1,3252 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: S-R register encoders and
+ sequences
+
+The S-R mode gives each (switch port, form, VLAN) class an identity of
+its own: an XLT rule on the conduit's PPE port that matches the
+switch's S-tag of the port (3900 + p) and the class's C-tag, and an
+ingress L3 interface that the rule's action hands the frame. A flow
+keyed on that interface is hit only by its class's frames. For
+downloads the nexthop inserts the S-tag of the port (3910 + p) and the
+C-tag of the VLAN. This patch adds the register side of all that,
+with no caller yet.
+
+ppe_sr_hw.c encodes, in pure code (no kernel call, tested in user
+space): the XLT rule (S-tagged with an upload S-VID, plus either no
+C-tag and EtherType 0x0800, or a C-tag with the class's VID; the
+EtherType key keeps a client's nested 802.1ad tag from taking U(p)'s
+identity), the action (L3 interface and counter, no tag, PCP or VSI
+change), the inert test of an L3 interface and its copy (the
+conduit's, without IPv6 routing, PPPoE, the DMAC check bypass and the
+VPN), and the fields S-R moves: the egress S-TPID (0x8899 to 0x88a8),
+the CPU port's egress tag modes (0x134 to 0x11f), the conduit's L3
+binding (valid bit cleared, index kept) and its parser role (core).
+The encodings are held against the words the PPE gate measured on a
+GL-BE9300.
+
+ppe_sr_seq.c runs the sequences on struct ppe_sr_io (register access,
+the flows, the rtl8_4s state word's ppe byte, logging), in pure code
+too. Every write is read back; a field or entry is moved only from the
+value it is expected to hold, and each step records that it may have
+written before it writes. The arm: read-only prechecks and the
+identities' entries (lowest free XLT entry in 0-63 whose counter no
+valid rule's action names, lowest inert L3 interface in 32-255), the
+switch claimed, every flow dropped, then S-TPID, CPU port, identities
+(L3 interface copy, counter zero, action, rule last), binding and the
+parser role last, then a full verify. A failure rolls back what was
+recorded, role first, and releases the claim; a failed rollback, like
+a stuck flow or a failed revert later, latches FAULT: the claim and
+every register stay until reboot. The disarm drops every flow and
+puts back the role first (nothing more if that fails, so a core role
+never meets an E CPU port), then the rest, each step attempted. A
+resync plans the identity changes against a new set of classes
+(removals, recopies after a conduit change, additions; live
+identities are never displaced over budget), executes them from the
+arm's record of what is free without reading foreign entries, and
+takes back a failed addition alone. Also a boot check of S-R's
+registers, the identities' counters and the names for status.
+
+The nexthop encoder moves out of the register write into
+ppe_nexthop_entry_encode()/_decode(). The pool reads every new entry
+back (one that reads otherwise is zeroed and declined), and never hands
+out index 0: enable programs it as a CPU sink (CPU port, IP_TO_ME), so
+that a host entry's DST_INFO 0, should hardware take it for a nexthop
+on a frame no flow matched, reaches the CPU.
+
+The register definitions added: XLT rule and action (with the C-VID
+and EtherType keys), XLT and L3 interface counters, ingress bridge
+type, port default VID and VLAN config, the tunnel parser's port role,
+and the L3 binding's VSI.
+
+Signed-off-by: François Guerraz <kubrick@fgv6.net>
+---
+ drivers/net/ethernet/qualcomm/ppe/Makefile         |    2 
+ drivers/net/ethernet/qualcomm/ppe/ppe_nexthop.c    |  104 +
+ drivers/net/ethernet/qualcomm/ppe/ppe_nexthop.h    |    5 
+ .../net/ethernet/qualcomm/ppe/ppe_nexthop_pool.c   |   79 +
+ .../net/ethernet/qualcomm/ppe/ppe_nexthop_pool.h   |    7 
+ drivers/net/ethernet/qualcomm/ppe/ppe_offload.c    |   10 
+ drivers/net/ethernet/qualcomm/ppe/ppe_regs.h       |  116 +
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr.h         |   17 
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_hw.c      |  413 +++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_hw.h      |  131 +
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_seq.c     | 1792 ++++++++++++++++++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_seq.h     |  299 +++
+ 12 files changed, 2927 insertions(+), 48 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/Makefile
++++ b/drivers/net/ethernet/qualcomm/ppe/Makefile
+@@ -7,7 +7,7 @@ obj-$(CONFIG_QCOM_PPE) += qcom-ppe.o
+ qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o
+ qcom-ppe-objs += ppe_flow.o ppe_flow_ipv4.o ppe_host.o ppe_host_ipv4.o ppe_host_pool.o \
+ 		 ppe_nexthop.o ppe_nexthop_pool.o ppe_l3_if.o ppe_pub_ip.o ppe_pub_ip_pool.o \
+-		 ppe_offload.o ppe_sr.o ppe_sr_topo.o
++		 ppe_offload.o ppe_sr.o ppe_sr_hw.o ppe_sr_seq.o ppe_sr_topo.o
+ 
+ #EDMA
+ qcom-ppe-objs += edma.o edma_cfg_rx.o edma_cfg_tx.o edma_debugfs.o edma_port.o edma_rx.o edma_tx.o edma_ethtool.o
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop.c
+@@ -30,31 +30,22 @@
+ #include <linux/bitfield.h>
+ #include <linux/etherdevice.h>
+ #include <linux/regmap.h>
++#include <linux/string.h>
+ 
+ #include "ppe.h"
+ #include "ppe_nexthop.h"
+ #include "ppe_regs.h"
+ 
+ /**
+- * ppe_nexthop_entry_set() - Write a PPE nexthop table entry.
+- * @ppe_dev: PPE device.
+- * @index: The entry index to write.
+- * @entry: The nexthop entry to write.
+- *
+- * Return: 0 on success, a negative error code on failure.
++ * ppe_nexthop_entry_encode() - Encode a PPE nexthop table entry.
++ * @entry: The nexthop entry.
++ * @val: Its words. A field wider than the hardware's is cut to it, which
++ * a read back (ppe_nexthop_pool_get_and_ref()) shows.
+  */
+-int ppe_nexthop_entry_set(struct ppe_device *ppe_dev, u32 index,
+-			   const struct ppe_nexthop_entry *entry)
++void ppe_nexthop_entry_encode(const struct ppe_nexthop_entry *entry,
++			      u32 val[PPE_IN_NEXTHOP_TBL_WORDS])
+ {
+-	u32 base, val[4] = {};
+-	u64 mac;
+-	int ret;
+-	int i;
+-
+-	if (index >= PPE_IN_NEXTHOP_TBL_ENTRIES)
+-		return -EINVAL;
+-
+-	mac = ether_addr_to_u64(entry->dmac);
++	u64 mac = ether_addr_to_u64(entry->dmac);
+ 
+ 	val[0] = FIELD_PREP(PPE_IN_NEXTHOP_TBL_TYPE, entry->port_valid ? 1 : 0);
+ 	if (entry->port_valid)
+@@ -74,9 +65,62 @@ int ppe_nexthop_entry_set(struct ppe_device *ppe_dev, u32 index,
+ 	val[2] = mac >> 16;
+ 
+ 	val[3] = be32_to_cpu(entry->dnat_ip);
++}
++
++/**
++ * ppe_nexthop_entry_decode() - Decode a PPE nexthop table entry.
++ * @val: Its words.
++ * @entry: Filled in; of @port and @vsi only the one @port_valid selects,
++ * the other 0.
++ */
++void ppe_nexthop_entry_decode(const u32 val[PPE_IN_NEXTHOP_TBL_WORDS],
++			      struct ppe_nexthop_entry *entry)
++{
++	u64 mac;
++
++	memset(entry, 0, sizeof(*entry));
++	entry->port_valid = FIELD_GET(PPE_IN_NEXTHOP_TBL_TYPE, val[0]);
++	if (entry->port_valid)
++		entry->port = FIELD_GET(PPE_IN_NEXTHOP_TBL_PORT, val[0]);
++	else
++		entry->vsi = FIELD_GET(PPE_IN_NEXTHOP_TBL_VSI, val[0]);
++	entry->post_l3_if = FIELD_GET(PPE_IN_NEXTHOP_TBL_POST_L3_IF, val[0]);
++	entry->ip_to_me = !!(val[0] & PPE_IN_NEXTHOP_TBL_IP_TO_ME);
++	entry->stag_fmt = !!(val[0] & PPE_IN_NEXTHOP_TBL_STAG_FMT);
++	entry->svid = FIELD_GET(PPE_IN_NEXTHOP_TBL_SVID, val[0]);
++	entry->ctag_fmt = !!(val[0] & PPE_IN_NEXTHOP_TBL_CTAG_FMT);
++
++	entry->cvid = FIELD_GET(PPE_IN_NEXTHOP_TBL_CVID, val[1]);
++	entry->pub_addr_index = FIELD_GET(PPE_IN_NEXTHOP_TBL_PUB_ADDR_INDEX, val[1]);
++
++	mac = (u64)val[2] << 16 | FIELD_GET(PPE_IN_NEXTHOP_TBL_MAC_ADDR_0, val[1]);
++	u64_to_ether_addr(mac, entry->dmac);
++
++	entry->dnat_ip = cpu_to_be32(val[3]);
++}
++
++/**
++ * ppe_nexthop_entry_set() - Write a PPE nexthop table entry.
++ * @ppe_dev: PPE device.
++ * @index: The entry index to write.
++ * @entry: The nexthop entry to write.
++ *
++ * Return: 0 on success, a negative error code on failure.
++ */
++int ppe_nexthop_entry_set(struct ppe_device *ppe_dev, u32 index,
++			  const struct ppe_nexthop_entry *entry)
++{
++	u32 base, val[PPE_IN_NEXTHOP_TBL_WORDS];
++	int ret;
++	int i;
++
++	if (index >= PPE_IN_NEXTHOP_TBL_ENTRIES)
++		return -EINVAL;
++
++	ppe_nexthop_entry_encode(entry, val);
+ 
+ 	base = PPE_IN_NEXTHOP_TBL_ADDR + index * PPE_IN_NEXTHOP_TBL_INC;
+-	for (i = 0; i < 4; i++) {
++	for (i = 0; i < PPE_IN_NEXTHOP_TBL_WORDS; i++) {
+ 		ret = regmap_write(ppe_dev->regmap, base + i * 4, val[i]);
+ 		if (ret)
+ 			return ret;
+@@ -96,8 +140,7 @@ int ppe_nexthop_entry_set(struct ppe_device *ppe_dev, u32 index,
+ int ppe_nexthop_entry_get(struct ppe_device *ppe_dev, u32 index,
+ 			   struct ppe_nexthop_entry *entry)
+ {
+-	u32 base, val[4];
+-	u64 mac;
++	u32 base, val[PPE_IN_NEXTHOP_TBL_WORDS];
+ 	int ret;
+ 	int i;
+ 
+@@ -105,30 +148,13 @@ int ppe_nexthop_entry_get(struct ppe_device *ppe_dev, u32 index,
+ 		return -EINVAL;
+ 
+ 	base = PPE_IN_NEXTHOP_TBL_ADDR + index * PPE_IN_NEXTHOP_TBL_INC;
+-	for (i = 0; i < 4; i++) {
++	for (i = 0; i < PPE_IN_NEXTHOP_TBL_WORDS; i++) {
+ 		ret = regmap_read(ppe_dev->regmap, base + i * 4, &val[i]);
+ 		if (ret)
+ 			return ret;
+ 	}
+ 
+-	entry->port_valid = FIELD_GET(PPE_IN_NEXTHOP_TBL_TYPE, val[0]);
+-	if (entry->port_valid)
+-		entry->port = FIELD_GET(PPE_IN_NEXTHOP_TBL_PORT, val[0]);
+-	else
+-		entry->vsi = FIELD_GET(PPE_IN_NEXTHOP_TBL_VSI, val[0]);
+-	entry->post_l3_if = FIELD_GET(PPE_IN_NEXTHOP_TBL_POST_L3_IF, val[0]);
+-	entry->ip_to_me = !!(val[0] & PPE_IN_NEXTHOP_TBL_IP_TO_ME);
+-	entry->stag_fmt = !!(val[0] & PPE_IN_NEXTHOP_TBL_STAG_FMT);
+-	entry->svid = FIELD_GET(PPE_IN_NEXTHOP_TBL_SVID, val[0]);
+-	entry->ctag_fmt = !!(val[0] & PPE_IN_NEXTHOP_TBL_CTAG_FMT);
+-
+-	entry->cvid = FIELD_GET(PPE_IN_NEXTHOP_TBL_CVID, val[1]);
+-	entry->pub_addr_index = FIELD_GET(PPE_IN_NEXTHOP_TBL_PUB_ADDR_INDEX, val[1]);
+-
+-	mac = (u64)val[2] << 16 | FIELD_GET(PPE_IN_NEXTHOP_TBL_MAC_ADDR_0, val[1]);
+-	u64_to_ether_addr(mac, entry->dmac);
+-
+-	entry->dnat_ip = cpu_to_be32(val[3]);
++	ppe_nexthop_entry_decode(val, entry);
+ 
+ 	return 0;
+ }
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop.h
+@@ -10,6 +10,7 @@
+ #include <linux/types.h>
+ 
+ #include "ppe.h"
++#include "ppe_regs.h"
+ 
+ /**
+  * struct ppe_nexthop_entry - PPE nexthop table entry.
+@@ -45,6 +46,10 @@ struct ppe_nexthop_entry {
+ 	__be32 dnat_ip;
+ };
+ 
++void ppe_nexthop_entry_encode(const struct ppe_nexthop_entry *entry,
++			      u32 val[PPE_IN_NEXTHOP_TBL_WORDS]);
++void ppe_nexthop_entry_decode(const u32 val[PPE_IN_NEXTHOP_TBL_WORDS],
++			      struct ppe_nexthop_entry *entry);
+ int ppe_nexthop_entry_set(struct ppe_device *ppe_dev, u32 index,
+ 			   const struct ppe_nexthop_entry *entry);
+ int ppe_nexthop_entry_get(struct ppe_device *ppe_dev, u32 index,
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop_pool.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop_pool.c
+@@ -6,6 +6,12 @@
+ /* Refcounted, deduplicating allocator on top of the nexthop table
+  * primitive (ppe_nexthop.c). See ppe_nexthop_pool.h for why this
+  * needs its own software dedup, unlike the host table pool.
++ *
++ * Index PPE_NEXTHOP_POOL_SINK is never handed out: a host table entry
++ * carries DST_INFO 0, and should hardware ever take that for a nexthop
++ * index on a frame no flow matched, it must reach the CPU rather than some
++ * flow's client. ppe_nexthop_pool_sink_set() programs it so (a zeroed entry
++ * would egress into VSI 0).
+  */
+ 
+ #include <linux/errno.h>
+@@ -36,9 +42,40 @@ static bool ppe_nexthop_entry_equal(const struct ppe_nexthop_entry *a,
+ 	       !memcmp(a->dmac, b->dmac, ETH_ALEN);
+ }
+ 
++/* The CPU sink: out through the CPU port, terminated locally. */
++static const struct ppe_nexthop_entry ppe_nexthop_sink = {
++	.port_valid = true,
++	.port = 0,
++	.ip_to_me = true,
++};
++
++/* Write @key at @index and read it back; on any failure zero the entry
++ * (best effort), which no flow uses yet.
++ *
++ * Return: 0, -EIO if it reads back otherwise, or the access error.
++ */
++static int ppe_nexthop_pool_write(struct ppe_device *ppe_dev, u32 index,
++				  const struct ppe_nexthop_entry *key)
++{
++	struct ppe_nexthop_entry back, zero = {};
++	int ret;
++
++	ret = ppe_nexthop_entry_set(ppe_dev, index, key);
++	if (!ret)
++		ret = ppe_nexthop_entry_get(ppe_dev, index, &back);
++	if (!ret && !ppe_nexthop_entry_equal(&back, key))
++		ret = -EIO;
++	if (ret)
++		ppe_nexthop_entry_set(ppe_dev, index, &zero);
++
++	return ret;
++}
++
+ /**
+  * ppe_nexthop_pool_init() - Initialize a nexthop table pool.
+  * @pool: The pool to initialize.
++ *
++ * Every index but PPE_NEXTHOP_POOL_SINK goes on the free list.
+  */
+ void ppe_nexthop_pool_init(struct ppe_nexthop_pool *pool)
+ {
+@@ -51,18 +88,44 @@ void ppe_nexthop_pool_init(struct ppe_nexthop_pool *pool)
+ 	for (i = 0; i < PPE_IN_NEXTHOP_TBL_ENTRIES; i++) {
+ 		pool->entry[i].index = i;
+ 		pool->entry[i].active = false;
+-		list_add_tail(&pool->entry[i].list, &pool->free);
++		if (i == PPE_NEXTHOP_POOL_SINK)
++			INIT_LIST_HEAD(&pool->entry[i].list);
++		else
++			list_add_tail(&pool->entry[i].list, &pool->free);
+ 	}
+ }
+ 
++/**
++ * ppe_nexthop_pool_sink_set() - Program the CPU sink entry.
++ * @ppe_dev: PPE device.
++ * @pool: The pool.
++ *
++ * Index PPE_NEXTHOP_POOL_SINK, which the pool never hands out, egresses to
++ * the CPU port with IP_TO_ME. Written and read back; nothing uses it as a
++ * flow's nexthop, so it may be written at any time.
++ *
++ * Return: 0, or a negative error code (the entry then zeroed if it was
++ * written).
++ */
++int ppe_nexthop_pool_sink_set(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool)
++{
++	int ret;
++
++	mutex_lock(&pool->lock);
++	ret = ppe_nexthop_pool_write(ppe_dev, PPE_NEXTHOP_POOL_SINK, &ppe_nexthop_sink);
++	mutex_unlock(&pool->lock);
++
++	return ret;
++}
++
+ /**
+  * ppe_nexthop_pool_destroy() - Tear down a nexthop table pool.
+  * @ppe_dev: PPE device.
+  * @pool: The pool to tear down.
+  *
+- * Clears every hardware entry the pool is still tracking. Callers are
+- * expected to have already stopped issuing get/deref calls against
+- * this pool.
++ * Clears every hardware entry the pool is still tracking, and the CPU
++ * sink. Callers are expected to have already stopped issuing get/deref
++ * calls against this pool.
+  */
+ void ppe_nexthop_pool_destroy(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool)
+ {
+@@ -71,6 +134,7 @@ void ppe_nexthop_pool_destroy(struct ppe_device *ppe_dev, struct ppe_nexthop_poo
+ 
+ 	list_for_each_entry_safe(e, tmp, &pool->active, list)
+ 		ppe_nexthop_entry_set(ppe_dev, e->index, &zero);
++	ppe_nexthop_entry_set(ppe_dev, PPE_NEXTHOP_POOL_SINK, &zero);
+ }
+ 
+ /**
+@@ -80,8 +144,11 @@ void ppe_nexthop_pool_destroy(struct ppe_device *ppe_dev, struct ppe_nexthop_poo
+  * @key: The nexthop entry to write, or match against an already-active one.
+  * @index: On success, the entry's hardware index (new or reused).
+  *
++ * A new entry is read back; one that fails to write or reads back
++ * otherwise is zeroed and stays free.
++ *
+  * Return: 0 on success, a negative error code on failure (-ENOSPC if
+- * the table is full).
++ * the table is full, -EIO if the entry did not read back as written).
+  */
+ int ppe_nexthop_pool_get_and_ref(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool,
+ 				  const struct ppe_nexthop_entry *key, u32 *index)
+@@ -106,7 +173,7 @@ int ppe_nexthop_pool_get_and_ref(struct ppe_device *ppe_dev, struct ppe_nexthop_
+ 		return -ENOSPC;
+ 	}
+ 
+-	ret = ppe_nexthop_entry_set(ppe_dev, e->index, key);
++	ret = ppe_nexthop_pool_write(ppe_dev, e->index, key);
+ 	if (ret) {
+ 		mutex_unlock(&pool->lock);
+ 		return ret;
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop_pool.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_nexthop_pool.h
+@@ -25,7 +25,8 @@ struct ppe_nexthop_pool_entry {
+ 
+ /**
+  * struct ppe_nexthop_pool - Deduplicating, refcounted nexthop table allocator.
+- * @entry: One entry per hardware index, threaded onto @free or @active.
++ * @entry: One entry per hardware index, threaded onto @free or @active
++ * (PPE_NEXTHOP_POOL_SINK onto neither).
+  * @free: Indices not currently programmed into hardware.
+  * @active: Indices currently programmed, each holding a copy of the
+  * entry it was programmed with in @entry[i].key, for matching future
+@@ -48,7 +49,11 @@ struct ppe_nexthop_pool {
+ 	struct mutex lock;
+ };
+ 
++/* The nexthop index the pool never hands out: the CPU sink. */
++#define PPE_NEXTHOP_POOL_SINK	0
++
+ void ppe_nexthop_pool_init(struct ppe_nexthop_pool *pool);
++int ppe_nexthop_pool_sink_set(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool);
+ void ppe_nexthop_pool_destroy(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool);
+ 
+ int ppe_nexthop_pool_get_and_ref(struct ppe_device *ppe_dev, struct ppe_nexthop_pool *pool,
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -5278,6 +5278,16 @@ static int ppe_offload_enable(struct ppe_offload_priv *priv)
+ 		goto unlock;
+ 	}
+ 
++	/* No flow uses it: written before anything else, and left in place
++	 * by disable (it only ever sends to the CPU).
++	 */
++	ret = ppe_nexthop_pool_sink_set(ppe_dev, &priv->nexthop_pool);
++	if (ret) {
++		pr_err("ppe_offload: not enabled: the CPU sink nexthop %u did not program: %d\n",
++		       PPE_NEXTHOP_POOL_SINK, ret);
++		goto unlock;
++	}
++
+ 	/* Every entry enabling may save: the TCP flag parser words, four
+ 	 * words per exception code, the PPPoE session and source MAC slots
+ 	 * (six and two entries each), profile E's two, and five per port.
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -1236,6 +1236,7 @@
+ #define PPE_IN_NEXTHOP_TBL_ADDR			0x260000
+ #define PPE_IN_NEXTHOP_TBL_ENTRIES		768
+ #define PPE_IN_NEXTHOP_TBL_INC			0x20
++#define PPE_IN_NEXTHOP_TBL_WORDS		4
+ 
+ /* Word 0. */
+ #define PPE_IN_NEXTHOP_TBL_TYPE			BIT(0)
+@@ -1292,6 +1293,12 @@
+ #define PPE_L3_VP_PORT_TBL_L3_IF_VALID		BIT(0)
+ #define PPE_L3_VP_PORT_TBL_L3_IF_INDEX		GENMASK(8, 1)
+ 
++/* Word 1: the port's VSI for L3 (vendor struct l3_vp_port_tbl, APPE: VSI 6
++ * bits). Only read: no port of this driver has one.
++ */
++#define PPE_L3_VP_PORT_TBL_VSI_VALID		BIT(9)
++#define PPE_L3_VP_PORT_TBL_VSI			GENMASK(15, 10)
++
+ /* Ingress L3 interface table: per-L3-interface MTU/MRU/route-enable
+  * config, referenced by a flow entry's SRC_L3_IF and consulted on
+  * ingress. Addressed directly, three words per entry on APPE (the
+@@ -1602,4 +1609,113 @@
+ #define PPE_VLAN_TPID_CTAG			GENMASK(15, 0)
+ #define PPE_VLAN_TPID_STAG			GENMASK(31, 16)
+ 
++/* The tunnel parser's copy of the per-port role (vendor TPR_PORT_PARSING,
++ * TUNNEL_PARSER_BASE_ADDR 0x1d0000 + 0x0 on APPE); only read.
++ */
++#define PPE_TPR_PORT_PARSING_ADDR		0x1d0000
++#define PPE_TPR_PORT_PARSING_ENTRIES		8
++#define PPE_TPR_PORT_PARSING_INC		4
++#define PPE_TPR_PORT_PARSING_PORT_ROLE		BIT(0)
++
++/* Ingress VLAN, global and per port (vendor BRIDGE_CONFIG, PORT_DEF_VID and
++ * PORT_VLAN_CONFIG at INGRESS_VLAN_BASE_ADDR 0xf000 + 0x0, + 0x10, + 0x50).
++ * BRIDGE_TYPE 0 parses an outer tag by its TPID (C mode); a port with no
++ * default VID, no tag filter and XLT_MISS_FWD_CMD 0 forwards a frame no XLT
++ * rule matches unchanged. Only read: this driver leaves them at reset.
++ */
++#define PPE_BRIDGE_CONFIG_ADDR			0xf000
++#define PPE_BRIDGE_CONFIG_BRIDGE_TYPE		BIT(0)
++#define PPE_PORT_DEF_VID_ADDR			0xf010
++#define PPE_PORT_DEF_VID_ENTRIES		8
++#define PPE_PORT_DEF_VID_INC			4
++#define PPE_PORT_VLAN_CONFIG_ADDR		0xf050
++#define PPE_PORT_VLAN_CONFIG_ENTRIES		8
++#define PPE_PORT_VLAN_CONFIG_INC		4
++#define PPE_PORT_VLAN_CONFIG_XLT_MISS_FWD_CMD	GENMASK(6, 5)
++
++/* Ingress VLAN translation: rules matched on a frame's tags as the parser
++ * classified them, each with its action at the same index (vendor
++ * XLT_RULE_TBL and XLT_ACTION_TBL, APPE layouts struct xlt_rule_tbl and
++ * struct xlt_action_tbl, at INGRESS_VLAN_BASE_ADDR 0xf000 + 0x2000 and
++ * + 0x4000). An entry latches when its last word is written. Fields not
++ * defined here (the PCP, DEI and frame type keys, VNI) are left 0.
++ */
++#define PPE_XLT_RULE_TBL_ADDR			0x11000
++#define PPE_XLT_RULE_TBL_ENTRIES		128
++#define PPE_XLT_RULE_TBL_INC			0x10
++#define PPE_XLT_RULE_TBL_WORDS			4
++
++/* Word 0. */
++#define PPE_XLT_RULE_W0_VALID			BIT(0)
++#define PPE_XLT_RULE_W0_PORT_BITMAP		GENMASK(8, 1)
++#define PPE_XLT_RULE_W0_SKEY_FMT		GENMASK(11, 9)
++#define PPE_XLT_RULE_W0_SKEY_VID_INCL		BIT(12)
++#define PPE_XLT_RULE_W0_SKEY_VID		GENMASK(24, 13)
++#define PPE_XLT_RULE_W0_CKEY_FMT_0		BIT(31)
++
++/* Word 1: the C key format's upper bits, the C-VID key and the EtherType
++ * key (PROT_VALUE's low 7 bits here, the upper 9 in word 2; vendor
++ * _insert_vlan_trans_adv_rule_action()).
++ */
++#define PPE_XLT_RULE_W1_CKEY_FMT_1		GENMASK(1, 0)
++#define PPE_XLT_RULE_W1_CKEY_VID_INCL		BIT(2)
++#define PPE_XLT_RULE_W1_CKEY_VID		GENMASK(14, 3)
++#define PPE_XLT_RULE_W1_PROT_INCL		BIT(24)
++#define PPE_XLT_RULE_W1_PROT_VALUE_0		GENMASK(31, 25)
++
++/* Word 2: PORT_TYPE 0, PORT_BITMAP holds physical ports (vendor
++ * adpt_port_type_convert()); 1 and 2 make it a VP profile or VP ID.
++ */
++#define PPE_XLT_RULE_W2_PROT_VALUE_1		GENMASK(8, 0)
++#define PPE_XLT_RULE_W2_PORT_TYPE		GENMASK(10, 9)
++
++/* Key formats, a bitmap (vendor FAL_PORT_VLAN_XLT_MATCH_*). */
++#define PPE_XLT_FMT_UNTAGGED			BIT(0)
++#define PPE_XLT_FMT_PRIORITY			BIT(1)
++#define PPE_XLT_FMT_TAGGED			BIT(2)
++
++#define PPE_XLT_ACTION_TBL_ADDR			0x13000
++#define PPE_XLT_ACTION_TBL_ENTRIES		128
++#define PPE_XLT_ACTION_TBL_INC			0x10
++#define PPE_XLT_ACTION_TBL_WORDS		3
++
++/* Word 1; word 0 holds the VID and PCP commands. */
++#define PPE_XLT_ACTION_W1_VSI_CMD		BIT(11)
++#define PPE_XLT_ACTION_W1_SRC_INFO_VALID	BIT(18)
++#define PPE_XLT_ACTION_W1_SRC_INFO_TYPE		BIT(19)
++#define PPE_XLT_ACTION_W1_SRC_INFO		GENMASK(27, 20)
++#define PPE_XLT_ACTION_W1_COUNTER_EN		BIT(28)
++#define PPE_XLT_ACTION_W1_COUNTER_ID_0		GENMASK(31, 29)
++
++/* Word 2: the counter ID's upper bits. */
++#define PPE_XLT_ACTION_W2_COUNTER_ID_1		GENMASK(3, 0)
++
++/* SRC_INFO_TYPE: SRC_INFO is an L3 interface (0: a virtual port). */
++#define PPE_XLT_SRC_INFO_TYPE_L3_IF		1
++
++/* The frames an XLT action counted, at its COUNTER_ID (vendor
++ * VLAN_DEV_CNT_TBL, INGRESS_POLICER_BASE_ADDR 0x100000 + 0x7f000): packets,
++ * then 40 bits of bytes.
++ */
++#define PPE_VLAN_DEV_CNT_TBL_ADDR		0x17f000
++#define PPE_VLAN_DEV_CNT_TBL_ENTRIES		128
++#define PPE_VLAN_DEV_CNT_TBL_INC		0x10
++#define PPE_VLAN_DEV_CNT_TBL_WORDS		3
++#define PPE_VLAN_DEV_CNT_W2_BYTE_HI		GENMASK(7, 0)
++
++/* Routed frames per L3 interface, ingress at its index and egress 256 above
++ * (vendor RT_INTERFACE_CNT_TBL, 0x100000 + 0x40000): packets, 40 bits of
++ * bytes, then 32 bits of dropped packets and 40 of dropped bytes spread over
++ * words 2 to 4.
++ */
++#define PPE_RT_INTERFACE_CNT_TBL_ADDR		0x140000
++#define PPE_RT_INTERFACE_CNT_TBL_ENTRIES	512
++#define PPE_RT_INTERFACE_CNT_TBL_INC		0x20
++#define PPE_RT_INTERFACE_CNT_TBL_WORDS		5
++#define PPE_RT_INTERFACE_CNT_W2_BYTE_HI		GENMASK(7, 0)
++#define PPE_RT_INTERFACE_CNT_W2_DROP_PKT_LO	GENMASK(31, 8)
++#define PPE_RT_INTERFACE_CNT_W3_DROP_PKT_HI	GENMASK(7, 0)
++#define PPE_RT_INTERFACE_CNT_W3_DROP_BYTE_LO	GENMASK(31, 8)
++#define PPE_RT_INTERFACE_CNT_W4_DROP_BYTE_HI	GENMASK(15, 0)
++
+ #endif
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_sr.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr.h
+@@ -59,6 +59,20 @@ enum ppe_sr_why {
+ 	PPE_SR_W_NUM
+ };
+ 
++/* The PPE's S-R state (WP2-DESIGN §4.3), kept in memory; the rtl8_4s state
++ * word's ppe byte follows it: OFF while OFF, ACTIVE while ACTIVE, FAULT
++ * while FAULT (unless the switch left READY), SR_READY otherwise.
++ */
++enum ppe_sr_state {
++	PPE_SR_S_OFF,
++	PPE_SR_S_ARMING,
++	PPE_SR_S_READY,
++	PPE_SR_S_ACTIVE,
++	PPE_SR_S_DISARMING,
++	PPE_SR_S_FAULT,
++	PPE_SR_S_NUM
++};
++
+ /* What made the S-R mode go back to off. */
+ enum ppe_sr_trigger {
+ 	PPE_SR_T_CONTROL,
+@@ -83,7 +97,8 @@ enum ppe_sr_fault {
+ 	PPE_SR_F_STUCK_FLOW,
+ 	PPE_SR_F_REVERT_MISMATCH,
+ 	PPE_SR_F_ROLLBACK_FAILED,
+-	PPE_SR_F_NOT_INERT_AT_BOOT
++	PPE_SR_F_NOT_INERT_AT_BOOT,
++	PPE_SR_F_NUM
+ };
+ 
+ /* @deadline: jiffies at which the S-R mode disarms by itself.
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_hw.c
+@@ -0,0 +1,413 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * S-R register encoders, see ppe_sr_hw.h. The XLT layouts are the vendor
++ * SDK's APPE struct xlt_rule_tbl and struct xlt_action_tbl
++ * (hppe_portvlan_reg.h); the static asserts below hold them against the
++ * words the PPE gate's probes counted and forwarded with on a GL-BE9300
++ * (P1b: rules R_A, R_B, R_D; P2.1: the L3 interface 32 action).
++ */
++#ifndef RTL8_4S_PURE
++#define RTL8_4S_PURE
++#endif
++#include <linux/bitfield.h>
++#include <linux/bits.h>
++#include <linux/build_bug.h>
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/dsa/rtl8_4s.h>
++
++#include "ppe_regs.h"
++#include "ppe_sr_hw.h"
++
++static_assert(PPE_SR_XLT_LAST < PPE_XLT_RULE_TBL_ENTRIES);
++static_assert(PPE_SR_XLT_LAST < PPE_VLAN_DEV_CNT_TBL_ENTRIES);
++static_assert(PPE_SR_XLT_LAST - PPE_SR_XLT_FIRST + 1 >= PPE_SR_ID_MAX);
++static_assert(PPE_SR_L3IF_LAST < PPE_IN_L3_IF_TBL_ENTRIES);
++static_assert(PPE_SR_L3IF_LAST - PPE_SR_L3IF_FIRST + 1 >= PPE_SR_ID_MAX);
++/* Every identity's L3 interface fits an XLT action's source information
++ * and a flow entry's SRC_L3_IF, and the U EtherType PROT_VALUE: an overflow
++ * fails FIELD_PREP_CONST() at build time.
++ */
++static_assert(FIELD_PREP_CONST(PPE_XLT_ACTION_W1_SRC_INFO, PPE_SR_L3IF_LAST));
++static_assert(FIELD_PREP_CONST(PPE_FLOW_TBL_SRC_L3_IF, PPE_SR_L3IF_LAST));
++static_assert(FIELD_PREP_CONST(PPE_XLT_RULE_W2_PROT_VALUE_1, PPE_SR_U_PROT >> 7));
++
++/* The CPU port fields, against the words read on the GL-BE9300 under E and
++ * written by bench profile S (P1b, P2.1).
++ */
++static_assert(((0x134 & ~PPE_SR_CPU_EG_MASK) | PPE_SR_CPU_EG_SR) == 0x11f);
++static_assert((0x134 & PPE_SR_CPU_EG_MASK) == PPE_SR_CPU_EG_E);
++static_assert(((0x11f & ~PPE_SR_CPU_EG_MASK) | PPE_SR_CPU_EG_E) == 0x134);
++static_assert(PPE_SR_PARSER_TPIDS == (FIELD_PREP_CONST(PPE_VLAN_TPID_STAG, 0x88a8) |
++				      FIELD_PREP_CONST(PPE_VLAN_TPID_CTAG, 0x8100)));
++static_assert((PPE_L3_VP_PORT_TBL_L3_IF_VALID |
++	       FIELD_PREP_CONST(PPE_L3_VP_PORT_TBL_L3_IF_INDEX, 1)) == 0x3);
++
++/* The rule fields that depend on neither the port, the S-VID nor the class:
++ * S-tagged with its VID keyed. P1b's R_A (PPE port 1, S-VID 3906, C
++ * untagged, no EtherType key), which counted lan2's frames, is that with
++ * the C format's low bit set; R_B (C 3901) and R_D (S 3907, C 1) are T
++ * rules.
++ */
++#define PPE_SR_RULE_W0	(PPE_XLT_RULE_W0_VALID |						\
++			 FIELD_PREP_CONST(PPE_XLT_RULE_W0_SKEY_FMT, PPE_XLT_FMT_TAGGED) |	\
++			 PPE_XLT_RULE_W0_SKEY_VID_INCL)
++static_assert((PPE_SR_RULE_W0 | FIELD_PREP_CONST(PPE_XLT_RULE_W0_PORT_BITMAP, BIT(1)) |
++	       FIELD_PREP_CONST(PPE_XLT_RULE_W0_SKEY_VID, 3906) |
++	       FIELD_PREP_CONST(PPE_XLT_RULE_W0_CKEY_FMT_0, PPE_XLT_FMT_UNTAGGED & 1)) ==
++	      0x81e85805);
++static_assert((FIELD_PREP_CONST(PPE_XLT_RULE_W1_CKEY_FMT_1, PPE_XLT_FMT_TAGGED >> 1) |
++	       PPE_XLT_RULE_W1_CKEY_VID_INCL | FIELD_PREP_CONST(PPE_XLT_RULE_W1_CKEY_VID, 3901)) ==
++	      0x79ee);
++static_assert((PPE_SR_RULE_W0 | FIELD_PREP_CONST(PPE_XLT_RULE_W0_PORT_BITMAP, BIT(1)) |
++	       FIELD_PREP_CONST(PPE_XLT_RULE_W0_SKEY_VID, 3907)) == 0x01e87805);
++
++/* The action: source information L3 interface 32, counter 5 (P2.1). */
++static_assert((PPE_XLT_ACTION_W1_SRC_INFO_VALID |
++	       FIELD_PREP_CONST(PPE_XLT_ACTION_W1_SRC_INFO_TYPE, PPE_XLT_SRC_INFO_TYPE_L3_IF) |
++	       FIELD_PREP_CONST(PPE_XLT_ACTION_W1_SRC_INFO, 32) | PPE_XLT_ACTION_W1_COUNTER_EN |
++	       FIELD_PREP_CONST(PPE_XLT_ACTION_W1_COUNTER_ID_0, 5)) == 0xb20c0000);
++
++/* What puts an ingress L3 interface to use: routing IPv4 or IPv6 unicast, a
++ * MAC_BITMAP that makes MY_MAC entries its own, PPPoE termination. With none
++ * of them an entry is inert, whatever its other fields hold (the GL-BE9300
++ * boots with MRU and MTU 1500 and TTL_EXCEED_CMD 1 in each unused entry).
++ */
++#define PPE_SR_L3IF_USE_W0	(PPE_IN_L3_IF_TBL_IPV4_UC_ROUTE_EN |			\
++				 PPE_IN_L3_IF_TBL_IPV6_UC_ROUTE_EN)
++#define PPE_SR_L3IF_USE_W1	(PPE_IN_L3_IF_TBL_MAC_BITMAP | PPE_IN_L3_IF_TBL_PPPOE_EN)
++/* What an identity's copy of the conduit's interface leaves out: IPv6
++ * routing, PPPoE termination, the DMAC check bypass and the VPN.
++ */
++#define PPE_SR_L3IF_CLR_W0	PPE_IN_L3_IF_TBL_IPV6_UC_ROUTE_EN
++#define PPE_SR_L3IF_CLR_W1	(PPE_IN_L3_IF_TBL_PPPOE_EN | PPE_IN_L3_IF_TBL_DMAC_CHECK_DIS |	\
++				 PPE_IN_L3_IF_TBL_VPN_ID)
++
++/* Against the live words: an unused entry and the conduit's (L3 interface
++ * 1, PPE port 1) and the PPPoE session's.
++ */
++static_assert(!(0x017705dc & PPE_SR_L3IF_USE_W0) && !(0x17700001 & PPE_SR_L3IF_USE_W1));
++static_assert((0x217905e4 & PPE_SR_L3IF_USE_W0) && (0x1790000b & PPE_SR_L3IF_USE_W1));
++static_assert(0x17700813 & PPE_SR_L3IF_USE_W1);
++
++/**
++ * ppe_sr_xlt_key_of() - The XLT key of a class.
++ * @cls: The class.
++ * @ppe_port: The conduit's PPE port.
++ * @k: Filled in.
++ */
++void ppe_sr_xlt_key_of(const struct ppe_sr_class *cls, u8 ppe_port, struct ppe_sr_xlt_key *k)
++{
++	k->ppe_port = ppe_port;
++	k->svid = rtl8_4s_svid_up(cls->port);
++	k->form = cls->form;
++	k->cvid = cls->form == PPE_SR_T ? cls->vid : 0;
++	k->prot = cls->form == PPE_SR_U;
++}
++
++/**
++ * ppe_sr_xlt_rule_enc() - Encode an identity's XLT rule.
++ * @k: What it matches.
++ * @w: Its words.
++ *
++ * Only the exact keys S-R uses are encoded: S-tagged with an upload S-VID,
++ * and either C-untagged with the EtherType key (U) or C-tagged with a C-VID
++ * that a class may have (T). Every field not named is 0: no PCP, DEI or
++ * frame type key, PORT_TYPE 0 (a bitmap of physical ports).
++ *
++ * Return: 0, or -EINVAL for any other key (@w then untouched).
++ */
++int ppe_sr_xlt_rule_enc(const struct ppe_sr_xlt_key *k, u32 w[PPE_XLT_RULE_TBL_WORDS])
++{
++	u8 cfmt;
++
++	if (k->ppe_port >= PPE_PORT_PARSING_ENTRIES || rtl8_4s_up_port(k->svid) < 0)
++		return -EINVAL;
++	switch (k->form) {
++	case PPE_SR_U:
++		if (!k->prot || k->cvid)
++			return -EINVAL;
++		cfmt = PPE_XLT_FMT_UNTAGGED;
++		break;
++	case PPE_SR_T:
++		if (k->prot || !k->cvid || k->cvid >= 4095 || rtl8_4s_vid_reserved(k->cvid))
++			return -EINVAL;
++		cfmt = PPE_XLT_FMT_TAGGED;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	w[0] = PPE_SR_RULE_W0 | FIELD_PREP(PPE_XLT_RULE_W0_PORT_BITMAP, BIT(k->ppe_port)) |
++	       FIELD_PREP(PPE_XLT_RULE_W0_SKEY_VID, k->svid) |
++	       FIELD_PREP(PPE_XLT_RULE_W0_CKEY_FMT_0, cfmt & 1);
++	w[1] = FIELD_PREP(PPE_XLT_RULE_W1_CKEY_FMT_1, cfmt >> 1);
++	w[2] = 0;
++	w[3] = 0;
++	if (k->form == PPE_SR_T) {
++		w[1] |= PPE_XLT_RULE_W1_CKEY_VID_INCL |
++			FIELD_PREP(PPE_XLT_RULE_W1_CKEY_VID, k->cvid);
++	} else {
++		w[1] |= PPE_XLT_RULE_W1_PROT_INCL |
++			FIELD_PREP(PPE_XLT_RULE_W1_PROT_VALUE_0, PPE_SR_U_PROT & 0x7f);
++		w[2] |= FIELD_PREP(PPE_XLT_RULE_W2_PROT_VALUE_1, PPE_SR_U_PROT >> 7);
++	}
++
++	return 0;
++}
++
++/**
++ * ppe_sr_xlt_rule_dec() - Decode an XLT rule.
++ * @w: Its words.
++ * @k: Filled in from the fields S-R uses: the lowest port of the bitmap
++ * (0xff for none), the S-VID and C-VID keys (0 when not keyed), @form
++ * PPE_SR_U for a C-untagged key, PPE_SR_T for a C-tagged one, else 0xff, and
++ * @prot whether an EtherType is keyed.
++ * @exact: Set when the rule is exactly one S-R encodes: ppe_sr_xlt_rule_enc()
++ * of @k gives @w, every word and bit.
++ *
++ * Return: 0 for a valid rule, -ENOENT for one whose VALID bit is clear
++ * (@k then undefined, @exact false).
++ */
++int ppe_sr_xlt_rule_dec(const u32 w[PPE_XLT_RULE_TBL_WORDS], struct ppe_sr_xlt_key *k,
++			bool *exact)
++{
++	u32 re[PPE_XLT_RULE_TBL_WORDS];
++	unsigned int bitmap, i;
++	u8 cfmt;
++
++	*exact = false;
++	if (!(w[0] & PPE_XLT_RULE_W0_VALID))
++		return -ENOENT;
++
++	bitmap = FIELD_GET(PPE_XLT_RULE_W0_PORT_BITMAP, w[0]);
++	k->ppe_port = 0xff;
++	for (i = 0; i < PPE_PORT_PARSING_ENTRIES; i++) {
++		if (bitmap & BIT(i)) {
++			k->ppe_port = i;
++			break;
++		}
++	}
++	k->svid = 0;
++	if (w[0] & PPE_XLT_RULE_W0_SKEY_VID_INCL)
++		k->svid = FIELD_GET(PPE_XLT_RULE_W0_SKEY_VID, w[0]);
++	cfmt = FIELD_GET(PPE_XLT_RULE_W0_CKEY_FMT_0, w[0]) |
++	       FIELD_GET(PPE_XLT_RULE_W1_CKEY_FMT_1, w[1]) << 1;
++	if (cfmt == PPE_XLT_FMT_UNTAGGED)
++		k->form = PPE_SR_U;
++	else if (cfmt == PPE_XLT_FMT_TAGGED)
++		k->form = PPE_SR_T;
++	else
++		k->form = 0xff;
++	k->cvid = 0;
++	if (w[1] & PPE_XLT_RULE_W1_CKEY_VID_INCL)
++		k->cvid = FIELD_GET(PPE_XLT_RULE_W1_CKEY_VID, w[1]);
++	k->prot = !!(w[1] & PPE_XLT_RULE_W1_PROT_INCL);
++
++	*exact = !ppe_sr_xlt_rule_enc(k, re) && !memcmp(re, w, sizeof(re));
++
++	return 0;
++}
++
++/**
++ * ppe_sr_xlt_rule_on_port() - Whether an XLT rule may match a PPE port's
++ * frames.
++ * @w: Its words.
++ * @ppe_port: The port.
++ *
++ * Return: true for a valid rule whose port bitmap names @ppe_port, and for
++ * a valid rule whose PORT_TYPE makes the bitmap a VP profile or a VP ID
++ * (which ports those name is not known here).
++ */
++bool ppe_sr_xlt_rule_on_port(const u32 w[PPE_XLT_RULE_TBL_WORDS], u8 ppe_port)
++{
++	if (!(w[0] & PPE_XLT_RULE_W0_VALID))
++		return false;
++
++	return FIELD_GET(PPE_XLT_RULE_W2_PORT_TYPE, w[2]) ||
++	       (ppe_port < PPE_PORT_PARSING_ENTRIES &&
++		(FIELD_GET(PPE_XLT_RULE_W0_PORT_BITMAP, w[0]) & BIT(ppe_port)));
++}
++
++/**
++ * ppe_sr_xlt_act_enc() - Encode an identity's XLT action.
++ * @l3_if: The ingress L3 interface it gives the frame (source information
++ * of type L3 interface).
++ * @counter: The VLAN_DEV_CNT entry it counts the frame in.
++ * @w: Its words: no VID, PCP, DEI or VSI command, so the frame's tags stay
++ * as they are.
++ *
++ * Return: 0, or -EINVAL for a counter past the table (@w then untouched).
++ */
++int ppe_sr_xlt_act_enc(u8 l3_if, u8 counter, u32 w[PPE_XLT_ACTION_TBL_WORDS])
++{
++	if (counter >= PPE_VLAN_DEV_CNT_TBL_ENTRIES)
++		return -EINVAL;
++
++	w[0] = 0;
++	w[1] = PPE_XLT_ACTION_W1_SRC_INFO_VALID |
++	       FIELD_PREP(PPE_XLT_ACTION_W1_SRC_INFO_TYPE, PPE_XLT_SRC_INFO_TYPE_L3_IF) |
++	       FIELD_PREP(PPE_XLT_ACTION_W1_SRC_INFO, l3_if) | PPE_XLT_ACTION_W1_COUNTER_EN |
++	       FIELD_PREP(PPE_XLT_ACTION_W1_COUNTER_ID_0, counter & 7);
++	w[2] = FIELD_PREP(PPE_XLT_ACTION_W2_COUNTER_ID_1, counter >> 3);
++
++	return 0;
++}
++
++/**
++ * ppe_sr_xlt_act_counter() - The counter an XLT action counts in.
++ * @w: Its words.
++ *
++ * Return: the VLAN_DEV_CNT index, or -ENOENT if the action counts nothing.
++ */
++int ppe_sr_xlt_act_counter(const u32 w[PPE_XLT_ACTION_TBL_WORDS])
++{
++	if (!(w[1] & PPE_XLT_ACTION_W1_COUNTER_EN))
++		return -ENOENT;
++
++	return FIELD_GET(PPE_XLT_ACTION_W2_COUNTER_ID_1, w[2]) << 3 |
++	       FIELD_GET(PPE_XLT_ACTION_W1_COUNTER_ID_0, w[1]);
++}
++
++/**
++ * ppe_sr_l3if_inert() - Whether an ingress L3 interface is out of use.
++ * @w: Its words.
++ *
++ * Return: true when it routes neither IPv4 nor IPv6, selects no MY_MAC entry
++ * and terminates no PPPoE, whatever else it holds.
++ */
++bool ppe_sr_l3if_inert(const u32 w[PPE_IN_L3_IF_TBL_WORDS])
++{
++	return !(w[0] & PPE_SR_L3IF_USE_W0) && !(w[1] & PPE_SR_L3IF_USE_W1);
++}
++
++/**
++ * ppe_sr_l3if_copy() - An identity's ingress L3 interface.
++ * @tmpl: The conduit's ingress L3 interface.
++ * @copy: Set to @tmpl without IPv6 routing, PPPoE termination, the DMAC
++ * check bypass and the VPN; MRU and MTU are the conduit's, so that a frame
++ * too large for the conduit goes to the CPU.
++ *
++ * Return: 0, or -EINVAL if the copy would not route IPv4 to the conduit's
++ * MAC address (no IPv4 routing or an empty MAC_BITMAP in @tmpl).
++ */
++int ppe_sr_l3if_copy(const u32 tmpl[PPE_IN_L3_IF_TBL_WORDS], u32 copy[PPE_IN_L3_IF_TBL_WORDS])
++{
++	if (!(tmpl[0] & PPE_IN_L3_IF_TBL_IPV4_UC_ROUTE_EN) ||
++	    !FIELD_GET(PPE_IN_L3_IF_TBL_MAC_BITMAP, tmpl[1]))
++		return -EINVAL;
++
++	copy[0] = tmpl[0] & ~PPE_SR_L3IF_CLR_W0;
++	copy[1] = tmpl[1] & ~PPE_SR_L3IF_CLR_W1;
++	copy[2] = tmpl[2];
++
++	return 0;
++}
++
++/**
++ * ppe_sr_stpid() - The egress TPID register with E's or S-R's S-TPID.
++ * @val: The register.
++ * @sr: S-R's (0x88a8) rather than E's (0x8899).
++ *
++ * Return: @val with its S-TPID field set, the C-TPID as it is.
++ */
++u32 ppe_sr_stpid(u32 val, bool sr)
++{
++	return (val & ~PPE_SR_STPID_MASK) |
++	       FIELD_PREP(PPE_SR_STPID_MASK, sr ? PPE_SR_STPID_SR : PPE_SR_STPID_E);
++}
++
++/**
++ * ppe_sr_cpu_eg() - The CPU port's egress VLAN register under E or S-R.
++ * @val: The register.
++ * @sr: S-R's fields rather than E's.
++ *
++ * Return: @val with the PPE_SR_CPU_EG_MASK fields set, TX counting and PCP
++ * and DEI propagation as they are.
++ */
++u32 ppe_sr_cpu_eg(u32 val, bool sr)
++{
++	return (val & ~PPE_SR_CPU_EG_MASK) | (sr ? PPE_SR_CPU_EG_SR : PPE_SR_CPU_EG_E);
++}
++
++/**
++ * ppe_sr_conduit_eg_ok() - Whether the conduit's egress VLAN register is as
++ * profile E sets it: S-type, no PCP or DEI propagation (0x135 on the
++ * GL-BE9300). S-R does not change it.
++ * @val: The register.
++ *
++ * Return: true if so.
++ */
++bool ppe_sr_conduit_eg_ok(u32 val)
++{
++	return (val & PPE_PORT_EG_VLAN_TBL_VLAN_TYPE) &&
++	       !(val & (PPE_PORT_EG_VLAN_TBL_PCP_PROP_CMD | PPE_PORT_EG_VLAN_TBL_DEI_PROP_CMD));
++}
++
++/**
++ * ppe_sr_ctype_eg_ok() - Whether another port's egress VLAN register is
++ * C-type, so that its tags do not follow the S-TPID S-R moves.
++ * @val: The register.
++ *
++ * Return: true if so.
++ */
++bool ppe_sr_ctype_eg_ok(u32 val)
++{
++	return !(val & PPE_PORT_EG_VLAN_TBL_VLAN_TYPE);
++}
++
++/**
++ * ppe_sr_bind() - An L3_VP_PORT_TBL word 0 with a binding.
++ * @w0: The word.
++ * @l3_if: The L3 interface it binds to.
++ * @valid: Whether the binding is valid.
++ *
++ * Return: @w0 with its PPE_SR_BIND_MASK fields set, the source guard fields
++ * as they are.
++ */
++u32 ppe_sr_bind(u32 w0, u8 l3_if, bool valid)
++{
++	return (w0 & ~PPE_SR_BIND_MASK) | FIELD_PREP(PPE_L3_VP_PORT_TBL_L3_IF_INDEX, l3_if) |
++	       (valid ? PPE_L3_VP_PORT_TBL_L3_IF_VALID : 0);
++}
++
++/**
++ * ppe_sr_role() - A PORT_PARSING register with a parser role.
++ * @val: The register.
++ * @core: Core (S-R) rather than edge.
++ *
++ * Return: @val with its role set, the other bits as they are.
++ */
++u32 ppe_sr_role(u32 val, bool core)
++{
++	return core ? val | PPE_PORT_PARSING_PORT_ROLE : val & ~PPE_PORT_PARSING_PORT_ROLE;
++}
++
++/**
++ * ppe_sr_vlan_cnt_dec() - Decode a VLAN_DEV_CNT entry (an XLT counter).
++ * @w: Its words.
++ * @c: Filled in; no drop counts.
++ */
++void ppe_sr_vlan_cnt_dec(const u32 w[PPE_VLAN_DEV_CNT_TBL_WORDS], struct ppe_sr_cnt *c)
++{
++	c->packets = w[0];
++	c->bytes = (u64)FIELD_GET(PPE_VLAN_DEV_CNT_W2_BYTE_HI, w[2]) << 32 | w[1];
++	c->drop_packets = 0;
++	c->drop_bytes = 0;
++}
++
++/**
++ * ppe_sr_rt_cnt_dec() - Decode an RT_INTERFACE_CNT entry.
++ * @w: Its words.
++ * @c: Filled in.
++ */
++void ppe_sr_rt_cnt_dec(const u32 w[PPE_RT_INTERFACE_CNT_TBL_WORDS], struct ppe_sr_cnt *c)
++{
++	c->packets = w[0];
++	c->bytes = (u64)FIELD_GET(PPE_RT_INTERFACE_CNT_W2_BYTE_HI, w[2]) << 32 | w[1];
++	c->drop_packets = (u64)FIELD_GET(PPE_RT_INTERFACE_CNT_W3_DROP_PKT_HI, w[3]) << 24 |
++			  FIELD_GET(PPE_RT_INTERFACE_CNT_W2_DROP_PKT_LO, w[2]);
++	c->drop_bytes = (u64)FIELD_GET(PPE_RT_INTERFACE_CNT_W4_DROP_BYTE_HI, w[4]) << 24 |
++			FIELD_GET(PPE_RT_INTERFACE_CNT_W3_DROP_BYTE_LO, w[3]);
++}
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_hw.h
+@@ -0,0 +1,131 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * S-R register encoders (WP2-DESIGN §3.2, §3.3, §4.4): an identity's XLT
++ * rule and action, the inert test and the copy of an ingress L3 interface,
++ * the fields S-R moves (egress S-TPID, the CPU port's egress tag modes, the
++ * conduit's L3 binding and parser role) and the counters an identity has.
++ * Pure: no kernel call, so that a desk harness compiles ppe_sr_hw.c in user
++ * space.
++ *
++ * An identity is one XLT entry x (0..63) on the conduit's PPE port and one
++ * ingress L3 interface n (32..255). The rule matches the switch's S-tag of
++ * the class's port (3900 + p, rtl8_4s) and, for T(p, v), C-VID v, or, for
++ * U(p), no C-tag and EtherType 0x0800: a nested 802.1ad tag must not take
++ * U(p)'s identity. The action gives the frame L3 interface n and counts it
++ * at counter x; nothing else of the frame changes.
++ */
++
++#ifndef __PPE_SR_HW_H__
++#define __PPE_SR_HW_H__
++
++#include <linux/types.h>
++
++#include "ppe_regs.h"
++#include "ppe_sr_topo.h"
++
++/* XLT entries (and counters) identities take, lowest first. */
++#define PPE_SR_XLT_FIRST	0
++#define PPE_SR_XLT_LAST		63
++/* Ingress L3 interfaces identities take: past the ports' own (1..7), the
++ * PPPoE sessions' (16..19) and the source MAC ones (24..27).
++ */
++#define PPE_SR_L3IF_FIRST	32
++#define PPE_SR_L3IF_LAST	255
++
++/* The EtherType a U(p) rule keys on. */
++#define PPE_SR_U_PROT		0x0800
++
++/* Egress TPIDs (PPE_EG_VLAN_TPID_ADDR): the S-TPID profile E inserts (the
++ * rtl8_4 head tag's EtherType), the one S-R inserts, and the C-TPID both
++ * keep.
++ */
++#define PPE_SR_STPID_E		0x8899
++#define PPE_SR_STPID_SR		0x88a8
++#define PPE_SR_CTPID		0x8100
++#define PPE_SR_STPID_MASK	PPE_EG_VLAN_TPID_STPID
++
++/* The parser TPIDs S-R needs and never moves, IPR and TPR: S 0x88a8, C
++ * 0x8100 (their reset values).
++ */
++#define PPE_SR_PARSER_TPIDS	0x88a88100
++
++/* The CPU port's egress fields: under E C-type, both tags UNMODIFIED, VSI
++ * tag mode on (0x134 with TX counting); under S-R S-type, both tags
++ * UNTOUCHED, VSI tag mode off (0x11f), so that a frame flooded to the CPU
++ * keeps the switch's S-tag.
++ */
++#define PPE_SR_CPU_PORT		0
++#define PPE_SR_CPU_EG_MASK	(PPE_PORT_EG_VLAN_TBL_VLAN_TYPE |			\
++				 PPE_PORT_EG_VLAN_TBL_CTAG_MODE |			\
++				 PPE_PORT_EG_VLAN_TBL_STAG_MODE |			\
++				 PPE_PORT_EG_VLAN_TBL_VSI_TAG_MODE_EN)
++#define PPE_SR_CPU_EG_E		(FIELD_PREP_CONST(PPE_PORT_EG_VLAN_TBL_CTAG_MODE,	\
++						  PPE_EG_VLAN_TAG_MODE_UNMODIFIED) |	\
++				 FIELD_PREP_CONST(PPE_PORT_EG_VLAN_TBL_STAG_MODE,	\
++						  PPE_EG_VLAN_TAG_MODE_UNMODIFIED) |	\
++				 PPE_PORT_EG_VLAN_TBL_VSI_TAG_MODE_EN)
++#define PPE_SR_CPU_EG_SR	(PPE_PORT_EG_VLAN_TBL_VLAN_TYPE |			\
++				 FIELD_PREP_CONST(PPE_PORT_EG_VLAN_TBL_CTAG_MODE,	\
++						  PPE_EG_VLAN_TAG_MODE_UNTOUCHED) |	\
++				 FIELD_PREP_CONST(PPE_PORT_EG_VLAN_TBL_STAG_MODE,	\
++						  PPE_EG_VLAN_TAG_MODE_UNTOUCHED))
++
++/* The conduit's binding to its L3 interface (L3_VP_PORT_TBL word 0): S-R
++ * clears the valid bit and keeps the index, as the vendor's
++ * ppe_drv_port_l3_if_detach() does, so that its frames get an L3 interface
++ * from XLT rules only.
++ */
++#define PPE_SR_BIND_MASK	(PPE_L3_VP_PORT_TBL_L3_IF_VALID | PPE_L3_VP_PORT_TBL_L3_IF_INDEX)
++
++/**
++ * struct ppe_sr_xlt_key - What an identity's XLT rule matches.
++ * @ppe_port: The conduit's PPE port (0..7), the rule's one port.
++ * @svid: The switch's upload S-VID of the class's port, 3900..3909.
++ * @form: enum ppe_sr_form: PPE_SR_U, no C-tag; PPE_SR_T, C-tagged.
++ * @cvid: The C-VID of a T rule; 0 for a U rule.
++ * @prot: The rule keys on EtherType PPE_SR_U_PROT: every U rule, no T rule.
++ */
++struct ppe_sr_xlt_key {
++	u8 ppe_port;
++	u16 svid;
++	u8 form;
++	u16 cvid;
++	bool prot;
++};
++
++/**
++ * struct ppe_sr_cnt - A counter entry, decoded.
++ * @packets: Frames counted.
++ * @bytes: Their bytes (40 bits).
++ * @drop_packets: Frames dropped (L3 interface counters only).
++ * @drop_bytes: Their bytes.
++ */
++struct ppe_sr_cnt {
++	u64 packets;
++	u64 bytes;
++	u64 drop_packets;
++	u64 drop_bytes;
++};
++
++void ppe_sr_xlt_key_of(const struct ppe_sr_class *cls, u8 ppe_port, struct ppe_sr_xlt_key *k);
++int ppe_sr_xlt_rule_enc(const struct ppe_sr_xlt_key *k, u32 w[PPE_XLT_RULE_TBL_WORDS]);
++int ppe_sr_xlt_rule_dec(const u32 w[PPE_XLT_RULE_TBL_WORDS], struct ppe_sr_xlt_key *k,
++			bool *exact);
++bool ppe_sr_xlt_rule_on_port(const u32 w[PPE_XLT_RULE_TBL_WORDS], u8 ppe_port);
++int ppe_sr_xlt_act_enc(u8 l3_if, u8 counter, u32 w[PPE_XLT_ACTION_TBL_WORDS]);
++int ppe_sr_xlt_act_counter(const u32 w[PPE_XLT_ACTION_TBL_WORDS]);
++
++bool ppe_sr_l3if_inert(const u32 w[PPE_IN_L3_IF_TBL_WORDS]);
++int ppe_sr_l3if_copy(const u32 tmpl[PPE_IN_L3_IF_TBL_WORDS], u32 copy[PPE_IN_L3_IF_TBL_WORDS]);
++
++u32 ppe_sr_stpid(u32 val, bool sr);
++u32 ppe_sr_cpu_eg(u32 val, bool sr);
++bool ppe_sr_conduit_eg_ok(u32 val);
++bool ppe_sr_ctype_eg_ok(u32 val);
++u32 ppe_sr_bind(u32 w0, u8 l3_if, bool valid);
++u32 ppe_sr_role(u32 val, bool core);
++
++void ppe_sr_vlan_cnt_dec(const u32 w[PPE_VLAN_DEV_CNT_TBL_WORDS], struct ppe_sr_cnt *c);
++void ppe_sr_rt_cnt_dec(const u32 w[PPE_RT_INTERFACE_CNT_TBL_WORDS], struct ppe_sr_cnt *c);
++
++#endif /* __PPE_SR_HW_H__ */
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_seq.c
+@@ -0,0 +1,1792 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * S-R register sequences, see ppe_sr_seq.h. The write helpers are bench
++ * profile S's (0443: s_write, s_field_set, s_entry_set), re-implemented on
++ * struct ppe_sr_io; the restore order keeps the conduit's parser role edge
++ * whenever the CPU port is not S-R's (0x11f): the role is set last and put
++ * back first, and nothing else is put back unless it read back edge.
++ *
++ * Arm (WP2-DESIGN §4.4), under RTNL and the lock:
++ *   A3  read-only prechecks (S1) and the identities' entries;
++ *   A4  claim the switch (READY, OFF) -> (READY, SR_READY); ARMING;
++ *   A5  drop every flow;
++ *   A6  egress S-TPID 0x8899 -> 0x88a8;
++ *   A7  CPU port egress fields 0x134 -> 0x11f;
++ *   A8  each identity: L3 interface copy, counter zero, action, rule last;
++ *   A9  the conduit's L3 binding invalid (index kept);
++ *   A10 the conduit's parser role core, last;
++ *   A11 verify (S3); READY.
++ * A failure from A6 on rolls back with the disarm's D3-D8 over what was
++ * recorded; a failed rollback is FAULT.
++ *
++ * Disarm (§4.6), under the lock: D1 offers off, DISARMING; D2 drop every
++ * flow; D3 role edge (a failure stops here); D4 the CPU port back; D5 the
++ * binding valid; D6 each identity's rule, action and counter; D7 its L3
++ * interface back; D8 the S-TPID back; D9 release, OFF. Any failure from D2
++ * on is FAULT: the claim stays, nothing more is written until reboot.
++ */
++#ifndef RTL8_4S_PURE
++#define RTL8_4S_PURE
++#endif
++#include <linux/array_size.h>
++#include <linux/bitfield.h>
++#include <linux/bits.h>
++#include <linux/build_bug.h>
++#include <linux/compiler.h>
++#include <linux/errno.h>
++#include <linux/stdarg.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/dsa/rtl8_4s.h>
++
++#include "ppe_regs.h"
++#include "ppe_sr.h"
++#include "ppe_sr_hw.h"
++#include "ppe_sr_seq.h"
++#include "ppe_sr_topo.h"
++
++/* The longest entry written or compared whole. */
++#define PPE_SR_WORDS_MAX	4
++
++static_assert(PPE_XLT_RULE_TBL_WORDS <= PPE_SR_WORDS_MAX);
++static_assert(PPE_XLT_ACTION_TBL_WORDS <= PPE_SR_WORDS_MAX);
++static_assert(PPE_VLAN_DEV_CNT_TBL_WORDS <= PPE_SR_WORDS_MAX);
++static_assert(PPE_IN_L3_IF_TBL_WORDS <= PPE_SR_WORDS_MAX);
++static_assert(PPE_L3_VP_PORT_TBL_WORDS <= PPE_SR_WORDS_MAX);
++static_assert(PPE_SR_ID_MAX <= 64);	/* u64 slot masks */
++static_assert(PPE_SR_XLT_LAST < 64);	/* u64 XLT masks */
++static_assert(PPE_SR_ID_MAX <= 255);	/* u8 slots */
++static_assert(PPE_SR_PORTS <= 16);	/* u16 port masks */
++
++static const char * const ppe_sr_state_names[PPE_SR_S_NUM] = {
++	[PPE_SR_S_OFF] = "off",
++	[PPE_SR_S_ARMING] = "arming",
++	[PPE_SR_S_READY] = "ready",
++	[PPE_SR_S_ACTIVE] = "active",
++	[PPE_SR_S_DISARMING] = "disarming",
++	[PPE_SR_S_FAULT] = "FAULT",
++};
++
++static const char * const ppe_sr_fault_names[PPE_SR_F_NUM] = {
++	[PPE_SR_F_NONE] = "none",
++	[PPE_SR_F_STUCK_FLOW] = "stuck_flow",
++	[PPE_SR_F_REVERT_MISMATCH] = "revert_mismatch",
++	[PPE_SR_F_ROLLBACK_FAILED] = "rollback_failed",
++	[PPE_SR_F_NOT_INERT_AT_BOOT] = "not_inert_at_boot",
++};
++
++static const char * const ppe_sr_step_names[PPE_SR_STEP_NUM] = {
++	[PPE_SR_STEP_NONE] = "none",
++	[PPE_SR_STEP_A3] = "A3",
++	[PPE_SR_STEP_A4] = "A4",
++	[PPE_SR_STEP_A5] = "A5",
++	[PPE_SR_STEP_A6] = "A6",
++	[PPE_SR_STEP_A7] = "A7",
++	[PPE_SR_STEP_A8] = "A8",
++	[PPE_SR_STEP_A9] = "A9",
++	[PPE_SR_STEP_A10] = "A10",
++	[PPE_SR_STEP_A11] = "A11",
++	[PPE_SR_STEP_OFFERS_ON] = "offers_on",
++	[PPE_SR_STEP_OFFERS_OFF] = "offers_off",
++	[PPE_SR_STEP_D1] = "D1",
++	[PPE_SR_STEP_D2] = "D2",
++	[PPE_SR_STEP_D3] = "D3",
++	[PPE_SR_STEP_D4] = "D4",
++	[PPE_SR_STEP_D5] = "D5",
++	[PPE_SR_STEP_D6] = "D6",
++	[PPE_SR_STEP_D7] = "D7",
++	[PPE_SR_STEP_D8] = "D8",
++	[PPE_SR_STEP_FLUSH_ID] = "flush_id",
++	[PPE_SR_STEP_REMOVE] = "remove",
++	[PPE_SR_STEP_RECOPY] = "recopy",
++	[PPE_SR_STEP_ADD] = "add",
++	[PPE_SR_STEP_FLUSH_PORT] = "flush_port",
++	[PPE_SR_STEP_HOOK] = "hook",
++};
++
++/**
++ * ppe_sr_state_name() - Name of an S-R state.
++ * @state: enum ppe_sr_state.
++ *
++ * Return: its name, "?" if out of range.
++ */
++const char *ppe_sr_state_name(unsigned int state)
++{
++	return state < PPE_SR_S_NUM ? ppe_sr_state_names[state] : "?";
++}
++
++/**
++ * ppe_sr_fault_name() - Name of a FAULT reason.
++ * @fault: enum ppe_sr_fault.
++ *
++ * Return: its name, "?" if out of range.
++ */
++const char *ppe_sr_fault_name(unsigned int fault)
++{
++	return fault < PPE_SR_F_NUM ? ppe_sr_fault_names[fault] : "?";
++}
++
++/**
++ * ppe_sr_step_name() - Name of a sequence step.
++ * @step: enum ppe_sr_step.
++ *
++ * Return: its name, "?" if out of range.
++ */
++const char *ppe_sr_step_name(unsigned int step)
++{
++	return step < PPE_SR_STEP_NUM ? ppe_sr_step_names[step] : "?";
++}
++
++static u32 sr_rule_addr(unsigned int x)
++{
++	return PPE_XLT_RULE_TBL_ADDR + x * PPE_XLT_RULE_TBL_INC;
++}
++
++static u32 sr_act_addr(unsigned int x)
++{
++	return PPE_XLT_ACTION_TBL_ADDR + x * PPE_XLT_ACTION_TBL_INC;
++}
++
++static u32 sr_cnt_addr(unsigned int x)
++{
++	return PPE_VLAN_DEV_CNT_TBL_ADDR + x * PPE_VLAN_DEV_CNT_TBL_INC;
++}
++
++static u32 sr_l3if_addr(unsigned int n)
++{
++	return PPE_IN_L3_IF_TBL_ADDR + n * PPE_IN_L3_IF_TBL_INC;
++}
++
++static u32 sr_rt_cnt_addr(unsigned int i)
++{
++	return PPE_RT_INTERFACE_CNT_TBL_ADDR + i * PPE_RT_INTERFACE_CNT_TBL_INC;
++}
++
++static u32 sr_bind_addr(unsigned int port)
++{
++	return PPE_L3_VP_PORT_TBL_ADDR + port * PPE_L3_VP_PORT_TBL_INC;
++}
++
++static u32 sr_role_addr(unsigned int port)
++{
++	return PPE_PORT_PARSING_ADDR + port * PPE_PORT_PARSING_INC;
++}
++
++static u32 sr_tpr_role_addr(unsigned int port)
++{
++	return PPE_TPR_PORT_PARSING_ADDR + port * PPE_TPR_PORT_PARSING_INC;
++}
++
++static u32 sr_eg_vlan_addr(unsigned int port)
++{
++	return PPE_PORT_EG_VLAN_TBL_ADDR + port * PPE_PORT_EG_VLAN_TBL_INC;
++}
++
++static u32 sr_my_mac_addr(unsigned int i)
++{
++	return PPE_MY_MAC_TBL_ADDR + i * PPE_MY_MAC_TBL_INC;
++}
++
++/* The rtl8_4s ppe byte that goes with a PPE state. */
++static u8 sr_td_ppe(u8 state)
++{
++	switch (state) {
++	case PPE_SR_S_OFF:
++		return RTL8_4S_PPE_OFF;
++	case PPE_SR_S_ACTIVE:
++		return RTL8_4S_PPE_ACTIVE;
++	case PPE_SR_S_FAULT:
++		return RTL8_4S_PPE_FAULT;
++	default:
++		return RTL8_4S_PPE_SR_READY;
++	}
++}
++
++static __printf(3, 4) void sr_log(const struct ppe_sr_io *io, int level, const char *fmt, ...)
++{
++	va_list ap;
++
++	va_start(ap, fmt);
++	io->log(io->ctx, level, fmt, ap);
++	va_end(ap);
++}
++
++static void sr_set_state(struct ppe_sr_seq *seq, const struct ppe_sr_io *io, u8 to)
++{
++	u8 from = seq->state;
++
++	WRITE_ONCE(seq->state, to);
++	io->state(io->ctx, from, to);
++}
++
++static int sr_rd(const struct ppe_sr_io *io, u32 addr, u32 *val, unsigned int words)
++{
++	int ret = io->rd(io->ctx, addr, val, words);
++
++	if (ret)
++		sr_log(io, PPE_SR_LOG_ERR, "read %#x failed (%d)", addr, ret);
++
++	return ret;
++}
++
++/* Write @words words at @addr and read them back. */
++static int sr_write(const struct ppe_sr_io *io, u32 addr, const u32 *val, unsigned int words)
++{
++	u32 back[PPE_SR_WORDS_MAX];
++	unsigned int i;
++	int ret;
++
++	ret = io->wr(io->ctx, addr, val, words);
++	if (ret) {
++		sr_log(io, PPE_SR_LOG_ERR, "write %#x failed (%d)", addr, ret);
++		return ret;
++	}
++	ret = sr_rd(io, addr, back, words);
++	if (ret)
++		return ret;
++	for (i = 0; i < words; i++) {
++		if (back[i] != val[i]) {
++			sr_log(io, PPE_SR_LOG_ERR, "write %#x: word %u reads back %08x, not %08x",
++			       addr, i, back[i], val[i]);
++			return -EIO;
++		}
++	}
++
++	return 0;
++}
++
++/* Set the @mask bits of the first of the @words words at @addr to @to if
++ * they hold @from, every other bit as it is, writing every word (the last
++ * one last) and reading them back.
++ *
++ * Return: 0 if set or holding @to already, -EBUSY if they hold neither
++ * (nothing written), another negative error code if an access or the read
++ * back failed.
++ */
++static int sr_field_set(const struct ppe_sr_io *io, u32 addr, unsigned int words, u32 mask,
++			u32 from, u32 to)
++{
++	u32 val[PPE_SR_WORDS_MAX];
++	int ret;
++
++	ret = sr_rd(io, addr, val, words);
++	if (ret)
++		return ret;
++	if ((val[0] & mask) == (to & mask))
++		return 0;
++	if ((val[0] & mask) != (from & mask)) {
++		sr_log(io, PPE_SR_LOG_ERR, "%#x holds %08x: neither %08x nor %08x under %08x",
++		       addr, val[0], from & mask, to & mask, mask);
++		return -EBUSY;
++	}
++	val[0] = (val[0] & ~mask) | (to & mask);
++
++	return sr_write(io, addr, val, words);
++}
++
++/* Put the @words words at @addr back to @pre, the words read before S-R
++ * moved the @mask bits of the first to @from: only if those bits still hold
++ * @from, and then whole, so that whatever else S-R's own write may have
++ * changed goes back too (nothing but S-R writes these while it is armed).
++ *
++ * Return: 0 if put back or holding @pre already, -EBUSY if the field holds
++ * something else (nothing written), another negative error code if an
++ * access or the read back failed.
++ */
++static int sr_field_restore(const struct ppe_sr_io *io, u32 addr, unsigned int words, u32 mask,
++			    u32 from, const u32 *pre)
++{
++	u32 val[PPE_SR_WORDS_MAX];
++	int ret;
++
++	ret = sr_rd(io, addr, val, words);
++	if (ret)
++		return ret;
++	if (!memcmp(val, pre, words * sizeof(*val)))
++		return 0;
++	if ((val[0] & mask) != (from & mask)) {
++		sr_log(io, PPE_SR_LOG_ERR, "%#x holds %08x: not S-R's %08x under %08x", addr,
++		       val[0], from & mask, mask);
++		return -EBUSY;
++	}
++
++	return sr_write(io, addr, pre, words);
++}
++
++/* Set the @words words at @addr to @to if they hold @from, as
++ * sr_field_set() does for a field.
++ */
++static int sr_entry_set(const struct ppe_sr_io *io, u32 addr, unsigned int words,
++			const u32 *from, const u32 *to)
++{
++	u32 val[PPE_SR_WORDS_MAX];
++	int ret;
++
++	ret = sr_rd(io, addr, val, words);
++	if (ret)
++		return ret;
++	if (!memcmp(val, to, words * sizeof(*val)))
++		return 0;
++	if (memcmp(val, from, words * sizeof(*val))) {
++		sr_log(io, PPE_SR_LOG_ERR, "%#x holds %08x %08x ...: neither S-R's nor the old",
++		       addr, val[0], val[1]);
++		return -EBUSY;
++	}
++
++	return sr_write(io, addr, to, words);
++}
++
++static bool sr_bit(const u64 *map, unsigned int i)
++{
++	return map[i / 64] & BIT_ULL(i % 64);
++}
++
++static void sr_bit_set(u64 *map, unsigned int i, bool on)
++{
++	if (on)
++		map[i / 64] |= BIT_ULL(i % 64);
++	else
++		map[i / 64] &= ~BIT_ULL(i % 64);
++}
++
++static void sr_mac_words(const u8 *mac, u32 *lo, u32 *hi)
++{
++	*lo = (u32)mac[2] << 24 | (u32)mac[3] << 16 | (u32)mac[4] << 8 | mac[5];
++	*hi = (u32)mac[0] << 8 | mac[1];
++}
++
++/* Whether a plan is sorted, without duplicates, and every class one the
++ * resolver can make.
++ */
++static bool sr_plan_ok(const struct ppe_sr_class *plan, unsigned int n)
++{
++	unsigned int i;
++
++	for (i = 0; i < n; i++) {
++		const struct ppe_sr_class *c = &plan[i];
++
++		if (c->port >= PPE_SR_PORTS || (c->form != PPE_SR_U && c->form != PPE_SR_T) ||
++		    !c->vid || c->vid >= 4095 || rtl8_4s_vid_reserved(c->vid))
++			return false;
++		if (i && ppe_sr_class_cmp(&plan[i - 1], c) >= 0)
++			return false;
++	}
++
++	return true;
++}
++
++static bool sr_plan_has(const struct ppe_sr_class *plan, unsigned int n,
++			const struct ppe_sr_class *cls)
++{
++	unsigned int i;
++
++	for (i = 0; i < n; i++)
++		if (ppe_sr_class_eq(&plan[i], cls))
++			return true;
++
++	return false;
++}
++
++/* Whether one of the slots in @mask of @ids holds @cls. */
++static bool sr_ids_have(const struct ppe_sr_id *ids, u64 mask, const struct ppe_sr_class *cls)
++{
++	unsigned int s;
++
++	for (s = 0; s < PPE_SR_ID_MAX; s++)
++		if ((mask & BIT_ULL(s)) && ppe_sr_class_eq(&ids[s].cls, cls))
++			return true;
++
++	return false;
++}
++
++/* A refusal of a precheck, said: nothing written. */
++static __printf(4, 5) int sr_refuse_one(struct ppe_sr_seq *seq, const struct ppe_sr_io *io,
++					int err, const char *fmt, ...)
++{
++	va_list ap;
++
++	seq->err = err;
++	va_start(ap, fmt);
++	io->log(io->ctx, PPE_SR_LOG_WARN, fmt, ap);
++	va_end(ap);
++
++	return err;
++}
++
++#define sr_refuse(seq, io, err, fmt, ...) \
++	sr_refuse_one(seq, io, err, "precheck: " fmt, ##__VA_ARGS__)
++
++/**
++ * ppe_sr_seq_precheck() - The arm's read-only prechecks (A3, S1).
++ * @seq: The sequence state; @seq->cfg set, nothing recorded.
++ * @io: Register access.
++ *
++ * Checks that the registers S-R relies on and moves are as E leaves them,
++ * records the values the disarm puts back, the conduit's L3 interface (the
++ * identities' template), the XLT entries that are not S-R's to take and the
++ * inert L3 interfaces. No valid XLT rule may match the conduit's frames.
++ * The L3 route control and the PPPoE sessions are the caller's (memory).
++ *
++ * Return: 0, -EINVAL for a configuration S-R cannot take, -EBUSY for a
++ * register not as expected, or a read error.
++ */
++int ppe_sr_seq_precheck(struct ppe_sr_seq *seq, const struct ppe_sr_io *io)
++{
++	const struct ppe_sr_cfg *cfg = &seq->cfg;
++	u32 port = cfg->ppe_port, v, lo, hi, w[PPE_SR_WORDS_MAX];
++	u32 act[PPE_XLT_ACTION_TBL_WORDS];
++	unsigned int i, q;
++	int ret, cnt;
++
++	seq->step = PPE_SR_STEP_A3;
++	if (!port || port >= PPE_PORT_PARSING_ENTRIES || !cfg->l3_if ||
++	    cfg->l3_if > PPE_MY_MAC_TBL_ENTRIES || cfg->l3_if >= PPE_SR_L3IF_FIRST ||
++	    (cfg->ctype_ports & (BIT(port) | BIT(PPE_SR_CPU_PORT))))
++		return sr_refuse(seq, io, -EINVAL,
++				 "conduit PPE port %u, L3 interface %u, C-type ports %#x",
++				 port, cfg->l3_if, cfg->ctype_ports);
++
++	ret = sr_rd(io, PPE_IPR_VLAN_TPID_ADDR, &v, 1);
++	if (ret)
++		return ret;
++	if (v != PPE_SR_PARSER_TPIDS)
++		return sr_refuse(seq, io, -EBUSY, "parser TPIDs %08x", v);
++	ret = sr_rd(io, PPE_TPR_VLAN_TPID_ADDR, &v, 1);
++	if (ret)
++		return ret;
++	if (v != PPE_SR_PARSER_TPIDS)
++		return sr_refuse(seq, io, -EBUSY, "tunnel parser TPIDs %08x", v);
++	ret = sr_rd(io, PPE_BRIDGE_CONFIG_ADDR, &v, 1);
++	if (ret)
++		return ret;
++	if (v & PPE_BRIDGE_CONFIG_BRIDGE_TYPE)
++		return sr_refuse(seq, io, -EBUSY, "ingress bridge type S (%08x)", v);
++
++	ret = sr_rd(io, PPE_EG_VLAN_TPID_ADDR, &v, 1);
++	if (ret)
++		return ret;
++	if (FIELD_GET(PPE_EG_VLAN_TPID_CTPID, v) != PPE_SR_CTPID ||
++	    FIELD_GET(PPE_EG_VLAN_TPID_STPID, v) != PPE_SR_STPID_E)
++		return sr_refuse(seq, io, -EBUSY, "egress TPIDs %08x", v);
++	seq->stpid_pre = v;
++
++	ret = sr_rd(io, sr_eg_vlan_addr(PPE_SR_CPU_PORT), &v, 1);
++	if (ret)
++		return ret;
++	if ((v & PPE_SR_CPU_EG_MASK) != PPE_SR_CPU_EG_E)
++		return sr_refuse(seq, io, -EBUSY, "CPU port egress VLAN %08x", v);
++	seq->cpu_pre = v;
++	ret = sr_rd(io, sr_eg_vlan_addr(port), &v, 1);
++	if (ret)
++		return ret;
++	if (!ppe_sr_conduit_eg_ok(v))
++		return sr_refuse(seq, io, -EBUSY, "PPE port %u egress VLAN %08x is not E's", port,
++				 v);
++	for (q = 1; q < PPE_PORT_EG_VLAN_TBL_ENTRIES; q++) {
++		if (!(cfg->ctype_ports & BIT(q)))
++			continue;
++		ret = sr_rd(io, sr_eg_vlan_addr(q), &v, 1);
++		if (ret)
++			return ret;
++		if (!ppe_sr_ctype_eg_ok(v))
++			return sr_refuse(seq, io, -EBUSY, "PPE port %u egress VLAN %08x is S-type",
++					 q, v);
++	}
++
++	ret = sr_rd(io, sr_role_addr(port), &v, 1);
++	if (ret)
++		return ret;
++	if (v & PPE_PORT_PARSING_PORT_ROLE)
++		return sr_refuse(seq, io, -EBUSY, "PPE port %u parser role core (%08x)", port, v);
++	seq->role_pre = v;
++	ret = sr_rd(io, sr_tpr_role_addr(port), &v, 1);
++	if (ret)
++		return ret;
++	if (v & PPE_TPR_PORT_PARSING_PORT_ROLE)
++		return sr_refuse(seq, io, -EBUSY, "PPE port %u tunnel parser role core", port);
++	ret = sr_rd(io, PPE_PORT_VLAN_CONFIG_ADDR + port * PPE_PORT_VLAN_CONFIG_INC, &v, 1);
++	if (ret)
++		return ret;
++	if (v)
++		return sr_refuse(seq, io, -EBUSY, "PPE port %u VLAN config %08x", port, v);
++	ret = sr_rd(io, PPE_PORT_DEF_VID_ADDR + port * PPE_PORT_DEF_VID_INC, &v, 1);
++	if (ret)
++		return ret;
++	if (v)
++		return sr_refuse(seq, io, -EBUSY, "PPE port %u default VID %08x", port, v);
++
++	ret = sr_rd(io, sr_bind_addr(port), w, PPE_L3_VP_PORT_TBL_WORDS);
++	if (ret)
++		return ret;
++	if ((w[0] & PPE_SR_BIND_MASK) != ppe_sr_bind(0, cfg->l3_if, true) ||
++	    (w[1] & PPE_L3_VP_PORT_TBL_VSI_VALID))
++		return sr_refuse(seq, io, -EBUSY,
++				 "PPE port %u L3 binding %08x %08x is not to L3 interface %u alone",
++				 port, w[0], w[1], cfg->l3_if);
++	memcpy(seq->bind_pre, w, sizeof(seq->bind_pre));
++
++	ret = sr_rd(io, sr_my_mac_addr(cfg->l3_if - 1), w, PPE_MY_MAC_TBL_WORDS);
++	if (ret)
++		return ret;
++	sr_mac_words(cfg->mac, &lo, &hi);
++	if (!(w[1] & PPE_MY_MAC_TBL_VALID) || w[0] != lo ||
++	    FIELD_GET(PPE_MY_MAC_TBL_MAC_DA_1, w[1]) != hi)
++		return sr_refuse(seq, io, -EBUSY, "MY_MAC %u is not the conduit's address",
++				 cfg->l3_if - 1);
++	ret = sr_rd(io, sr_l3if_addr(cfg->l3_if), seq->tmpl, PPE_IN_L3_IF_TBL_WORDS);
++	if (ret)
++		return ret;
++	if (!(FIELD_GET(PPE_IN_L3_IF_TBL_MAC_BITMAP, seq->tmpl[1]) & BIT(cfg->l3_if - 1)) ||
++	    ppe_sr_l3if_copy(seq->tmpl, w))
++		return sr_refuse(seq, io, -EBUSY,
++				 "L3 interface %u (%08x %08x %08x) does not route the conduit's address",
++				 cfg->l3_if, seq->tmpl[0], seq->tmpl[1], seq->tmpl[2]);
++
++	/* XLT: no rule for the conduit's frames but S-R's, and S-R's entries
++	 * only where rule and action hold nothing and no counter is shared.
++	 */
++	seq->xlt_busy = 0;
++	for (i = 0; i < PPE_XLT_RULE_TBL_ENTRIES; i++) {
++		bool valid;
++
++		ret = sr_rd(io, sr_rule_addr(i), w, PPE_XLT_RULE_TBL_WORDS);
++		if (ret)
++			return ret;
++		valid = w[0] & PPE_XLT_RULE_W0_VALID;
++		if (ppe_sr_xlt_rule_on_port(w, port))
++			return sr_refuse(seq, io, -EBUSY, "XLT rule %u may match PPE port %u", i,
++					 port);
++		if (!valid && i > PPE_SR_XLT_LAST)
++			continue;
++		if (i <= PPE_SR_XLT_LAST && (w[0] | w[1] | w[2] | w[3]))
++			seq->xlt_busy |= BIT_ULL(i);
++		ret = sr_rd(io, sr_act_addr(i), act, PPE_XLT_ACTION_TBL_WORDS);
++		if (ret)
++			return ret;
++		if (i <= PPE_SR_XLT_LAST && (act[0] | act[1] | act[2]))
++			seq->xlt_busy |= BIT_ULL(i);
++		cnt = ppe_sr_xlt_act_counter(act);
++		if (valid && cnt >= 0 && cnt <= PPE_SR_XLT_LAST)
++			seq->xlt_busy |= BIT_ULL(cnt);
++	}
++
++	memset(seq->l3if_inert, 0, sizeof(seq->l3if_inert));
++	for (i = PPE_SR_L3IF_FIRST; i <= PPE_SR_L3IF_LAST; i++) {
++		ret = sr_rd(io, sr_l3if_addr(i), w, PPE_IN_L3_IF_TBL_WORDS);
++		if (ret)
++			return ret;
++		sr_bit_set(seq->l3if_inert, i, ppe_sr_l3if_inert(w));
++	}
++
++	return 0;
++}
++
++/* Take an XLT entry and an L3 interface for @cls into free slot @slot: the
++ * lowest XLT entry not busy and not S-R's, the lowest L3 interface found
++ * inert and not S-R's that still reads inert (read: its words are what the
++ * removal puts back).
++ */
++static int sr_alloc_one(struct ppe_sr_seq *seq, const struct ppe_sr_io *io, unsigned int slot,
++			const struct ppe_sr_class *cls, const u32 *tmpl)
++{
++	u64 own_l3[PPE_IN_L3_IF_TBL_ENTRIES / 64] = {};
++	struct ppe_sr_id *id = &seq->id[slot];
++	u32 w[PPE_IN_L3_IF_TBL_WORDS];
++	unsigned int s, x, n;
++	u64 own = 0;
++	int ret;
++
++	if (id->used)
++		return -EINVAL;
++	for (s = 0; s < PPE_SR_ID_MAX; s++) {
++		if (!seq->id[s].used)
++			continue;
++		own |= BIT_ULL(seq->id[s].xlt);
++		sr_bit_set(own_l3, seq->id[s].l3_if, true);
++	}
++
++	for (x = PPE_SR_XLT_FIRST; x <= PPE_SR_XLT_LAST; x++)
++		if (!((seq->xlt_busy | own) & BIT_ULL(x)))
++			break;
++	if (x > PPE_SR_XLT_LAST)
++		return -ENOSPC;
++
++	for (n = PPE_SR_L3IF_FIRST; n <= PPE_SR_L3IF_LAST; n++) {
++		if (!sr_bit(seq->l3if_inert, n) || sr_bit(own_l3, n))
++			continue;
++		ret = sr_rd(io, sr_l3if_addr(n), w, PPE_IN_L3_IF_TBL_WORDS);
++		if (ret)
++			return ret;
++		if (ppe_sr_l3if_inert(w))
++			break;
++		sr_log(io, PPE_SR_LOG_INFO, "L3 interface %u no longer inert", n);
++		sr_bit_set(seq->l3if_inert, n, false);
++	}
++	if (n > PPE_SR_L3IF_LAST)
++		return -ENOSPC;
++
++	memset(id, 0, sizeof(*id));
++	ret = ppe_sr_l3if_copy(tmpl, id->l3if_new);
++	if (ret)
++		return ret;
++	memcpy(id->l3if_old, w, sizeof(id->l3if_old));
++	id->cls = *cls;
++	id->xlt = x;
++	id->l3_if = n;
++	id->used = 1;
++	seq->nid++;
++
++	return 0;
++}
++
++static void sr_ids_clear(struct ppe_sr_seq *seq)
++{
++	memset(seq->id, 0, sizeof(seq->id));
++	seq->nid = 0;
++}
++
++/**
++ * ppe_sr_seq_alloc() - Take every class's identity (A3).
++ * @seq: The sequence state, after ppe_sr_seq_precheck(), no identity yet.
++ * @io: Register access (reads the L3 interfaces taken).
++ * @plan: The classes, sorted; slot i gets @plan[i], with XLT entries
++ * ascending.
++ * @n: Their number.
++ *
++ * Return: 0, -ENOSPC if they do not all fit, -EINVAL, or a read error;
++ * nothing is taken then.
++ */
++int ppe_sr_seq_alloc(struct ppe_sr_seq *seq, const struct ppe_sr_io *io,
++		     const struct ppe_sr_class *plan, unsigned int n)
++{
++	unsigned int i;
++	int ret;
++
++	seq->step = PPE_SR_STEP_A3;
++	if (seq->nid || n > PPE_SR_ID_MAX)
++		return -EINVAL;
++	for (i = 0; i < n; i++) {
++		ret = sr_alloc_one(seq, io, i, &plan[i], seq->tmpl);
++		if (ret) {
++			sr_ids_clear(seq);
++			seq->err = ret;
++			sr_log(io, PPE_SR_LOG_WARN, "precheck: no identity for class %u of %u (%d)",
++			       i + 1, n, ret);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++/* One install step of identity @id (enum ppe_sr_op_code). */
++static int sr_id_install(struct ppe_sr_seq *seq, const struct ppe_sr_io *io, struct ppe_sr_id *id,
++			 u8 code)
++{
++	static const u32 zero[PPE_SR_WORDS_MAX];
++	struct ppe_sr_xlt_key k;
++	u32 w[PPE_SR_WORDS_MAX];
++	int ret;
++
++	switch (code) {
++	case PPE_SR_OP_L3IF_COPY:
++		id->set |= PPE_SR_ID_L3IF;
++		return sr_entry_set(io, sr_l3if_addr(id->l3_if), PPE_IN_L3_IF_TBL_WORDS,
++				    id->l3if_old, id->l3if_new);
++	case PPE_SR_OP_CNT_ZERO:
++		id->set |= PPE_SR_ID_CNT;
++		return sr_write(io, sr_cnt_addr(id->xlt), zero, PPE_VLAN_DEV_CNT_TBL_WORDS);
++	case PPE_SR_OP_ACT_ON:
++		ret = ppe_sr_xlt_act_enc(id->l3_if, id->xlt, w);
++		if (ret)
++			return ret;
++		id->set |= PPE_SR_ID_ACT;
++		return sr_entry_set(io, sr_act_addr(id->xlt), PPE_XLT_ACTION_TBL_WORDS, zero, w);
++	case PPE_SR_OP_RULE_ON:
++		ppe_sr_xlt_key_of(&id->cls, seq->cfg.ppe_port, &k);
++		ret = ppe_sr_xlt_rule_enc(&k, w);
++		if (ret)
++			return ret;
++		id->set |= PPE_SR_ID_RULE;
++		return sr_entry_set(io, sr_rule_addr(id->xlt), PPE_XLT_RULE_TBL_WORDS, zero, w);
++	default:
++		return -EINVAL;
++	}
++}
++
++/* One removal step of identity @id (enum ppe_sr_op_code): each entry only
++ * from S-R's own words. The counter is a statistic: a failure to clear it
++ * is said and ignored.
++ */
++static int sr_id_remove(struct ppe_sr_seq *seq, const struct ppe_sr_io *io, struct ppe_sr_id *id,
++			u8 code)
++{
++	static const u32 zero[PPE_SR_WORDS_MAX];
++	struct ppe_sr_xlt_key k;
++	u32 w[PPE_SR_WORDS_MAX], back[PPE_SR_WORDS_MAX];
++	u32 addr;
++	int ret;
++
++	switch (code) {
++	case PPE_SR_OP_RULE_OFF:
++		if (!(id->set & PPE_SR_ID_RULE))
++			return 0;
++		ppe_sr_xlt_key_of(&id->cls, seq->cfg.ppe_port, &k);
++		ret = ppe_sr_xlt_rule_enc(&k, w);
++		if (!ret)
++			ret = sr_entry_set(io, sr_rule_addr(id->xlt), PPE_XLT_RULE_TBL_WORDS, w,
++					   zero);
++		if (!ret)
++			id->set &= ~PPE_SR_ID_RULE;
++		return ret;
++	case PPE_SR_OP_ACT_OFF:
++		if (!(id->set & PPE_SR_ID_ACT))
++			return 0;
++		ret = ppe_sr_xlt_act_enc(id->l3_if, id->xlt, w);
++		if (!ret)
++			ret = sr_entry_set(io, sr_act_addr(id->xlt), PPE_XLT_ACTION_TBL_WORDS, w,
++					   zero);
++		if (!ret)
++			id->set &= ~PPE_SR_ID_ACT;
++		return ret;
++	case PPE_SR_OP_CNT_OFF:
++		if (!(id->set & PPE_SR_ID_CNT))
++			return 0;
++		addr = sr_cnt_addr(id->xlt);
++		ret = io->wr(io->ctx, addr, zero, PPE_VLAN_DEV_CNT_TBL_WORDS);
++		if (!ret)
++			ret = io->rd(io->ctx, addr, back, PPE_VLAN_DEV_CNT_TBL_WORDS);
++		if (ret || memcmp(back, zero, PPE_VLAN_DEV_CNT_TBL_WORDS * sizeof(*back)))
++			sr_log(io, PPE_SR_LOG_INFO, "XLT counter %u not cleared (%d)", id->xlt,
++			       ret);
++		id->set &= ~PPE_SR_ID_CNT;
++		return 0;
++	case PPE_SR_OP_L3IF_RESTORE:
++		if (!(id->set & PPE_SR_ID_L3IF))
++			return 0;
++		ret = sr_entry_set(io, sr_l3if_addr(id->l3_if), PPE_IN_L3_IF_TBL_WORDS,
++				   id->l3if_new, id->l3if_old);
++		if (!ret)
++			id->set &= ~PPE_SR_ID_L3IF;
++		return ret;
++	default:
++		return -EINVAL;
++	}
++}
++
++static const u8 sr_install_ops[] = {
++	PPE_SR_OP_L3IF_COPY, PPE_SR_OP_CNT_ZERO, PPE_SR_OP_ACT_ON, PPE_SR_OP_RULE_ON,
++};
++
++static const u8 sr_remove_ops[] = {
++	PPE_SR_OP_RULE_OFF, PPE_SR_OP_ACT_OFF, PPE_SR_OP_CNT_OFF, PPE_SR_OP_L3IF_RESTORE,
++};
++
++/* Take identity @id's entries back after its own install failed: rule,
++ * action, counter, L3 interface, each only where S-R's words still are.
++ */
++static int sr_id_takeback(struct ppe_sr_seq *seq, const struct ppe_sr_io *io,
++			  struct ppe_sr_id *id)
++{
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < ARRAY_SIZE(sr_remove_ops); i++) {
++		ret = sr_id_remove(seq, io, id, sr_remove_ops[i]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * ppe_sr_seq_apply() - The arm's writes (A6-A10).
++ * @seq: The sequence state, prechecked and allocated (ARMING).
++ * @io: Register access.
++ *
++ * Each step marks its record before it writes, so that
++ * ppe_sr_seq_revert() takes back whatever may have changed.
++ *
++ * Return: 0, or the first error (the rest not attempted).
++ */
++int ppe_sr_seq_apply(struct ppe_sr_seq *seq, const struct ppe_sr_io *io)
++{
++	const u8 port = seq->cfg.ppe_port;
++	unsigned int s, i;
++	int ret;
++
++	seq->step = PPE_SR_STEP_A6;
++	seq->rec |= PPE_SR_REC_STPID;
++	ret = sr_field_set(io, PPE_EG_VLAN_TPID_ADDR, 1, PPE_SR_STPID_MASK, ppe_sr_stpid(0, false),
++			   ppe_sr_stpid(0, true));
++	if (ret)
++		return ret;
++
++	seq->step = PPE_SR_STEP_A7;
++	seq->rec |= PPE_SR_REC_CPU;
++	ret = sr_field_set(io, sr_eg_vlan_addr(PPE_SR_CPU_PORT), 1, PPE_SR_CPU_EG_MASK,
++			   PPE_SR_CPU_EG_E, PPE_SR_CPU_EG_SR);
++	if (ret)
++		return ret;
++
++	/* Slots were filled in plan order with XLT entries ascending. */
++	seq->step = PPE_SR_STEP_A8;
++	for (s = 0; s < PPE_SR_ID_MAX; s++) {
++		if (!seq->id[s].used)
++			continue;
++		for (i = 0; i < ARRAY_SIZE(sr_install_ops); i++) {
++			ret = sr_id_install(seq, io, &seq->id[s], sr_install_ops[i]);
++			if (ret)
++				return ret;
++		}
++	}
++
++	seq->step = PPE_SR_STEP_A9;
++	seq->rec |= PPE_SR_REC_BIND;
++	ret = sr_field_set(io, sr_bind_addr(port), PPE_L3_VP_PORT_TBL_WORDS, PPE_SR_BIND_MASK,
++			   ppe_sr_bind(0, seq->cfg.l3_if, true),
++			   ppe_sr_bind(0, seq->cfg.l3_if, false));
++	if (ret)
++		return ret;
++
++	seq->step = PPE_SR_STEP_A10;
++	seq->rec |= PPE_SR_REC_ROLE;
++	return sr_field_set(io, sr_role_addr(port), 1, PPE_PORT_PARSING_PORT_ROLE,
++			    ppe_sr_role(0, false), ppe_sr_role(0, true));
++}
++
++/* Note the first failure of a revert that goes on. */
++static void sr_note(struct ppe_sr_seq *seq, int *first, u8 step, int ret)
++{
++	if (!ret || *first)
++		return;
++	*first = ret;
++	seq->step = step;
++	seq->err = ret;
++}
++
++/**
++ * ppe_sr_seq_revert() - Put back what the records say S-R may have written
++ * (D3-D8; the arm's rollback).
++ * @seq: The sequence state; every flow is out of hardware.
++ * @io: Register access.
++ *
++ * D3 first: the parser role edge, read back; if that fails nothing else is
++ * written (the CPU port stays S-R's, which a core role needs). Then each of
++ * D4-D8 is attempted whatever failed before, except that an identity whose
++ * rule could not be removed keeps its action, counter and L3 interface (a
++ * valid rule still names them). Every entry is put back only from S-R's own
++ * words; a moved field only while it holds S-R's value, and then with the
++ * whole register as it was before the arm. On success the records and
++ * identities are cleared.
++ *
++ * Return: 0, or the first error (@seq->step names its step).
++ */
++int ppe_sr_seq_revert(struct ppe_sr_seq *seq, const struct ppe_sr_io *io)
++{
++	const u8 port = seq->cfg.ppe_port;
++	u64 keep = 0;
++	unsigned int s;
++	int ret, first = 0;
++
++	if (seq->rec & PPE_SR_REC_ROLE) {
++		ret = sr_field_restore(io, sr_role_addr(port), 1, PPE_PORT_PARSING_PORT_ROLE,
++				       ppe_sr_role(0, true), &seq->role_pre);
++		if (ret) {
++			sr_note(seq, &first, PPE_SR_STEP_D3, ret);
++			return ret;
++		}
++		seq->rec &= ~PPE_SR_REC_ROLE;
++	}
++
++	if (seq->rec & PPE_SR_REC_CPU) {
++		ret = sr_field_restore(io, sr_eg_vlan_addr(PPE_SR_CPU_PORT), 1, PPE_SR_CPU_EG_MASK,
++				       PPE_SR_CPU_EG_SR, &seq->cpu_pre);
++		sr_note(seq, &first, PPE_SR_STEP_D4, ret);
++		if (!ret)
++			seq->rec &= ~PPE_SR_REC_CPU;
++	}
++
++	if (seq->rec & PPE_SR_REC_BIND) {
++		ret = sr_field_restore(io, sr_bind_addr(port), PPE_L3_VP_PORT_TBL_WORDS,
++				       PPE_SR_BIND_MASK, ppe_sr_bind(0, seq->cfg.l3_if, false),
++				       seq->bind_pre);
++		sr_note(seq, &first, PPE_SR_STEP_D5, ret);
++		if (!ret)
++			seq->rec &= ~PPE_SR_REC_BIND;
++	}
++
++	for (s = 0; s < PPE_SR_ID_MAX; s++) {
++		struct ppe_sr_id *id = &seq->id[s];
++
++		if (!id->used)
++			continue;
++		id->live = 0;
++		ret = sr_id_remove(seq, io, id, PPE_SR_OP_RULE_OFF);
++		if (!ret)
++			ret = sr_id_remove(seq, io, id, PPE_SR_OP_ACT_OFF);
++		if (!ret)
++			ret = sr_id_remove(seq, io, id, PPE_SR_OP_CNT_OFF);
++		if (ret)
++			keep |= BIT_ULL(s);
++		sr_note(seq, &first, PPE_SR_STEP_D6, ret);
++	}
++
++	for (s = 0; s < PPE_SR_ID_MAX; s++) {
++		if (!seq->id[s].used || (keep & BIT_ULL(s)))
++			continue;
++		ret = sr_id_remove(seq, io, &seq->id[s], PPE_SR_OP_L3IF_RESTORE);
++		sr_note(seq, &first, PPE_SR_STEP_D7, ret);
++	}
++
++	if (seq->rec & PPE_SR_REC_STPID) {
++		ret = sr_field_restore(io, PPE_EG_VLAN_TPID_ADDR, 1, PPE_SR_STPID_MASK,
++				       ppe_sr_stpid(0, true), &seq->stpid_pre);
++		sr_note(seq, &first, PPE_SR_STEP_D8, ret);
++		if (!ret)
++			seq->rec &= ~PPE_SR_REC_STPID;
++	}
++
++	if (!first)
++		sr_ids_clear(seq);
++
++	return first;
++}
++
++/* Read @words registers at @addr and compare them with @want under @mask
++ * (NULL: every bit), counting and saying a mismatch.
++ */
++static int sr_check(const struct ppe_sr_io *io, const char *what, u32 addr, const u32 *want,
++		    const u32 *mask, unsigned int words, unsigned int *bad)
++{
++	u32 val[PPE_SR_WORDS_MAX];
++	unsigned int i;
++	int ret;
++
++	ret = sr_rd(io, addr, val, words);
++	if (ret)
++		return ret;
++	for (i = 0; i < words; i++) {
++		u32 m = mask ? mask[i] : ~0U;
++
++		if ((val[i] & m) != (want[i] & m)) {
++			sr_log(io, PPE_SR_LOG_ERR,
++			       "verify MISMATCH %s %#x word %u: %08x, want %08x under %08x", what,
++			       addr, i, val[i], want[i], m);
++			(*bad)++;
++		}
++	}
++
++	return 0;
++}
++
++/* Compare one register with a predicate's verdict. */
++static int sr_check_ok(const struct ppe_sr_io *io, const char *what, u32 addr,
++		       bool (*ok)(u32 val), unsigned int *bad)
++{
++	u32 v;
++	int ret;
++
++	ret = sr_rd(io, addr, &v, 1);
++	if (ret)
++		return ret;
++	if (!ok(v)) {
++		sr_log(io, PPE_SR_LOG_ERR, "verify MISMATCH %s %#x: %08x", what, addr, v);
++		(*bad)++;
++	}
++
++	return 0;
++}
++
++static bool sr_zero_ok(u32 val)
++{
++	return !val;
++}
++
++/* S1's registers that S-R does not write, and S-R's globals. */
++static int sr_verify_globals(struct ppe_sr_seq *seq, const struct ppe_sr_io *io,
++			     unsigned int *bad)
++{
++	const struct ppe_sr_cfg *cfg = &seq->cfg;
++	const u32 tpids = PPE_SR_PARSER_TPIDS, role_mask = PPE_PORT_PARSING_PORT_ROLE;
++	const u32 my_mask[PPE_MY_MAC_TBL_WORDS] = {
++		~0U, PPE_MY_MAC_TBL_MAC_DA_1 | PPE_MY_MAC_TBL_VALID
++	};
++	const u32 bt_mask = PPE_BRIDGE_CONFIG_BRIDGE_TYPE, zero = 0;
++	u32 my[PPE_MY_MAC_TBL_WORDS], want;
++	unsigned int q;
++	int ret;
++
++	ret = sr_check(io, "parser TPIDs", PPE_IPR_VLAN_TPID_ADDR, &tpids, NULL, 1, bad);
++	if (!ret)
++		ret = sr_check(io, "tunnel parser TPIDs", PPE_TPR_VLAN_TPID_ADDR, &tpids, NULL, 1,
++			       bad);
++	if (!ret)
++		ret = sr_check(io, "bridge type", PPE_BRIDGE_CONFIG_ADDR, &zero, &bt_mask, 1, bad);
++	want = ppe_sr_stpid(seq->stpid_pre, true);
++	if (!ret)
++		ret = sr_check(io, "egress TPIDs", PPE_EG_VLAN_TPID_ADDR, &want, NULL, 1, bad);
++	want = ppe_sr_cpu_eg(seq->cpu_pre, true);
++	if (!ret)
++		ret = sr_check(io, "CPU port egress", sr_eg_vlan_addr(PPE_SR_CPU_PORT), &want, NULL,
++			       1, bad);
++	if (!ret)
++		ret = sr_check_ok(io, "conduit egress", sr_eg_vlan_addr(cfg->ppe_port),
++				  ppe_sr_conduit_eg_ok, bad);
++	for (q = 1; !ret && q < PPE_PORT_EG_VLAN_TBL_ENTRIES; q++)
++		if (cfg->ctype_ports & BIT(q))
++			ret = sr_check_ok(io, "C-type port egress", sr_eg_vlan_addr(q),
++					  ppe_sr_ctype_eg_ok, bad);
++	want = ppe_sr_role(seq->role_pre, true);
++	if (!ret)
++		ret = sr_check(io, "parser role", sr_role_addr(cfg->ppe_port), &want, NULL, 1, bad);
++	if (!ret)
++		ret = sr_check(io, "tunnel parser role", sr_tpr_role_addr(cfg->ppe_port), &zero,
++			       &role_mask, 1, bad);
++	if (!ret)
++		ret = sr_check_ok(io, "port VLAN config",
++				  PPE_PORT_VLAN_CONFIG_ADDR +
++				  cfg->ppe_port * PPE_PORT_VLAN_CONFIG_INC, sr_zero_ok, bad);
++	if (!ret)
++		ret = sr_check_ok(io, "port default VID",
++				  PPE_PORT_DEF_VID_ADDR + cfg->ppe_port * PPE_PORT_DEF_VID_INC,
++				  sr_zero_ok, bad);
++	sr_mac_words(cfg->mac, &my[0], &my[1]);
++	my[1] = FIELD_PREP(PPE_MY_MAC_TBL_MAC_DA_1, my[1]) | PPE_MY_MAC_TBL_VALID;
++	if (!ret)
++		ret = sr_check(io, "MY_MAC", sr_my_mac_addr(cfg->l3_if - 1), my, my_mask,
++			       PPE_MY_MAC_TBL_WORDS, bad);
++
++	return ret;
++}
++
++/**
++ * ppe_sr_seq_verify() - Read back what S-R relies on.
++ * @seq: The sequence state, READY, ACTIVE or ARMING after A10.
++ * @io: Register access.
++ * @how: PPE_SR_VERIFY_ARM (S3, A11): S-R's globals, the binding, each
++ * identity's entries and S1's other registers; PPE_SR_VERIFY_RESYNC (S5):
++ * the binding, the template and each identity's entries only (no foreign
++ * entry is read); PPE_SR_VERIFY_IDLE (S8): ARM's and no valid XLT rule but
++ * S-R's matching the conduit (a full scan: never under load).
++ *
++ * Every mismatch is said ("verify MISMATCH").
++ *
++ * Return: 0, -EBADMSG on a mismatch, or a read error.
++ */
++int ppe_sr_seq_verify(struct ppe_sr_seq *seq, const struct ppe_sr_io *io, enum ppe_sr_verify how)
++{
++	u32 w[PPE_SR_WORDS_MAX], copy[PPE_IN_L3_IF_TBL_WORDS] = {};
++	const u8 port = seq->cfg.ppe_port;
++	unsigned int bad = 0, s, i;
++	struct ppe_sr_xlt_key k;
++	u64 own = 0;
++	int ret;
++
++	memcpy(w, seq->bind_pre, sizeof(seq->bind_pre));
++	w[0] = ppe_sr_bind(w[0], seq->cfg.l3_if, false);
++	ret = sr_check(io, "L3 binding", sr_bind_addr(port), w, NULL, PPE_L3_VP_PORT_TBL_WORDS,
++		       &bad);
++	if (!ret)
++		ret = sr_check(io, "template", sr_l3if_addr(seq->cfg.l3_if), seq->tmpl, NULL,
++			       PPE_IN_L3_IF_TBL_WORDS, &bad);
++	if (!ret && ppe_sr_l3if_copy(seq->tmpl, copy)) {
++		sr_log(io, PPE_SR_LOG_ERR, "verify MISMATCH template routes nothing");
++		bad++;
++	}
++
++	for (s = 0; !ret && s < PPE_SR_ID_MAX; s++) {
++		const struct ppe_sr_id *id = &seq->id[s];
++
++		if (!id->used)
++			continue;
++		own |= BIT_ULL(id->xlt);
++		if (memcmp(id->l3if_new, copy, sizeof(copy))) {
++			sr_log(io, PPE_SR_LOG_ERR,
++			       "verify MISMATCH identity %u: L3 interface %u is not the template's copy",
++			       s, id->l3_if);
++			bad++;
++		}
++		ret = sr_check(io, "identity L3 interface", sr_l3if_addr(id->l3_if), id->l3if_new,
++			       NULL, PPE_IN_L3_IF_TBL_WORDS, &bad);
++		if (ret)
++			break;
++		ppe_sr_xlt_act_enc(id->l3_if, id->xlt, w);
++		ret = sr_check(io, "identity XLT action", sr_act_addr(id->xlt), w, NULL,
++			       PPE_XLT_ACTION_TBL_WORDS, &bad);
++		if (ret)
++			break;
++		ppe_sr_xlt_key_of(&id->cls, port, &k);
++		if (ppe_sr_xlt_rule_enc(&k, w)) {
++			bad++;
++			continue;
++		}
++		ret = sr_check(io, "identity XLT rule", sr_rule_addr(id->xlt), w, NULL,
++			       PPE_XLT_RULE_TBL_WORDS, &bad);
++	}
++
++	if (!ret && how != PPE_SR_VERIFY_RESYNC)
++		ret = sr_verify_globals(seq, io, &bad);
++
++	for (i = 0; !ret && how == PPE_SR_VERIFY_IDLE && i < PPE_XLT_RULE_TBL_ENTRIES; i++) {
++		ret = sr_rd(io, sr_rule_addr(i), w, PPE_XLT_RULE_TBL_WORDS);
++		if (!ret && ppe_sr_xlt_rule_on_port(w, port) &&
++		    (i > PPE_SR_XLT_LAST || !(own & BIT_ULL(i)))) {
++			sr_log(io, PPE_SR_LOG_ERR, "verify MISMATCH XLT rule %u (%08x) not S-R's",
++			       i, w[0]);
++			bad++;
++		}
++	}
++
++	if (ret)
++		return ret;
++
++	return bad ? -EBADMSG : 0;
++}
++
++/**
++ * ppe_sr_seq_fault() - Latch FAULT (WP2-DESIGN D13).
++ * @seq: The sequence state.
++ * @io: For the ppe byte and the log.
++ * @why: enum ppe_sr_fault.
++ * @step: Where.
++ * @err: The error.
++ *
++ * Asks the caller to latch priv->degraded. Outside OFF and FAULT, moves the
++ * ppe byte to FAULT (best effort: a switch that left READY keeps it) and
++ * the state to FAULT; the claim and every register stay as they are.
++ */
++void ppe_sr_seq_fault(struct ppe_sr_seq *seq, const struct ppe_sr_io *io,
++		      enum ppe_sr_fault why, enum ppe_sr_step step, int err)
++{
++	u8 from;
++
++	seq->degrade = true;
++	if (seq->state == PPE_SR_S_OFF || seq->state == PPE_SR_S_FAULT)
++		return;
++
++	from = sr_td_ppe(seq->state);
++	if (!io->move(io->ctx, from, RTL8_4S_PPE_FAULT))
++		sr_log(io, PPE_SR_LOG_WARN, "switch left READY: ppe byte %u not moved to FAULT",
++		       from);
++	seq->fault = why;
++	seq->fault_step = step;
++	seq->fault_err = err;
++	sr_set_state(seq, io, PPE_SR_S_FAULT);
++	sr_log(io, PPE_SR_LOG_ERR,
++	       "FAULT %s at %s (%d): claim and registers kept, reboot to recover",
++	       ppe_sr_fault_name(why), ppe_sr_step_name(step), err);
++}
++
++static int sr_arm_rollback(struct ppe_sr_seq *seq, const struct ppe_sr_io *io, int err)
++{
++	u8 step = seq->step;
++	int ret;
++
++	sr_log(io, PPE_SR_LOG_ERR, "arm failed at %s (%d), rolling back", ppe_sr_step_name(step),
++	       err);
++	ret = ppe_sr_seq_revert(seq, io);
++	if (ret) {
++		ppe_sr_seq_fault(seq, io, PPE_SR_F_ROLLBACK_FAILED, seq->step, ret);
++		return -EIO;
++	}
++
++	io->release(io->ctx);
++	seq->step = step;
++	seq->err = err;
++	sr_set_state(seq, io, PPE_SR_S_OFF);
++
++	return err;
++}
++
++/**
++ * ppe_sr_seq_arm() - Arm S-R (A3-A11), offers off.
++ * @seq: The sequence state, OFF.
++ * @io: Register access, flows and the switch's state word.
++ * @cfg: What the arm is for.
++ * @plan: The classes to give identities, sorted (ppe_sr_topo_plan()).
++ * @n: Their number.
++ * @why: Set to the refusal's reason (enum ppe_sr_why).
++ *
++ * Under RTNL and the lock. Refusals (A3, A4) write nothing and leave the
++ * switch unclaimed. Every flow is dropped after the claim; one that cannot
++ * be means release and OFF with @seq->degrade set. A failure from A6 on is
++ * rolled back (release, OFF, the error returned) or, if that fails, FAULT.
++ *
++ * Return: 0 (READY), -EALREADY unless OFF, -EIO in FAULT or after a stuck
++ * flow or a failed rollback, -EINVAL (@why NOTHING for an empty plan),
++ * -ENOSPC (BUDGET), -EBUSY (PRECHECK or SWITCH_NOT_READY), -ENODEV (no
++ * switch), or a rolled-back failure's error (HW).
++ */
++int ppe_sr_seq_arm(struct ppe_sr_seq *seq, const struct ppe_sr_io *io,
++		   const struct ppe_sr_cfg *cfg, const struct ppe_sr_class *plan, unsigned int n,
++		   enum ppe_sr_why *why)
++{
++	unsigned int stuck, s;
++	u32 sw_gen;
++	u16 s_ports;
++	int ret;
++
++	*why = PPE_SR_W_PRECHECK;
++	if (seq->state == PPE_SR_S_FAULT)
++		return -EIO;
++	if (seq->state != PPE_SR_S_OFF)
++		return -EALREADY;
++	if (!n) {
++		*why = PPE_SR_W_NOTHING;
++		return -EINVAL;
++	}
++	if (n > PPE_SR_ID_MAX) {
++		*why = PPE_SR_W_BUDGET;
++		return -ENOSPC;
++	}
++	if (!sr_plan_ok(plan, n))
++		return -EINVAL;
++
++	seq->cfg = *cfg;
++	seq->step = PPE_SR_STEP_NONE;
++	seq->err = 0;
++	seq->rec = 0;
++	sr_ids_clear(seq);
++
++	ret = ppe_sr_seq_precheck(seq, io);
++	if (!ret)
++		ret = ppe_sr_seq_alloc(seq, io, plan, n);
++	if (ret) {
++		if (ret == -ENOSPC)
++			*why = PPE_SR_W_BUDGET;
++		return ret;
++	}
++
++	seq->step = PPE_SR_STEP_A4;
++	ret = io->claim(io->ctx, &sw_gen, &s_ports);
++	if (!ret && (sw_gen != cfg->sw_gen || s_ports != cfg->s_ports)) {
++		io->release(io->ctx);
++		ret = -EBUSY;
++	}
++	if (ret) {
++		sr_ids_clear(seq);
++		seq->err = ret;
++		*why = PPE_SR_W_SWITCH_NOT_READY;
++		sr_log(io, PPE_SR_LOG_WARN, "arm refused: switch not READY or re-armed (%d)", ret);
++		return ret;
++	}
++	sr_set_state(seq, io, PPE_SR_S_ARMING);
++
++	seq->step = PPE_SR_STEP_A5;
++	stuck = io->flush(io->ctx, PPE_SR_FLUSH_ALL, 0);
++	if (stuck) {
++		io->release(io->ctx);
++		sr_ids_clear(seq);
++		seq->err = -EBUSY;
++		seq->degrade = true;
++		sr_set_state(seq, io, PPE_SR_S_OFF);
++		*why = PPE_SR_W_HW;
++		sr_log(io, PPE_SR_LOG_ERR,
++		       "arm stopped: %u flow(s) stuck in hardware, claim released, nothing written",
++		       stuck);
++		return -EIO;
++	}
++
++	ret = ppe_sr_seq_apply(seq, io);
++	if (!ret) {
++		seq->step = PPE_SR_STEP_A11;
++		ret = ppe_sr_seq_verify(seq, io, PPE_SR_VERIFY_ARM);
++	}
++	if (ret) {
++		*why = PPE_SR_W_HW;
++		return sr_arm_rollback(seq, io, ret);
++	}
++
++	for (s = 0; s < PPE_SR_ID_MAX; s++)
++		seq->id[s].live = seq->id[s].used;
++	seq->step = PPE_SR_STEP_NONE;
++	*why = PPE_SR_W_OK;
++	sr_set_state(seq, io, PPE_SR_S_READY);
++
++	return 0;
++}
++
++/**
++ * ppe_sr_seq_offers() - Turn S-R offers on or off (WP2-DESIGN §4.5).
++ * @seq: The sequence state.
++ * @io: The switch's state word and the flows.
++ * @on: On (READY -> ACTIVE) or off (ACTIVE -> READY, every flow dropped).
++ *
++ * Under the lock. Off with a flow stuck in hardware is FAULT.
++ *
++ * Return: 0 (also when already so), -EINVAL unless READY or ACTIVE, -EBUSY
++ * if the switch refuses ACTIVE, -EIO on FAULT.
++ */
++int ppe_sr_seq_offers(struct ppe_sr_seq *seq, const struct ppe_sr_io *io, bool on)
++{
++	unsigned int stuck;
++
++	if (on) {
++		if (seq->state == PPE_SR_S_ACTIVE)
++			return 0;
++		if (seq->state != PPE_SR_S_READY)
++			return -EINVAL;
++		seq->step = PPE_SR_STEP_OFFERS_ON;
++		if (!io->move(io->ctx, RTL8_4S_PPE_SR_READY, RTL8_4S_PPE_ACTIVE)) {
++			sr_log(io, PPE_SR_LOG_WARN, "switch left READY: offers stay off");
++			return -EBUSY;
++		}
++		sr_set_state(seq, io, PPE_SR_S_ACTIVE);
++		return 0;
++	}
++
++	if (seq->state == PPE_SR_S_READY)
++		return 0;
++	if (seq->state != PPE_SR_S_ACTIVE)
++		return -EINVAL;
++	seq->step = PPE_SR_STEP_OFFERS_OFF;
++	if (!io->move(io->ctx, RTL8_4S_PPE_ACTIVE, RTL8_4S_PPE_SR_READY))
++		sr_log(io, PPE_SR_LOG_WARN, "switch left READY: ppe byte not moved back");
++	sr_set_state(seq, io, PPE_SR_S_READY);
++	stuck = io->flush(io->ctx, PPE_SR_FLUSH_ALL, 0);
++	if (stuck) {
++		ppe_sr_seq_fault(seq, io, PPE_SR_F_STUCK_FLOW, PPE_SR_STEP_OFFERS_OFF, -EBUSY);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++/**
++ * ppe_sr_seq_disarm() - Disarm S-R (D0-D9).
++ * @seq: The sequence state.
++ * @io: Register access, flows and the switch's state word.
++ *
++ * Under the lock. A flow stuck in hardware (D2) or any failed revert
++ * (D3-D8) is FAULT: the claim is kept and nothing more is written.
++ *
++ * Return: 0 (OFF; also when already OFF), -EIO in or into FAULT, -EBUSY
++ * while an arm or a disarm is under way.
++ */
++int ppe_sr_seq_disarm(struct ppe_sr_seq *seq, const struct ppe_sr_io *io)
++{
++	unsigned int stuck;
++	int ret;
++
++	switch (seq->state) {
++	case PPE_SR_S_OFF:
++		return 0;
++	case PPE_SR_S_FAULT:
++		return -EIO;
++	case PPE_SR_S_READY:
++	case PPE_SR_S_ACTIVE:
++		break;
++	default:
++		return -EBUSY;
++	}
++
++	seq->step = PPE_SR_STEP_D1;
++	if (seq->state == PPE_SR_S_ACTIVE &&
++	    !io->move(io->ctx, RTL8_4S_PPE_ACTIVE, RTL8_4S_PPE_SR_READY))
++		sr_log(io, PPE_SR_LOG_WARN, "switch left READY: ppe byte not moved back");
++	sr_set_state(seq, io, PPE_SR_S_DISARMING);
++
++	seq->step = PPE_SR_STEP_D2;
++	stuck = io->flush(io->ctx, PPE_SR_FLUSH_ALL, 0);
++	if (stuck) {
++		ppe_sr_seq_fault(seq, io, PPE_SR_F_STUCK_FLOW, PPE_SR_STEP_D2, -EBUSY);
++		return -EIO;
++	}
++
++	ret = ppe_sr_seq_revert(seq, io);
++	if (ret) {
++		ppe_sr_seq_fault(seq, io, PPE_SR_F_REVERT_MISMATCH, seq->step, ret);
++		return -EIO;
++	}
++
++	io->release(io->ctx);
++	seq->step = PPE_SR_STEP_NONE;
++	sr_set_state(seq, io, PPE_SR_S_OFF);
++
++	return 0;
++}
++
++/**
++ * ppe_sr_diff() - Plan the identity changes of a resync (WP2-DESIGN §5.2).
++ * @old: The identities now, PPE_SR_ID_MAX slots.
++ * @plan: Every class that should have an identity, sorted, no duplicate.
++ * @n: Their number.
++ * @recopy: The conduit's L3 interface changed: rewrite every kept copy.
++ * @flush_ports: Switch ports whose flows to drop at the end, 0 for none.
++ * @ops: Filled in, at most PPE_SR_OPS_MAX.
++ * @declined: Set to the classes of @plan left without an identity because
++ * PPE_SR_ID_MAX are taken.
++ *
++ * Identities of classes no longer planned go first, each FLUSH_ID,
++ * RULE_OFF, ACT_OFF, CNT_OFF, L3IF_RESTORE; then RECOPY of every kept one;
++ * then each new class in @plan order, ALLOC, L3IF_COPY, CNT_ZERO, ACT_ON,
++ * RULE_ON, into the lowest free slot; FLUSH_PORT last. A kept identity is
++ * never displaced by a new class: over budget, new classes decline.
++ *
++ * Return: the number of operations.
++ */
++unsigned int ppe_sr_diff(const struct ppe_sr_id *old, const struct ppe_sr_class *plan,
++			 unsigned int n, bool recopy, u16 flush_ports, struct ppe_sr_op *ops,
++			 unsigned int *declined)
++{
++	static const u8 rm[] = {
++		PPE_SR_OP_FLUSH_ID, PPE_SR_OP_RULE_OFF, PPE_SR_OP_ACT_OFF, PPE_SR_OP_CNT_OFF,
++		PPE_SR_OP_L3IF_RESTORE,
++	};
++	static const u8 add[] = {
++		PPE_SR_OP_ALLOC, PPE_SR_OP_L3IF_COPY, PPE_SR_OP_CNT_ZERO, PPE_SR_OP_ACT_ON,
++		PPE_SR_OP_RULE_ON,
++	};
++	unsigned int nops = 0, held = 0, s, i, k;
++	u64 kept = 0, taken;
++
++	*declined = 0;
++	for (s = 0; s < PPE_SR_ID_MAX; s++) {
++		if (!old[s].used)
++			continue;
++		if (sr_plan_has(plan, n, &old[s].cls)) {
++			kept |= BIT_ULL(s);
++			held++;
++			continue;
++		}
++		for (k = 0; k < ARRAY_SIZE(rm); k++)
++			ops[nops++] = (struct ppe_sr_op){ .code = rm[k], .slot = s };
++	}
++
++	for (s = 0; recopy && s < PPE_SR_ID_MAX; s++)
++		if (kept & BIT_ULL(s))
++			ops[nops++] = (struct ppe_sr_op){ .code = PPE_SR_OP_RECOPY, .slot = s };
++
++	taken = kept;
++	for (i = 0; i < n; i++) {
++		if (sr_ids_have(old, kept, &plan[i]))
++			continue;
++		if (held >= PPE_SR_ID_MAX) {
++			(*declined)++;
++			continue;
++		}
++		for (s = 0; s < PPE_SR_ID_MAX; s++)
++			if (!(taken & BIT_ULL(s)))
++				break;
++		taken |= BIT_ULL(s);
++		held++;
++		for (k = 0; k < ARRAY_SIZE(add); k++)
++			ops[nops++] = (struct ppe_sr_op){ .code = add[k], .slot = s,
++							  .cls = plan[i] };
++	}
++
++	if (flush_ports)
++		ops[nops++] = (struct ppe_sr_op){ .code = PPE_SR_OP_FLUSH_PORT,
++						  .ports = flush_ports };
++
++	return nops;
++}
++
++static int sr_exec_fault(struct ppe_sr_seq *seq, const struct ppe_sr_io *io,
++			 enum ppe_sr_fault why, int err)
++{
++	seq->err = err;
++	ppe_sr_seq_fault(seq, io, why, seq->step, err);
++	return -EIO;
++}
++
++/**
++ * ppe_sr_seq_exec() - Carry out a resync's diff (WP2-DESIGN §5.2).
++ * @seq: The sequence state, READY or ACTIVE.
++ * @io: Register access and flows.
++ * @ops: From ppe_sr_diff() on @seq->id.
++ * @n: Their number.
++ * @tmpl: The conduit's L3 interface as read now: RECOPY and new identities
++ * copy it; it becomes @seq->tmpl.
++ * @failed: Set to the additions that failed: each was taken back alone and
++ * its class has no identity.
++ *
++ * Reads no foreign entry: new identities are allocated from the arm's
++ * record (struct ppe_sr_seq::xlt_busy, l3if_inert) and S-R's own entries,
++ * reading only the L3 interface they take. A flow left after FLUSH_ID or
++ * FLUSH_PORT, a failed removal or recopy, or a failed take-back of an
++ * addition is FAULT, and the rest is not done.
++ *
++ * Return: 0, -EIO on FAULT, -EINVAL for a bad operation.
++ */
++int ppe_sr_seq_exec(struct ppe_sr_seq *seq, const struct ppe_sr_io *io,
++		    const struct ppe_sr_op *ops, unsigned int n,
++		    const u32 tmpl[PPE_IN_L3_IF_TBL_WORDS], unsigned int *failed)
++{
++	u32 copy[PPE_IN_L3_IF_TBL_WORDS];
++	unsigned int i, stuck;
++	struct ppe_sr_id *id;
++	u64 skip = 0;
++	int ret;
++
++	*failed = 0;
++	for (i = 0; i < n; i++) {
++		const struct ppe_sr_op *op = &ops[i];
++
++		if (op->slot >= PPE_SR_ID_MAX)
++			return -EINVAL;
++		id = &seq->id[op->slot];
++
++		switch (op->code) {
++		case PPE_SR_OP_FLUSH_ID:
++			seq->step = PPE_SR_STEP_FLUSH_ID;
++			id->live = 0;
++			stuck = io->flush(io->ctx, PPE_SR_FLUSH_ID, op->slot);
++			if (stuck)
++				return sr_exec_fault(seq, io, PPE_SR_F_STUCK_FLOW, -EBUSY);
++			break;
++		case PPE_SR_OP_RULE_OFF:
++		case PPE_SR_OP_ACT_OFF:
++		case PPE_SR_OP_CNT_OFF:
++		case PPE_SR_OP_L3IF_RESTORE:
++			seq->step = PPE_SR_STEP_REMOVE;
++			if (!id->used)
++				return -EINVAL;
++			ret = sr_id_remove(seq, io, id, op->code);
++			if (ret)
++				return sr_exec_fault(seq, io, PPE_SR_F_REVERT_MISMATCH, ret);
++			if (op->code == PPE_SR_OP_L3IF_RESTORE && !id->set) {
++				memset(id, 0, sizeof(*id));
++				seq->nid--;
++			}
++			break;
++		case PPE_SR_OP_RECOPY:
++			seq->step = PPE_SR_STEP_RECOPY;
++			if (!id->used)
++				return -EINVAL;
++			ret = ppe_sr_l3if_copy(tmpl, copy);
++			if (!ret)
++				ret = sr_entry_set(io, sr_l3if_addr(id->l3_if),
++						   PPE_IN_L3_IF_TBL_WORDS, id->l3if_new, copy);
++			if (ret)
++				return sr_exec_fault(seq, io, PPE_SR_F_REVERT_MISMATCH, ret);
++			memcpy(id->l3if_new, copy, sizeof(copy));
++			break;
++		case PPE_SR_OP_ALLOC:
++			seq->step = PPE_SR_STEP_ADD;
++			skip &= ~BIT_ULL(op->slot);
++			ret = sr_alloc_one(seq, io, op->slot, &op->cls, tmpl);
++			if (ret) {
++				skip |= BIT_ULL(op->slot);
++				(*failed)++;
++				sr_log(io, PPE_SR_LOG_WARN,
++				       "no identity for port %u %s VLAN %u (%d)", op->cls.port,
++				       op->cls.form == PPE_SR_U ? "U" : "T", op->cls.vid, ret);
++			}
++			break;
++		case PPE_SR_OP_L3IF_COPY:
++		case PPE_SR_OP_CNT_ZERO:
++		case PPE_SR_OP_ACT_ON:
++		case PPE_SR_OP_RULE_ON:
++			if (skip & BIT_ULL(op->slot))
++				break;
++			seq->step = PPE_SR_STEP_ADD;
++			if (!id->used)
++				return -EINVAL;
++			ret = sr_id_install(seq, io, id, op->code);
++			if (!ret) {
++				if (op->code == PPE_SR_OP_RULE_ON)
++					id->live = 1;
++				break;
++			}
++			skip |= BIT_ULL(op->slot);
++			(*failed)++;
++			sr_log(io, PPE_SR_LOG_WARN, "identity %u not installed (%d), taken back",
++			       op->slot, ret);
++			ret = sr_id_takeback(seq, io, id);
++			if (ret)
++				return sr_exec_fault(seq, io, PPE_SR_F_ROLLBACK_FAILED, ret);
++			memset(id, 0, sizeof(*id));
++			seq->nid--;
++			break;
++		case PPE_SR_OP_FLUSH_PORT:
++			seq->step = PPE_SR_STEP_FLUSH_PORT;
++			stuck = io->flush(io->ctx, PPE_SR_FLUSH_PORTS, op->ports);
++			if (stuck)
++				return sr_exec_fault(seq, io, PPE_SR_F_STUCK_FLOW, -EBUSY);
++			break;
++		default:
++			return -EINVAL;
++		}
++	}
++
++	memcpy(seq->tmpl, tmpl, sizeof(seq->tmpl));
++	seq->step = PPE_SR_STEP_NONE;
++
++	return 0;
++}
++
++/**
++ * ppe_sr_seq_resync() - Bring the identities in line with a new plan.
++ * @seq: The sequence state.
++ * @io: Register access and flows.
++ * @plan: Every class that should have an identity, sorted (classes ∩
++ * scope, not truncated: ppe_sr_diff() keeps live identities first).
++ * @n: Their number.
++ * @recopy: Rewrite every copy even if the conduit's L3 interface reads as
++ * before.
++ * @flush_ports: Switch ports whose flows to drop at the end.
++ * @ops: Scratch room for PPE_SR_OPS_MAX operations.
++ * @declined: Set to the classes left without an identity.
++ *
++ * Under RTNL and the lock; nothing unless READY or ACTIVE (never in FAULT).
++ * Reads the conduit's L3 interface, plans, executes. The caller verifies
++ * after (ppe_sr_seq_verify(), PPE_SR_VERIFY_RESYNC) and disarms on a
++ * mismatch.
++ *
++ * Return: 0, -EIO on FAULT, -EBADMSG if the conduit's L3 interface can no
++ * longer be copied, -EINVAL for a bad plan, or a read error.
++ */
++int ppe_sr_seq_resync(struct ppe_sr_seq *seq, const struct ppe_sr_io *io,
++		      const struct ppe_sr_class *plan, unsigned int n, bool recopy,
++		      u16 flush_ports, struct ppe_sr_op *ops, unsigned int *declined)
++{
++	u32 tmpl[PPE_IN_L3_IF_TBL_WORDS], copy[PPE_IN_L3_IF_TBL_WORDS];
++	unsigned int nops, failed;
++	bool changed;
++	int ret;
++
++	*declined = 0;
++	if (seq->state != PPE_SR_S_READY && seq->state != PPE_SR_S_ACTIVE)
++		return 0;
++	if (!sr_plan_ok(plan, n))
++		return -EINVAL;
++
++	seq->step = PPE_SR_STEP_RECOPY;
++	ret = sr_rd(io, sr_l3if_addr(seq->cfg.l3_if), tmpl, PPE_IN_L3_IF_TBL_WORDS);
++	if (ret)
++		return ret;
++	changed = memcmp(tmpl, seq->tmpl, sizeof(tmpl));
++	if (ppe_sr_l3if_copy(tmpl, copy)) {
++		sr_log(io, PPE_SR_LOG_ERR,
++		       "verify MISMATCH template %08x %08x %08x routes nothing", tmpl[0], tmpl[1],
++		       tmpl[2]);
++		return -EBADMSG;
++	}
++
++	nops = ppe_sr_diff(seq->id, plan, n, changed || recopy, flush_ports, ops, declined);
++	ret = ppe_sr_seq_exec(seq, io, ops, nops, tmpl, &failed);
++	*declined += failed;
++
++	return ret;
++}
++
++/**
++ * ppe_sr_seq_boot_check() - S-R's registers at their base (S9).
++ * @io: Register access.
++ * @ppe_port: The conduit's PPE port.
++ *
++ * At enable: the conduit's parser role edge, the CPU port's egress fields
++ * E's, the conduit's L3 binding valid and no valid XLT rule matching the
++ * conduit. Anything else may be left from an S-R mode that did not
++ * disarm, and S-R stays refused until reboot.
++ *
++ * Return: 0, -EBUSY if not at base (said), -EINVAL, or a read error.
++ */
++int ppe_sr_seq_boot_check(const struct ppe_sr_io *io, u8 ppe_port)
++{
++	u32 v, w[PPE_XLT_RULE_TBL_WORDS];
++	unsigned int i;
++	int ret;
++
++	if (!ppe_port || ppe_port >= PPE_PORT_PARSING_ENTRIES)
++		return -EINVAL;
++
++	ret = sr_rd(io, sr_role_addr(ppe_port), &v, 1);
++	if (ret)
++		return ret;
++	if (v & PPE_PORT_PARSING_PORT_ROLE)
++		goto busy;
++	ret = sr_rd(io, sr_tpr_role_addr(ppe_port), &v, 1);
++	if (ret)
++		return ret;
++	if (v & PPE_TPR_PORT_PARSING_PORT_ROLE)
++		goto busy;
++	ret = sr_rd(io, sr_eg_vlan_addr(PPE_SR_CPU_PORT), &v, 1);
++	if (ret)
++		return ret;
++	if ((v & PPE_SR_CPU_EG_MASK) != PPE_SR_CPU_EG_E)
++		goto busy;
++	ret = sr_rd(io, sr_bind_addr(ppe_port), &v, 1);
++	if (ret)
++		return ret;
++	if (!(v & PPE_L3_VP_PORT_TBL_L3_IF_VALID))
++		goto busy;
++	for (i = 0; i < PPE_XLT_RULE_TBL_ENTRIES; i++) {
++		ret = sr_rd(io, sr_rule_addr(i), w, PPE_XLT_RULE_TBL_WORDS);
++		if (ret)
++			return ret;
++		if (ppe_sr_xlt_rule_on_port(w, ppe_port)) {
++			v = w[0];
++			goto busy;
++		}
++	}
++
++	return 0;
++
++busy:
++	sr_log(io, PPE_SR_LOG_ERR, "not inert at boot (PPE port %u, %08x): refused until reboot",
++	       ppe_port, v);
++	return -EBUSY;
++}
++
++/**
++ * ppe_sr_seq_id_find() - The live identity of a class.
++ * @seq: The sequence state.
++ * @cls: The class.
++ *
++ * Under the lock; memory only.
++ *
++ * Return: its slot, or -ENOENT.
++ */
++int ppe_sr_seq_id_find(const struct ppe_sr_seq *seq, const struct ppe_sr_class *cls)
++{
++	unsigned int s;
++
++	for (s = 0; s < PPE_SR_ID_MAX; s++)
++		if (seq->id[s].used && seq->id[s].live && ppe_sr_class_eq(&seq->id[s].cls, cls))
++			return s;
++
++	return -ENOENT;
++}
++
++/**
++ * ppe_sr_seq_id_counters() - Read an identity's hardware counters.
++ * @seq: The sequence state.
++ * @io: Register access.
++ * @slot: The identity's slot.
++ * @c: Filled in.
++ *
++ * Reads registers: idle only.
++ *
++ * Return: 0, -ENOENT for an empty slot, or a read error.
++ */
++int ppe_sr_seq_id_counters(const struct ppe_sr_seq *seq, const struct ppe_sr_io *io,
++			   unsigned int slot, struct ppe_sr_id_cnt *c)
++{
++	u32 w[PPE_RT_INTERFACE_CNT_TBL_WORDS];
++	const struct ppe_sr_id *id;
++	int ret;
++
++	if (slot >= PPE_SR_ID_MAX || !seq->id[slot].used)
++		return -ENOENT;
++	id = &seq->id[slot];
++
++	ret = sr_rd(io, sr_cnt_addr(id->xlt), w, PPE_VLAN_DEV_CNT_TBL_WORDS);
++	if (ret)
++		return ret;
++	ppe_sr_vlan_cnt_dec(w, &c->xlt);
++	ret = sr_rd(io, sr_rt_cnt_addr(id->l3_if), w, PPE_RT_INTERFACE_CNT_TBL_WORDS);
++	if (ret)
++		return ret;
++	ppe_sr_rt_cnt_dec(w, &c->rt_in);
++	ret = sr_rd(io, sr_rt_cnt_addr(id->l3_if + PPE_IN_L3_IF_TBL_ENTRIES), w,
++		    PPE_RT_INTERFACE_CNT_TBL_WORDS);
++	if (ret)
++		return ret;
++	ppe_sr_rt_cnt_dec(w, &c->rt_eg);
++
++	return 0;
++}
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_seq.h
+@@ -0,0 +1,299 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * S-R register sequences (WP2-DESIGN §3.3, §3.5, §4.3-§4.6, §5.2, §8.4):
++ * the arm (A3-A11), offers on and off, the disarm (D0-D9), the identity
++ * diff planner and its executor (resync), the FAULT latch, the boot check
++ * (S9) and the verifies (S1, S3, S5, S8). Pure: registers, the flows, the
++ * rtl8_4s state word's ppe byte and logging all go through struct
++ * ppe_sr_io, so that a desk harness drives these on a mock. The caller holds
++ * the offload lock (priv->lock) around every call taking a struct
++ * ppe_sr_seq, and RTNL around the arm and the resync.
++ *
++ * Every register write is read back (whole entry, or the word holding the
++ * field). A field is moved only from the value it is expected to hold:
++ * "already there" is success, anything else -EBUSY, and nothing is written.
++ * Each step marks its record before it writes, so that a rollback or a
++ * disarm puts back exactly what may have changed, in the reverse order,
++ * again only from S-R's own value.
++ */
++
++#ifndef __PPE_SR_SEQ_H__
++#define __PPE_SR_SEQ_H__
++
++#include <linux/compiler.h>
++#include <linux/stdarg.h>
++#include <linux/types.h>
++
++#include "ppe_regs.h"
++#include "ppe_sr.h"
++#include "ppe_sr_hw.h"
++#include "ppe_sr_topo.h"
++
++/* Diff operations at most: a removal and an addition of five each per
++ * identity, a recopy per identity, one port flush.
++ */
++#define PPE_SR_OPS_MAX		(PPE_SR_ID_MAX * 11 + 1)
++
++/* struct ppe_sr_seq::rec: the global writes that may be in place. */
++#define PPE_SR_REC_STPID	BIT(0)
++#define PPE_SR_REC_CPU		BIT(1)
++#define PPE_SR_REC_BIND		BIT(2)
++#define PPE_SR_REC_ROLE		BIT(3)
++
++/* struct ppe_sr_id::set: an identity's entries that may be S-R's. */
++#define PPE_SR_ID_L3IF		BIT(0)
++#define PPE_SR_ID_CNT		BIT(1)
++#define PPE_SR_ID_ACT		BIT(2)
++#define PPE_SR_ID_RULE		BIT(3)
++
++/* Where a sequence is, for the FAULT record and the logs. */
++enum ppe_sr_step {
++	PPE_SR_STEP_NONE,
++	PPE_SR_STEP_A3,
++	PPE_SR_STEP_A4,
++	PPE_SR_STEP_A5,
++	PPE_SR_STEP_A6,
++	PPE_SR_STEP_A7,
++	PPE_SR_STEP_A8,
++	PPE_SR_STEP_A9,
++	PPE_SR_STEP_A10,
++	PPE_SR_STEP_A11,
++	PPE_SR_STEP_OFFERS_ON,
++	PPE_SR_STEP_OFFERS_OFF,
++	PPE_SR_STEP_D1,
++	PPE_SR_STEP_D2,
++	PPE_SR_STEP_D3,
++	PPE_SR_STEP_D4,
++	PPE_SR_STEP_D5,
++	PPE_SR_STEP_D6,
++	PPE_SR_STEP_D7,
++	PPE_SR_STEP_D8,
++	PPE_SR_STEP_FLUSH_ID,
++	PPE_SR_STEP_REMOVE,
++	PPE_SR_STEP_RECOPY,
++	PPE_SR_STEP_ADD,
++	PPE_SR_STEP_FLUSH_PORT,
++	PPE_SR_STEP_HOOK,
++	PPE_SR_STEP_NUM
++};
++
++/* What struct ppe_sr_io::flush drops: every flow; the upload flows of the
++ * identity in slot @arg; the flows of the switch ports in mask @arg, both
++ * directions.
++ */
++enum ppe_sr_flush {
++	PPE_SR_FLUSH_ALL,
++	PPE_SR_FLUSH_ID,
++	PPE_SR_FLUSH_PORTS
++};
++
++/* Diff operations (ppe_sr_diff()), see ppe_sr_seq_exec(). */
++enum ppe_sr_op_code {
++	PPE_SR_OP_FLUSH_ID,
++	PPE_SR_OP_RULE_OFF,
++	PPE_SR_OP_ACT_OFF,
++	PPE_SR_OP_CNT_OFF,
++	PPE_SR_OP_L3IF_RESTORE,
++	PPE_SR_OP_RECOPY,
++	PPE_SR_OP_ALLOC,
++	PPE_SR_OP_L3IF_COPY,
++	PPE_SR_OP_CNT_ZERO,
++	PPE_SR_OP_ACT_ON,
++	PPE_SR_OP_RULE_ON,
++	PPE_SR_OP_FLUSH_PORT
++};
++
++/* What ppe_sr_seq_verify() checks. */
++enum ppe_sr_verify {
++	PPE_SR_VERIFY_ARM,	/* S3: everything written, and S1 but its scans */
++	PPE_SR_VERIFY_RESYNC,	/* S5: the binding, the template, own entries */
++	PPE_SR_VERIFY_IDLE	/* S8: S3 and the foreign-rule scan */
++};
++
++enum ppe_sr_log_level {
++	PPE_SR_LOG_ERR,
++	PPE_SR_LOG_WARN,
++	PPE_SR_LOG_INFO
++};
++
++/**
++ * struct ppe_sr_io - What the sequences act through.
++ * @ctx: Passed to every callback.
++ * @rd: Read @words registers from @addr on.
++ * @wr: Write @words registers from @addr on, the last one last (a table
++ * entry latches on it).
++ * @flush: Drop the flows enum ppe_sr_flush names, with their hardware
++ * entries; return how many could not be dropped, those at an unknown index
++ * included (0: none is left).
++ * @claim: rtl8_4s_ppe_claim() on the conduit's switch; on success fill in
++ * its sw_gen and s_ports as read after the claim. Return 0, -EBUSY if the
++ * switch is not (READY, OFF), -ENODEV if it is gone.
++ * @move: rtl8_4s_ppe_move() between the enum rtl8_4s_ppe_state values @from
++ * and @to; false if refused or the switch is gone.
++ * @release: rtl8_4s_ppe_release(), nothing if the switch is gone.
++ * @state: Told every change of struct ppe_sr_seq::state, after it is
++ * stored: the caller bumps its generation here.
++ * @log: Log a line (enum ppe_sr_log_level, a format and its arguments);
++ * the caller prefixes it "sr: " (WP2-DESIGN §6.5: "sr: FAULT", "sr: verify
++ * MISMATCH" and "sr: switch left READY" are what a bench stops on).
++ *
++ * No callback may call back into the sequences: a degraded latch inside
++ * @flush is the caller's to report afterwards (ppe_sr_seq_fault()).
++ */
++struct ppe_sr_io {
++	void *ctx;
++	int (*rd)(void *ctx, u32 addr, u32 *val, unsigned int words);
++	int (*wr)(void *ctx, u32 addr, const u32 *val, unsigned int words);
++	unsigned int (*flush)(void *ctx, enum ppe_sr_flush what, u32 arg);
++	int (*claim)(void *ctx, u32 *sw_gen, u16 *s_ports);
++	bool (*move)(void *ctx, u8 from, u8 to);
++	void (*release)(void *ctx);
++	void (*state)(void *ctx, u8 from, u8 to);
++	void (*log)(void *ctx, int level, const char *fmt, va_list ap) __printf(3, 0);
++};
++
++/**
++ * struct ppe_sr_cfg - What an arm is for, fixed until the disarm.
++ * @ppe_port: The conduit's PPE port.
++ * @l3_if: Its L3 interface (its MY_MAC entry is @l3_if - 1).
++ * @ctype_ports: The other PPE ports whose egress must stay C-type.
++ * @mac: The conduit's MAC address.
++ * @sw_gen: rtl8_4s_tagger_data::sw_gen when the plan was built (A2).
++ * @s_ports: rtl8_4s_tagger_data::s_ports then.
++ */
++struct ppe_sr_cfg {
++	u8 ppe_port;
++	u8 l3_if;
++	u8 ctype_ports;
++	u8 mac[6];
++	u32 sw_gen;
++	u16 s_ports;
++};
++
++/**
++ * struct ppe_sr_id - An identity: a class's XLT entry and L3 interface.
++ * @cls: Its class.
++ * @used: The slot holds an identity.
++ * @live: Installed (and, at arm, verified): offers may key flows on it.
++ * @set: PPE_SR_ID_* entries that may be S-R's.
++ * @xlt: Its XLT entry and counter.
++ * @l3_if: Its ingress L3 interface.
++ * @l3if_old: What @l3_if held before (inert), written back at removal.
++ * @l3if_new: The copy written to @l3_if.
++ */
++struct ppe_sr_id {
++	struct ppe_sr_class cls;
++	u8 used;
++	u8 live;
++	u8 set;
++	u8 xlt;
++	u8 l3_if;
++	u32 l3if_old[PPE_IN_L3_IF_TBL_WORDS];
++	u32 l3if_new[PPE_IN_L3_IF_TBL_WORDS];
++};
++
++/**
++ * struct ppe_sr_op - A diff operation.
++ * @code: enum ppe_sr_op_code.
++ * @slot: The identity slot it acts on.
++ * @ports: PPE_SR_OP_FLUSH_PORT's switch ports.
++ * @cls: PPE_SR_OP_ALLOC's class.
++ */
++struct ppe_sr_op {
++	u8 code;
++	u8 slot;
++	u16 ports;
++	struct ppe_sr_class cls;
++};
++
++/**
++ * struct ppe_sr_id_cnt - An identity's hardware counters.
++ * @xlt: Its XLT counter: frames its rule gave the identity.
++ * @rt_in: Its L3 interface's ingress counters.
++ * @rt_eg: Its L3 interface's egress counters.
++ */
++struct ppe_sr_id_cnt {
++	struct ppe_sr_cnt xlt;
++	struct ppe_sr_cnt rt_in;
++	struct ppe_sr_cnt rt_eg;
++};
++
++/**
++ * struct ppe_sr_seq - The S-R mode's memory state and write records.
++ * @cfg: What the arm is for.
++ * @state: enum ppe_sr_state; stored with WRITE_ONCE() for lockless readers.
++ * @step: enum ppe_sr_step of the last failure.
++ * @err: Its error.
++ * @fault: enum ppe_sr_fault, latched until reboot.
++ * @fault_step: The step that latched it.
++ * @fault_err: Its error.
++ * @degrade: Set when the caller must latch priv->degraded; the caller
++ * clears it.
++ * @rec: PPE_SR_REC_* writes that may be in place.
++ * @stpid_pre: The egress TPID register before the arm.
++ * @cpu_pre: The CPU port's egress VLAN register before the arm.
++ * @role_pre: The conduit's PORT_PARSING register before the arm.
++ * @bind_pre: Its L3_VP_PORT_TBL entry before the arm.
++ * @tmpl: The conduit's ingress L3 interface the identities copy.
++ * @xlt_busy: XLT entries 0..63 that are not S-R's to take (found at the
++ * arm: a valid rule, words left in the rule or action, or a counter a valid
++ * rule's action names).
++ * @l3if_inert: L3 interfaces found inert at the arm, PPE_SR_L3IF_FIRST on.
++ * @nid: Slots in use.
++ * @id: The identities, by slot; a flow names its identity by slot.
++ */
++struct ppe_sr_seq {
++	struct ppe_sr_cfg cfg;
++	u8 state;
++	u8 step;
++	int err;
++	u8 fault;
++	u8 fault_step;
++	int fault_err;
++	bool degrade;
++	u8 rec;
++	u32 stpid_pre;
++	u32 cpu_pre;
++	u32 role_pre;
++	u32 bind_pre[PPE_L3_VP_PORT_TBL_WORDS];
++	u32 tmpl[PPE_IN_L3_IF_TBL_WORDS];
++	u64 xlt_busy;
++	u64 l3if_inert[PPE_IN_L3_IF_TBL_ENTRIES / 64];
++	unsigned int nid;
++	struct ppe_sr_id id[PPE_SR_ID_MAX];
++};
++
++const char *ppe_sr_state_name(unsigned int state);
++const char *ppe_sr_fault_name(unsigned int fault);
++const char *ppe_sr_step_name(unsigned int step);
++
++int ppe_sr_seq_precheck(struct ppe_sr_seq *seq, const struct ppe_sr_io *io);
++int ppe_sr_seq_alloc(struct ppe_sr_seq *seq, const struct ppe_sr_io *io,
++		     const struct ppe_sr_class *plan, unsigned int n);
++int ppe_sr_seq_apply(struct ppe_sr_seq *seq, const struct ppe_sr_io *io);
++int ppe_sr_seq_verify(struct ppe_sr_seq *seq, const struct ppe_sr_io *io, enum ppe_sr_verify how);
++int ppe_sr_seq_revert(struct ppe_sr_seq *seq, const struct ppe_sr_io *io);
++unsigned int ppe_sr_diff(const struct ppe_sr_id *old, const struct ppe_sr_class *plan,
++			 unsigned int n, bool recopy, u16 flush_ports, struct ppe_sr_op *ops,
++			 unsigned int *declined);
++int ppe_sr_seq_exec(struct ppe_sr_seq *seq, const struct ppe_sr_io *io,
++		    const struct ppe_sr_op *ops, unsigned int n,
++		    const u32 tmpl[PPE_IN_L3_IF_TBL_WORDS], unsigned int *failed);
++
++int ppe_sr_seq_arm(struct ppe_sr_seq *seq, const struct ppe_sr_io *io,
++		   const struct ppe_sr_cfg *cfg, const struct ppe_sr_class *plan, unsigned int n,
++		   enum ppe_sr_why *why);
++int ppe_sr_seq_offers(struct ppe_sr_seq *seq, const struct ppe_sr_io *io, bool on);
++int ppe_sr_seq_disarm(struct ppe_sr_seq *seq, const struct ppe_sr_io *io);
++int ppe_sr_seq_resync(struct ppe_sr_seq *seq, const struct ppe_sr_io *io,
++		      const struct ppe_sr_class *plan, unsigned int n, bool recopy,
++		      u16 flush_ports, struct ppe_sr_op *ops, unsigned int *declined);
++void ppe_sr_seq_fault(struct ppe_sr_seq *seq, const struct ppe_sr_io *io,
++		      enum ppe_sr_fault why, enum ppe_sr_step step, int err);
++
++int ppe_sr_seq_boot_check(const struct ppe_sr_io *io, u8 ppe_port);
++int ppe_sr_seq_id_find(const struct ppe_sr_seq *seq, const struct ppe_sr_class *cls);
++int ppe_sr_seq_id_counters(const struct ppe_sr_seq *seq, const struct ppe_sr_io *io,
++			   unsigned int slot, struct ppe_sr_id_cnt *c);
++
++#endif /* __PPE_SR_SEQ_H__ */
