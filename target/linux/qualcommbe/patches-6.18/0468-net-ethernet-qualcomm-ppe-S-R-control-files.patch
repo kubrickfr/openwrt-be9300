@@ -1,0 +1,1270 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: S-R control files
+
+The S-R mode has been driven by nothing so far. This patch adds the five
+debugfs files its one controller, /usr/sbin/ppe-sr, uses (WP3-DESIGN
+§4.1), next to the offload's own:
+
+  offload_sr         0600  arm <s> [offers] | offers on|off |
+                           deadline <s> | disarm | uninhibit <gen>
+  offload_sr_scope   0600  class <port> <U|T> <vid> | client any|<a.b.c.d>
+                           | commit
+  offload_sr_status  0400  the status, from memory alone
+  offload_sr_hw      0400  the idle verify and the identities' counters
+  offload_sr_guard   0200  "1": the bounded disarm without RTNL
+
+A write returns its length or the error of what it ran, and each verb is
+counted. arm and deadline take seconds from 60 to 86400; uninhibit takes
+the generation read from the status before the enable began, so that a
+stop that overlapped the enable keeps arms refused.
+
+The locks follow the existing order: the parameter lock, RTNL, the
+offload lock. arm takes all three; while RTNL is busy the write restarts
+rather than wait unkillably, since rtnl_lock_killable() is not exported.
+offers and deadline take the parameter lock and the offload lock; disarm,
+uninhibit and the reads only the offload lock, killably; the guard the
+offload lock only, for 2 s at most. The parameter lock also checks that
+the file's offload is still the instance.
+
+A scope is written as lines and put in force by a commit, which sorts the
+classes, refuses a class given twice or classes without a client line,
+and denies everything when no class is given. Lines may be split across
+writes; each write takes the parameter lock and RTNL before it parses, so
+that a restart finds the open file's edit unchanged and two writers of
+one file are serialized. A line that does not parse fails its write and
+every later commit on that open file. A port outside 0-9, a VID outside
+1-4094 or in 3900-3919, a malformed address, more than 330 classes or 64
+clients, or "client any" with a list are such lines.
+
+The status is printed from a copy taken under the lock, as "key value"
+lines in a fixed order, and calls no register accessor. offload_stop()
+removes the files before it takes any lock.
+
+Signed-off-by: François Guerraz <kubrick@fgv6.net>
+---
+ drivers/net/ethernet/qualcomm/ppe/Makefile      |    3 
+ drivers/net/ethernet/qualcomm/ppe/ppe_offload.c |   79 +++
+ drivers/net/ethernet/qualcomm/ppe/ppe_offload.h |   24 +
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_cli.c  |  586 +++++++++++++++++++++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_cli.h  |   98 ++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_ctl.c  |  340 +++++++++++++
+ 6 files changed, 1129 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/Makefile
++++ b/drivers/net/ethernet/qualcomm/ppe/Makefile
+@@ -7,7 +7,8 @@ obj-$(CONFIG_QCOM_PPE) += qcom-ppe.o
+ qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o
+ qcom-ppe-objs += ppe_flow.o ppe_flow_ipv4.o ppe_host.o ppe_host_ipv4.o ppe_host_pool.o \
+ 		 ppe_nexthop.o ppe_nexthop_pool.o ppe_l3_if.o ppe_pub_ip.o ppe_pub_ip_pool.o \
+-		 ppe_offload.o ppe_sr.o ppe_sr_eng.o ppe_sr_hw.o ppe_sr_seq.o ppe_sr_topo.o
++		 ppe_offload.o ppe_sr.o ppe_sr_cli.o ppe_sr_ctl.o ppe_sr_eng.o ppe_sr_hw.o \
++		 ppe_sr_seq.o ppe_sr_topo.o
+ 
+ #EDMA
+ qcom-ppe-objs += edma.o edma_cfg_rx.o edma_cfg_tx.o edma_debugfs.o edma_port.o edma_rx.o edma_tx.o edma_ethtool.o
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -233,6 +233,8 @@
+ #include <linux/ppp_defs.h>
+ #include <linux/regmap.h>
+ #include <linux/rtnetlink.h>
++#include <linux/sched.h>
++#include <linux/sched/signal.h>
+ #include <net/dsa.h>
+ #if IS_ENABLED(CONFIG_NET_DSA)
+ #include <linux/dsa/rtl8_4s.h>
+@@ -677,6 +679,7 @@ struct ppe_offload_counters {
+  * @flows_dentry: The debugfs listing of what is tracked.
+  * @flows_hw_dentry: The debugfs listing of the tracked flows' entries as
+  * hardware has them.
++ * @sr_dentry: The S-R control files (ppe_sr_ctl.c).
+  * @binds: This driver's flow block callbacks, see ppe_offload_unbind();
+  * under @lock.
+  * @counters: See struct ppe_offload_counters.
+@@ -737,6 +740,7 @@ struct ppe_offload_priv {
+ 	struct dentry *profile_dentry;
+ 	struct dentry *flows_dentry;
+ 	struct dentry *flows_hw_dentry;
++	struct dentry *sr_dentry[PPE_SR_CTL_FILES];
+ 	struct list_head binds;
+ 	struct ppe_offload_counters counters;
+ 	unsigned long rearm_window;
+@@ -777,6 +781,25 @@ void ppe_offload_set_degraded(struct ppe_offload_priv *priv)
+ 	ppe_sr_degraded(&priv->sr);
+ }
+ 
++/**
++ * ppe_offload_sr_flags() - The offload's flags, for the S-R status.
++ * @priv: The offload.
++ * @enabled: Set to whether flows are accepted.
++ * @degraded: Set to whether it latched degraded.
++ * @tripped: Set to whether it tripped.
++ *
++ * Under priv->lock.
++ */
++void ppe_offload_sr_flags(struct ppe_offload_priv *priv, bool *enabled, bool *degraded,
++			  bool *tripped)
++{
++	lockdep_assert_held(&priv->lock);
++
++	*enabled = priv->enabled;
++	*degraded = priv->degraded;
++	*tripped = priv->tripped;
++}
++
+ /**
+  * ppe_offload_sr() - The S-R mode of an offload.
+  * @priv: The offload.
+@@ -6478,6 +6501,48 @@ static const struct kernel_param_ops ppe_offload_param_ops = {
+ 	.get = ppe_offload_param_get,
+ };
+ 
++/**
++ * ppe_offload_ctl_lock() - Take the locks an S-R control write needs.
++ * @priv: The offload the file belongs to.
++ * @rtnl: Take RTNL too.
++ *
++ * ppe_offload_param_lock, killably, then RTNL if @rtnl (WP3-DESIGN §4.1,
++ * G9). RTNL is only tried: while it is busy the write is restarted, so that
++ * a writer waiting for it stays killable (rtnl_lock_killable() is not
++ * exported). Restarting is safe: nothing was changed yet.
++ *
++ * Return: 0 with the locks held, -EINTR if killed, -ENODEV if @priv is not
++ * (or no longer) the offload instance, or -ERESTARTNOINTR to restart.
++ */
++int ppe_offload_ctl_lock(struct ppe_offload_priv *priv, bool rtnl)
++{
++	if (mutex_lock_killable(&ppe_offload_param_lock))
++		return -EINTR;
++	if (ppe_offload_instance != priv) {
++		mutex_unlock(&ppe_offload_param_lock);
++		return -ENODEV;
++	}
++	if (rtnl && !rtnl_trylock()) {
++		mutex_unlock(&ppe_offload_param_lock);
++		schedule_timeout_killable(1);
++		return restart_syscall();
++	}
++
++	return 0;
++}
++
++/**
++ * ppe_offload_ctl_unlock() - Release what ppe_offload_ctl_lock() took.
++ * @priv: The offload.
++ * @rtnl: RTNL was taken.
++ */
++void ppe_offload_ctl_unlock(struct ppe_offload_priv *priv, bool rtnl)
++{
++	if (rtnl)
++		rtnl_unlock();
++	mutex_unlock(&ppe_offload_param_lock);
++}
++
+ module_param_cb(flow_offload, &ppe_offload_param_ops, NULL, 0644);
+ 
+ /* Offload tripped (ppe_offload_rearm_trip()): turn it off as writing 0 to
+@@ -6608,6 +6673,7 @@ int ppe_offload_port_l3_if_bind(struct ppe_device *ppe_dev, u32 port, u32 l3_if)
+ void ppe_offload_start(struct ppe_device *ppe_dev)
+ {
+ 	struct ppe_offload_priv *priv = ppe_dev->offload;
++	unsigned int i;
+ 
+ 	if (!priv)
+ 		return;
+@@ -6625,6 +6691,11 @@ void ppe_offload_start(struct ppe_device *ppe_dev)
+ 		priv->pin_dentry = debugfs_create_file("offload_pppoe_pin", 0600,
+ 						       ppe_dev->debugfs_root, priv,
+ 						       &ppe_offload_pin_fops);
++		for (i = 0; i < PPE_SR_CTL_FILES; i++)
++			priv->sr_dentry[i] = debugfs_create_file(ppe_sr_ctl_files[i].name,
++								 ppe_sr_ctl_files[i].mode,
++								 ppe_dev->debugfs_root, priv,
++								 ppe_sr_ctl_files[i].fops);
+ 	}
+ 
+ 	ppe_sr_start(&priv->sr);
+@@ -6647,10 +6718,18 @@ void ppe_offload_start(struct ppe_device *ppe_dev)
+ void ppe_offload_stop(struct ppe_device *ppe_dev)
+ {
+ 	struct ppe_offload_priv *priv = ppe_dev->offload;
++	unsigned int i;
+ 
+ 	if (!priv)
+ 		return;
+ 
++	/* The S-R controls first, before any lock: removal waits for a write
++	 * in progress, which may hold or wait for the locks taken below.
++	 */
++	for (i = 0; i < PPE_SR_CTL_FILES; i++) {
++		debugfs_remove(priv->sr_dentry[i]);
++		priv->sr_dentry[i] = NULL;
++	}
+ 	debugfs_remove(priv->profile_dentry);
+ 	priv->profile_dentry = NULL;
+ 	debugfs_remove(priv->flows_dentry);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.h
+@@ -34,5 +34,29 @@ unsigned int ppe_offload_sr_flows_check(struct ppe_offload_priv *priv, unsigned
+ 					unsigned int *dn);
+ void ppe_offload_sr_dn_counts(struct ppe_offload_priv *priv, u32 dn[PPE_SR_ID_MAX]);
+ int ppe_offload_sr_precheck(struct ppe_offload_priv *priv, u32 port, const char **what);
++void ppe_offload_sr_flags(struct ppe_offload_priv *priv, bool *enabled, bool *degraded,
++			  bool *tripped);
++
++/* For the S-R control files (ppe_sr_ctl.c, WP3-DESIGN §4.1). */
++int ppe_offload_ctl_lock(struct ppe_offload_priv *priv, bool rtnl);
++void ppe_offload_ctl_unlock(struct ppe_offload_priv *priv, bool rtnl);
++
++#define PPE_SR_CTL_FILES	5
++
++/**
++ * struct ppe_sr_ctl_file - An S-R control file in the PPE's debugfs
++ * directory, created by ppe_offload_start() with the offload as its data
++ * and removed first thing by ppe_offload_stop().
++ * @name: Its name.
++ * @mode: Its mode.
++ * @fops: Its operations.
++ */
++struct ppe_sr_ctl_file {
++	const char *name;
++	umode_t mode;
++	const struct file_operations *fops;
++};
++
++extern const struct ppe_sr_ctl_file ppe_sr_ctl_files[PPE_SR_CTL_FILES];
+ 
+ #endif
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_cli.c
+@@ -0,0 +1,586 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * S-R control files, the parsers and printers: see ppe_sr_cli.h.
++ *
++ * offload_sr takes one verb per write (WP3-DESIGN §4.2):
++ *
++ *   arm <s> [offers] | offers on|off | deadline <s> | disarm | uninhibit <gen>
++ *
++ * with <s> in 60..86400 and <gen> a u32, in decimal without a sign or a
++ * leading zero, words separated by spaces or tabs, and at most one newline,
++ * at the end.
++ *
++ * offload_sr_scope takes lines (§4.3), each ending in a newline and at most
++ * PPE_SR_SCOPE_LINE_MAX bytes long without it, carried over from one write
++ * to the next:
++ *
++ *   class <port 0..9> <U|T> <vid 1..4094, not 3900..3919>
++ *   client any | client <a.b.c.d>
++ *   commit
++ *
++ * An empty line is ignored. At most PPE_SR_SCOPE_CLS_MAX classes and
++ * PPE_SR_SCOPE_CLIENTS_MAX clients; "client any" excludes a list, and a
++ * client is listed once. A line that does not parse fails its write
++ * (-EINVAL), and every later commit on the same open file. A commit sorts
++ * the classes, refuses a class given twice, or classes without a client
++ * line, gives no scope (every class denied) for no class, has the caller
++ * put the result in force, and starts the next scope empty.
++ */
++#ifndef RTL8_4S_PURE
++#define RTL8_4S_PURE
++#endif
++#include <linux/array_size.h>
++#include <linux/compiler.h>
++#include <linux/errno.h>
++#include <linux/sort.h>
++#include <linux/stdarg.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/dsa/rtl8_4s.h>
++
++#include "ppe_sr.h"
++#include "ppe_sr_cli.h"
++#include "ppe_sr_eng.h"
++#include "ppe_sr_hw.h"
++#include "ppe_sr_seq.h"
++#include "ppe_sr_topo.h"
++
++#define CLI_VID_MAX	4094
++#define CLI_WORDS_MAX	4
++
++static const char * const ppe_sr_verb_names[PPE_SR_V_NUM] = {
++	[PPE_SR_V_ARM] = "arm",
++	[PPE_SR_V_OFFERS] = "offers",
++	[PPE_SR_V_DEADLINE] = "deadline",
++	[PPE_SR_V_DISARM] = "disarm",
++	[PPE_SR_V_UNINHIBIT] = "uninhibit",
++};
++
++/* The rtl8_4s state word's bytes (enum rtl8_4s_sw_state, rtl8_4s_ppe_state). */
++static const char * const cli_sw_names[] = {
++	[RTL8_4S_SW_OFF] = "off",
++	[RTL8_4S_SW_ARMING] = "arming",
++	[RTL8_4S_SW_READY] = "ready",
++	[RTL8_4S_SW_DISARMING] = "disarming",
++	[RTL8_4S_SW_FAULT] = "fault",
++};
++
++static const char * const cli_ppe_names[] = {
++	[RTL8_4S_PPE_OFF] = "off",
++	[RTL8_4S_PPE_SR_READY] = "sr_ready",
++	[RTL8_4S_PPE_ACTIVE] = "active",
++	[RTL8_4S_PPE_FAULT] = "fault",
++};
++
++static const char * const cli_last_kinds[] = {
++	[PPE_SR_LAST_NONE] = "none",
++	[PPE_SR_LAST_ARM] = "arm",
++	[PPE_SR_LAST_DISARM] = "disarm",
++	[PPE_SR_LAST_OFFERS_OFF] = "offers_off",
++};
++
++/**
++ * ppe_sr_verb_name() - Name of a control verb.
++ * @verb: enum ppe_sr_verb.
++ *
++ * Return: its name, "?" if out of range.
++ */
++const char *ppe_sr_verb_name(unsigned int verb)
++{
++	return verb < PPE_SR_V_NUM ? ppe_sr_verb_names[verb] : "?";
++}
++
++static const char *cli_name(const char * const *names, unsigned int n, unsigned int i)
++{
++	return i < n && names[i] ? names[i] : "?";
++}
++
++struct cli_word {
++	const char *s;
++	size_t len;
++};
++
++/* Split @len bytes at @s into words separated by spaces or tabs. Return:
++ * the words, at most @max, or @max + 1 if there are more.
++ */
++static unsigned int cli_split(const char *s, size_t len, struct cli_word *w, unsigned int max)
++{
++	unsigned int n = 0;
++	size_t i = 0, b;
++
++	while (i < len) {
++		if (s[i] == ' ' || s[i] == '\t') {
++			i++;
++			continue;
++		}
++		if (n == max)
++			return max + 1;
++		b = i;
++		while (i < len && s[i] != ' ' && s[i] != '\t')
++			i++;
++		w[n].s = s + b;
++		w[n].len = i - b;
++		n++;
++	}
++
++	return n;
++}
++
++static bool cli_is(const struct cli_word *w, const char *word)
++{
++	size_t n = strlen(word);
++
++	return w->len == n && !memcmp(w->s, word, n);
++}
++
++/* A decimal number of at most 10 digits, without a sign or a leading zero,
++ * in @min..@max.
++ */
++static int cli_u32(const struct cli_word *w, u32 min, u32 max, u32 *val)
++{
++	u64 v = 0;
++	size_t i;
++
++	if (!w->len || w->len > 10 || (w->len > 1 && w->s[0] == '0'))
++		return -EINVAL;
++	for (i = 0; i < w->len; i++) {
++		if (w->s[i] < '0' || w->s[i] > '9')
++			return -EINVAL;
++		v = v * 10 + (w->s[i] - '0');
++	}
++	if (v < min || v > max)
++		return -EINVAL;
++	*val = v;
++
++	return 0;
++}
++
++/**
++ * ppe_sr_cmd_parse() - Parse one offload_sr write.
++ * @buf: The bytes written, not NUL-terminated.
++ * @len: Their number.
++ * @cmd: Filled in.
++ *
++ * Return: 0, or -EINVAL for anything but one verb with its arguments in
++ * range, and one newline at most, at the end.
++ */
++int ppe_sr_cmd_parse(const char *buf, size_t len, struct ppe_sr_cmd *cmd)
++{
++	struct cli_word w[CLI_WORDS_MAX];
++	unsigned int n;
++
++	memset(cmd, 0, sizeof(*cmd));
++	if (len && buf[len - 1] == '\n')
++		len--;
++	if (!len || len >= PPE_SR_CMD_MAX || memchr(buf, '\n', len) || memchr(buf, '\0', len))
++		return -EINVAL;
++	n = cli_split(buf, len, w, 3);
++	if (!n || n > 3)
++		return -EINVAL;
++
++	if (cli_is(&w[0], "arm") && (n == 2 || (n == 3 && cli_is(&w[2], "offers")))) {
++		cmd->verb = PPE_SR_V_ARM;
++		cmd->on = n == 3;
++		return cli_u32(&w[1], PPE_SR_SECS_MIN, PPE_SR_SECS_MAX, &cmd->secs);
++	}
++	if (cli_is(&w[0], "offers") && n == 2 && (cli_is(&w[1], "on") || cli_is(&w[1], "off"))) {
++		cmd->verb = PPE_SR_V_OFFERS;
++		cmd->on = cli_is(&w[1], "on");
++		return 0;
++	}
++	if (cli_is(&w[0], "deadline") && n == 2) {
++		cmd->verb = PPE_SR_V_DEADLINE;
++		return cli_u32(&w[1], PPE_SR_SECS_MIN, PPE_SR_SECS_MAX, &cmd->secs);
++	}
++	if (cli_is(&w[0], "disarm") && n == 1) {
++		cmd->verb = PPE_SR_V_DISARM;
++		return 0;
++	}
++	if (cli_is(&w[0], "uninhibit") && n == 2) {
++		cmd->verb = PPE_SR_V_UNINHIBIT;
++		return cli_u32(&w[1], 0, ~0U, &cmd->gen);
++	}
++
++	return -EINVAL;
++}
++
++/**
++ * ppe_sr_guard_parse() - Parse one offload_sr_guard write.
++ * @buf: The bytes written, not NUL-terminated.
++ * @len: Their number.
++ *
++ * Return: 0 for "1", with or without a newline; -EINVAL for anything else.
++ */
++int ppe_sr_guard_parse(const char *buf, size_t len)
++{
++	if (len && buf[len - 1] == '\n')
++		len--;
++
++	return len == 1 && buf[0] == '1' ? 0 : -EINVAL;
++}
++
++/**
++ * ppe_sr_ipv4_parse() - Parse a dotted-quad IPv4 address.
++ * @s: The address, not NUL-terminated.
++ * @len: Its length.
++ * @addr: Set to the address, in network order.
++ *
++ * Return: 0, or -EINVAL unless four decimal octets of one to three digits
++ * each, without a leading zero (but "0" itself), up to 255, separated by
++ * single dots, and nothing else.
++ */
++int ppe_sr_ipv4_parse(const char *s, size_t len, __be32 *addr)
++{
++	unsigned int o = 0, v = 0, digits = 0;
++	u8 b[4];
++	size_t i;
++
++	for (i = 0; i <= len; i++) {
++		if (i == len || s[i] == '.') {
++			if (!digits || o == ARRAY_SIZE(b))
++				return -EINVAL;
++			b[o++] = v;
++			v = 0;
++			digits = 0;
++			continue;
++		}
++		if (s[i] < '0' || s[i] > '9' || (digits && !v))
++			return -EINVAL;
++		v = v * 10 + (s[i] - '0');
++		if (++digits > 3 || v > 255)
++			return -EINVAL;
++	}
++	if (o != ARRAY_SIZE(b))
++		return -EINVAL;
++	memcpy(addr, b, sizeof(b));
++
++	return 0;
++}
++
++/**
++ * ppe_sr_scope_edit_init() - Start an open file's scope edit, empty.
++ * @e: The edit.
++ */
++void ppe_sr_scope_edit_init(struct ppe_sr_scope_edit *e)
++{
++	memset(e, 0, sizeof(*e));
++}
++
++static int cli_class_cmp(const void *a, const void *b)
++{
++	return ppe_sr_class_cmp(a, b);
++}
++
++/**
++ * ppe_sr_scope_finish() - Make the scope to commit.
++ * @scope: The classes and clients given, classes in the order given;
++ * sorted in place.
++ * @client_line: A client line was given.
++ * @out: Set to @scope, or to NULL (no scope: every class denied) when no
++ * class was given.
++ *
++ * Return: 0, or -EINVAL for classes without a client line, a class given
++ * twice, or a scope ppe_sr_scope_check() refuses.
++ */
++int ppe_sr_scope_finish(struct ppe_sr_scope *scope, bool client_line,
++			const struct ppe_sr_scope **out)
++{
++	unsigned int i;
++
++	*out = NULL;
++	if (!scope->ncls)
++		return 0;
++	if (!client_line || scope->ncls > PPE_SR_SCOPE_CLS_MAX)
++		return -EINVAL;
++	sort(scope->cls, scope->ncls, sizeof(scope->cls[0]), cli_class_cmp, NULL);
++	for (i = 1; i < scope->ncls; i++)
++		if (!ppe_sr_class_cmp(&scope->cls[i - 1], &scope->cls[i]))
++			return -EINVAL;
++	if (ppe_sr_scope_check(scope))
++		return -EINVAL;
++	*out = scope;
++
++	return 0;
++}
++
++/* One scope line without its newline. Return: 0, 1 for a commit, or
++ * -EINVAL.
++ */
++static int cli_scope_line(struct ppe_sr_scope_edit *e, const char *s, size_t len)
++{
++	struct ppe_sr_scope *sc = &e->scope;
++	struct cli_word w[CLI_WORDS_MAX];
++	unsigned int n, i;
++	u32 port, vid;
++	__be32 ip;
++
++	n = cli_split(s, len, w, CLI_WORDS_MAX);
++	if (!n)
++		return 0;
++	if (n == 1 && cli_is(&w[0], "commit"))
++		return 1;
++
++	if (n == 4 && cli_is(&w[0], "class")) {
++		if (cli_u32(&w[1], 0, PPE_SR_PORTS - 1, &port) ||
++		    !(cli_is(&w[2], "U") || cli_is(&w[2], "T")) ||
++		    cli_u32(&w[3], 1, CLI_VID_MAX, &vid) || rtl8_4s_vid_reserved(vid) ||
++		    sc->ncls >= PPE_SR_SCOPE_CLS_MAX)
++			return -EINVAL;
++		sc->cls[sc->ncls++] = (struct ppe_sr_class){
++			.port = port, .form = cli_is(&w[2], "T") ? PPE_SR_T : PPE_SR_U, .vid = vid,
++		};
++		return 0;
++	}
++
++	if (n == 2 && cli_is(&w[0], "client")) {
++		if (cli_is(&w[1], "any")) {
++			if (sc->any_client || sc->nclients)
++				return -EINVAL;
++			sc->any_client = true;
++		} else {
++			if (sc->any_client || sc->nclients >= PPE_SR_SCOPE_CLIENTS_MAX ||
++			    ppe_sr_ipv4_parse(w[1].s, w[1].len, &ip))
++				return -EINVAL;
++			for (i = 0; i < sc->nclients; i++)
++				if (sc->clients[i] == ip)
++					return -EINVAL;
++			sc->clients[sc->nclients++] = ip;
++		}
++		e->client_line = true;
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
++/**
++ * ppe_sr_scope_edit_feed() - Feed one offload_sr_scope write.
++ * @e: The open file's edit.
++ * @buf: The bytes written, not NUL-terminated.
++ * @len: Their number.
++ * @commit: Puts a committed scope in force.
++ * @ctx: Passed to @commit.
++ *
++ * The caller serializes the writes of one open file, and takes what
++ * @commit needs before it calls this, so that nothing in @e changes before
++ * it can no longer fail for want of a lock. Every line is consumed, the
++ * last partial one kept for the next write. A line that does not parse
++ * latches @e->bad; a commit then fails, and otherwise has @commit put the
++ * scope finished (ppe_sr_scope_finish()) in force; either way the next
++ * scope starts empty.
++ *
++ * Return: 0, or the first error: -EINVAL for a line that does not parse or
++ * a commit refused, else @commit's.
++ */
++int ppe_sr_scope_edit_feed(struct ppe_sr_scope_edit *e, const char *buf, size_t len,
++			   ppe_sr_commit_fn commit, void *ctx)
++{
++	const struct ppe_sr_scope *out;
++	int ret = 0, r;
++	size_t i;
++
++	for (i = 0; i < len; i++) {
++		char c = buf[i];
++
++		if (c != '\n') {
++			if (e->skip)
++				continue;
++			if (e->len == PPE_SR_SCOPE_LINE_MAX || !c)
++				e->skip = true;
++			else
++				e->line[e->len++] = c;
++			continue;
++		}
++
++		e->lines++;
++		r = e->skip ? -EINVAL : cli_scope_line(e, e->line, e->len);
++		e->len = 0;
++		e->skip = false;
++		if (r < 0) {
++			if (!e->bad)
++				e->bad = e->lines;
++		} else if (r == 1) {
++			r = e->bad ? -EINVAL : ppe_sr_scope_finish(&e->scope, e->client_line, &out);
++			if (!r)
++				r = commit(ctx, out);
++			memset(&e->scope, 0, sizeof(e->scope));
++			e->client_line = false;
++		}
++		if (r < 0 && !ret)
++			ret = r;
++	}
++
++	return ret;
++}
++
++static __printf(2, 3) void cli_out(const struct ppe_sr_out *o, const char *fmt, ...)
++{
++	va_list ap;
++
++	va_start(ap, fmt);
++	o->vprintf(o->ctx, fmt, ap);
++	va_end(ap);
++}
++
++/**
++ * ppe_sr_scope_print() - The offload_sr_scope read (WP3-DESIGN §4.3).
++ * @scope: The scope in force, NULL for none.
++ * @gen: Scope swaps so far.
++ * @u_uploads: U classes get identities.
++ * @out: Where to.
++ *
++ * "gen G", then the scope in the syntax it is written in (classes sorted,
++ * no commit line), then "u_uploads 0|1".
++ */
++void ppe_sr_scope_print(const struct ppe_sr_scope *scope, u32 gen, bool u_uploads,
++			const struct ppe_sr_out *out)
++{
++	unsigned int i;
++	u8 b[4];
++
++	cli_out(out, "gen %u\n", gen);
++	for (i = 0; scope && i < scope->ncls && i < PPE_SR_SCOPE_CLS_MAX; i++)
++		cli_out(out, "class %u %c %u\n", scope->cls[i].port,
++			scope->cls[i].form == PPE_SR_T ? 'T' : 'U', scope->cls[i].vid);
++	if (scope && scope->any_client)
++		cli_out(out, "client any\n");
++	for (i = 0; scope && i < scope->nclients && i < PPE_SR_SCOPE_CLIENTS_MAX; i++) {
++		memcpy(b, &scope->clients[i], sizeof(b));
++		cli_out(out, "client %u.%u.%u.%u\n", b[0], b[1], b[2], b[3]);
++	}
++	cli_out(out, "u_uploads %u\n", u_uploads);
++}
++
++static void cli_td(const struct ppe_sr_status *st, const struct ppe_sr_out *out, char sep)
++{
++	const char *sw, *pp;
++
++	if (st->td_word < 0) {
++		cli_out(out, "none");
++		return;
++	}
++	sw = cli_name(cli_sw_names, ARRAY_SIZE(cli_sw_names), rtl8_4s_word_sw(st->td_word));
++	pp = cli_name(cli_ppe_names, ARRAY_SIZE(cli_ppe_names), rtl8_4s_word_ppe(st->td_word));
++	if (sep == '/')
++		cli_out(out, "%s/%s", sw, pp);
++	else
++		cli_out(out, "sw %s ppe %s", sw, pp);
++}
++
++static const char *cli_ctl_last(const struct ppe_sr_status *st)
++{
++	return st->ctl_last_verb < 0 ? "none" : ppe_sr_verb_name(st->ctl_last_verb);
++}
++
++/**
++ * ppe_sr_ctl_print() - The offload_sr read (WP3-DESIGN §4.2): one line.
++ * @st: The status (ppe_sr_status_fill()).
++ * @out: Where to.
++ *
++ * "state S td SW/PPE|none inhibit 0|1 inhibit_gen G deadline_in_s N|none
++ * last VERB RET", VERB "none" (RET 0) before the first control verb.
++ */
++void ppe_sr_ctl_print(const struct ppe_sr_status *st, const struct ppe_sr_out *out)
++{
++	cli_out(out, "state %s td ", ppe_sr_state_name(st->state));
++	cli_td(st, out, '/');
++	cli_out(out, " inhibit %u inhibit_gen %u deadline_in_s ", st->inhibit, st->inhibit_gen);
++	if (st->has_deadline)
++		cli_out(out, "%ld", st->deadline_in_s);
++	else
++		cli_out(out, "none");
++	cli_out(out, " last %s %d\n", cli_ctl_last(st), st->ctl_last_ret);
++}
++
++/**
++ * ppe_sr_status_print() - The offload_sr_status read (WP3-DESIGN §4.6).
++ * @st: The status (ppe_sr_status_fill(), and the offload's flags).
++ * @out: Where to.
++ *
++ * Memory only. One line per key, in this order: state, td, inhibit,
++ * inhibit_gen, sw_module_ref, offload, conduit, gen, deadline_in_s,
++ * switch_disarm_in_s, scope, limits, u_uploads, an id line per identity,
++ * accepted, decline_<why> for every reason, trigger_<t> for every trigger,
++ * arm_ok, arm_refused_<why> for every reason, last, fault, inert_fail,
++ * ctl_<verb>_ok and ctl_<verb>_err for every verb, ctl_last, guard_n,
++ * guard_last, guard_busy, renewals, rebind_skipped, resyncs,
++ * resync_declined, moved, move_dropped. A key's value is its first word;
++ * the lines of several values name each but the first.
++ */
++void ppe_sr_status_print(const struct ppe_sr_status *st, const struct ppe_sr_out *out)
++{
++	const struct ppe_sr_last *l = &st->last;
++	unsigned int i;
++
++	cli_out(out, "state %s\n", ppe_sr_state_name(st->state));
++	cli_out(out, "td ");
++	cli_td(st, out, ' ');
++	cli_out(out, "\ninhibit %u\n", st->inhibit);
++	cli_out(out, "inhibit_gen %u\n", st->inhibit_gen);
++	cli_out(out, "sw_module_ref %u\n", st->sw_ref);
++	cli_out(out, "offload enabled %u degraded %u tripped %u\n", st->off_enabled,
++		st->off_degraded, st->off_tripped);
++	cli_out(out, "conduit %s held %u ppe_port %u l3_if %u bridge %d s_ports 0x%03x\n",
++		st->conduit[0] ? st->conduit : "-", st->held, st->ppe_port, st->l3_if,
++		st->bridge_ifindex, st->s_ports);
++	cli_out(out, "gen %u dirty %u dirty_ports 0x%03x\n", st->gen, st->dirty, st->dirty_ports);
++	if (st->has_deadline)
++		cli_out(out, "deadline_in_s %ld\n", st->deadline_in_s);
++	else
++		cli_out(out, "deadline_in_s none\n");
++	if (st->has_sw_deadline)
++		cli_out(out, "switch_disarm_in_s %ld\n", st->sw_deadline_in_s);
++	else
++		cli_out(out, "switch_disarm_in_s none\n");
++	cli_out(out, "scope gen %u cls %u clients ", st->scope_gen, st->scoped ? st->scope_cls : 0);
++	if (!st->scoped)
++		cli_out(out, "none\n");
++	else if (st->scope_any)
++		cli_out(out, "any\n");
++	else
++		cli_out(out, "%u\n", st->scope_clients);
++	cli_out(out, "limits ids %u xlt %u-%u l3_if %u-%u cls %u clients %u\n", PPE_SR_ID_MAX,
++		PPE_SR_XLT_FIRST, PPE_SR_XLT_LAST, PPE_SR_L3IF_FIRST, PPE_SR_L3IF_LAST,
++		PPE_SR_SCOPE_CLS_MAX, PPE_SR_SCOPE_CLIENTS_MAX);
++	cli_out(out, "u_uploads %u\n", st->u_uploads);
++	for (i = 0; i < st->nid && i < PPE_SR_ID_MAX; i++) {
++		const struct ppe_sr_status_id *id = &st->id[i];
++
++		cli_out(out,
++			"id %u p %u form %c vid %u xlt %u l3_if %u live %u up %u dn %u acc_up %u acc_dn %u\n",
++			id->slot, id->cls.port, id->cls.form == PPE_SR_T ? 'T' : 'U', id->cls.vid,
++			id->xlt, id->l3_if, id->live, id->up, id->dn, id->acc_up, id->acc_dn);
++	}
++	cli_out(out, "accepted up %llu dn %llu\n", (unsigned long long)st->accepted[PPE_SR_UP],
++		(unsigned long long)st->accepted[PPE_SR_DN]);
++	for (i = PPE_SR_W_OK + 1; i < PPE_SR_W_NUM; i++)
++		cli_out(out, "decline_%s %llu\n", ppe_sr_why_name(i),
++			(unsigned long long)st->decline[i]);
++	for (i = 0; i < PPE_SR_T_NUM; i++)
++		cli_out(out, "trigger_%s %u\n", ppe_sr_trigger_name(i), st->trig[i]);
++	cli_out(out, "arm_ok %u\n", st->arm_ok);
++	for (i = PPE_SR_W_OK + 1; i < PPE_SR_W_NUM; i++)
++		cli_out(out, "arm_refused_%s %u\n", ppe_sr_why_name(i), st->arm_refused[i]);
++	cli_out(out, "last %s %s err %d ms %u flushed %u stuck %u\n",
++		cli_name(cli_last_kinds, ARRAY_SIZE(cli_last_kinds), l->kind),
++		l->kind == PPE_SR_LAST_NONE ? "-" :
++		l->kind == PPE_SR_LAST_ARM ? ppe_sr_why_name(l->why) :
++		ppe_sr_trigger_name(l->trigger), l->err, l->ms, l->flushed, l->stuck);
++	cli_out(out, "fault %s step %s err %d\n", ppe_sr_fault_name(st->fault),
++		ppe_sr_step_name(st->fault_step), st->fault_err);
++	cli_out(out, "inert_fail %u\n", st->inert_fail);
++	for (i = 0; i < PPE_SR_V_NUM; i++) {
++		cli_out(out, "ctl_%s_ok %u\n", ppe_sr_verb_name(i), st->ctl_ok[i]);
++		cli_out(out, "ctl_%s_err %u\n", ppe_sr_verb_name(i), st->ctl_err[i]);
++	}
++	cli_out(out, "ctl_last %s %d\n", cli_ctl_last(st), st->ctl_last_ret);
++	cli_out(out, "guard_n %u\n", st->guard_n);
++	cli_out(out, "guard_last %d\n", st->guard_last);
++	cli_out(out, "guard_busy %u\n", st->guard_busy);
++	cli_out(out, "renewals %u\n", st->renewals);
++	cli_out(out, "rebind_skipped %u\n", st->rebind_skipped);
++	cli_out(out, "resyncs %u\n", st->resyncs);
++	cli_out(out, "resync_declined %u\n", st->resync_declined);
++	cli_out(out, "moved %u\n", st->moved);
++	cli_out(out, "move_dropped %u\n", st->move_dropped);
++}
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_cli.h
+@@ -0,0 +1,98 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * S-R control files, the parsers and printers (WP3-DESIGN §4.2-§4.6): the
++ * verbs of offload_sr, the scope lines of offload_sr_scope, and the lines
++ * of offload_sr, offload_sr_scope and offload_sr_status. Pure (compiles in
++ * user space with -DPPE_SR_PURE, for the desk harness); ppe_sr_ctl.c binds
++ * them to debugfs.
++ */
++
++#ifndef __PPE_SR_CLI_H__
++#define __PPE_SR_CLI_H__
++
++#include <linux/compiler.h>
++#include <linux/stdarg.h>
++#include <linux/types.h>
++
++#include "ppe_sr.h"
++#include "ppe_sr_eng.h"
++
++/* One offload_sr write holds one verb, in fewer bytes than this. */
++#define PPE_SR_CMD_MAX		64
++/* The seconds of arm and deadline. */
++#define PPE_SR_SECS_MIN		PPE_SR_DEADLINE_MIN_S
++#define PPE_SR_SECS_MAX		86400
++/* A scope line, without its newline, is at most this long. */
++#define PPE_SR_SCOPE_LINE_MAX	48
++
++/**
++ * struct ppe_sr_cmd - A parsed offload_sr verb.
++ * @verb: enum ppe_sr_verb.
++ * @on: arm: offers on after arming; offers: on (else off).
++ * @secs: arm, deadline: seconds from now, PPE_SR_SECS_MIN..PPE_SR_SECS_MAX.
++ * @gen: uninhibit: the inhibit generation.
++ */
++struct ppe_sr_cmd {
++	u8 verb;
++	bool on;
++	u32 secs;
++	u32 gen;
++};
++
++/**
++ * struct ppe_sr_scope_edit - An offload_sr_scope file's scope being written.
++ * @scope: The classes and clients given since the last commit (or open),
++ * classes in the order given.
++ * @client_line: A client line was given since then.
++ * @lines: Lines consumed since open.
++ * @bad: The first line with a syntax error, 0 for none: every commit on
++ * this open file fails from then on.
++ * @len: Bytes in @line.
++ * @skip: The line being read is too long: the rest of it is dropped.
++ * @line: The line being read, carried over from one write to the next.
++ */
++struct ppe_sr_scope_edit {
++	struct ppe_sr_scope scope;
++	bool client_line;
++	unsigned int lines;
++	unsigned int bad;
++	unsigned int len;
++	bool skip;
++	char line[PPE_SR_SCOPE_LINE_MAX + 1];
++};
++
++/**
++ * typedef ppe_sr_commit_fn - Puts a committed scope in force.
++ * @ctx: The caller's.
++ * @scope: The scope, sorted and checked (ppe_sr_scope_finish()); NULL for
++ * none, which denies every class.
++ *
++ * Return: 0 or an error, which the write returns.
++ */
++typedef int (*ppe_sr_commit_fn)(void *ctx, const struct ppe_sr_scope *scope);
++
++/**
++ * struct ppe_sr_out - Where the printers write.
++ * @ctx: Passed to @vprintf.
++ * @vprintf: Append a formatted string.
++ */
++struct ppe_sr_out {
++	void *ctx;
++	void (*vprintf)(void *ctx, const char *fmt, va_list ap) __printf(2, 0);
++};
++
++const char *ppe_sr_verb_name(unsigned int verb);
++int ppe_sr_cmd_parse(const char *buf, size_t len, struct ppe_sr_cmd *cmd);
++int ppe_sr_guard_parse(const char *buf, size_t len);
++int ppe_sr_ipv4_parse(const char *s, size_t len, __be32 *addr);
++void ppe_sr_scope_edit_init(struct ppe_sr_scope_edit *e);
++int ppe_sr_scope_finish(struct ppe_sr_scope *scope, bool client_line,
++			const struct ppe_sr_scope **out);
++int ppe_sr_scope_edit_feed(struct ppe_sr_scope_edit *e, const char *buf, size_t len,
++			   ppe_sr_commit_fn commit, void *ctx);
++void ppe_sr_scope_print(const struct ppe_sr_scope *scope, u32 gen, bool u_uploads,
++			const struct ppe_sr_out *out);
++void ppe_sr_ctl_print(const struct ppe_sr_status *st, const struct ppe_sr_out *out);
++void ppe_sr_status_print(const struct ppe_sr_status *st, const struct ppe_sr_out *out);
++
++#endif /* __PPE_SR_CLI_H__ */
+--- /dev/null
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_ctl.c
+@@ -0,0 +1,340 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * S-R control files in the PPE's debugfs directory (WP3-DESIGN §4.1):
++ *
++ *   offload_sr         0600  one verb per write; read: one state line
++ *   offload_sr_scope   0600  scope lines and commit; read: the scope in force
++ *   offload_sr_status  0400  the status, from memory: safe under load
++ *   offload_sr_hw      0400  the idle verify and counters: reads registers
++ *   offload_sr_guard   0200  "1": the bounded disarm without RTNL
++ *
++ * The syntax is ppe_sr_cli.c's. A write returns its length, or the error of
++ * what it ran. Locks (WP3-DESIGN §4.1, §4.2): arm takes the parameter lock,
++ * then RTNL (ppe_offload_ctl_lock(), which restarts the write while RTNL is
++ * busy, so that it stays killable), then the offload lock; offers and
++ * deadline the parameter lock, then the offload lock, killably; disarm and
++ * uninhibit the offload lock only, killably; the guard the offload lock
++ * only, for PPE_SR_LOCK_WAIT_S at most. A scope write takes the parameter
++ * lock and RTNL before it parses anything, so that a restart finds the edit
++ * as it was and the writers of one open file are serialized; its commits
++ * run under them. The reads take the offload lock killably and print
++ * outside it; the status and state reads call no register accessor.
++ * ppe_offload_stop() removes these files before it takes any lock.
++ */
++
++#include <linux/array_size.h>
++#include <linux/debugfs.h>
++#include <linux/err.h>
++#include <linux/errno.h>
++#include <linux/fs.h>
++#include <linux/jiffies.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/seq_file.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/uaccess.h>
++
++#include "ppe_offload.h"
++#include "ppe_sr.h"
++#include "ppe_sr_cli.h"
++#include "ppe_sr_eng.h"
++
++/* The largest offload_sr_scope write taken at once: a whole scope. */
++#define PPE_SR_CTL_SCOPE_WRITE_MAX	SZ_16K
++/* offload_sr_status's first buffer: the whole status at once. */
++#define PPE_SR_CTL_STATUS_SIZE		SZ_16K
++
++static __printf(2, 0) void ppe_sr_ctl_vprintf(void *ctx, const char *fmt, va_list ap)
++{
++	seq_vprintf(ctx, fmt, ap);
++}
++
++/* The status from memory, the offload lock taken killably. */
++static struct ppe_sr_status *ppe_sr_ctl_status(struct ppe_offload_priv *priv)
++{
++	struct ppe_sr *sr = ppe_offload_sr(priv);
++	struct ppe_sr_status *st;
++
++	st = kzalloc(sizeof(*st), GFP_KERNEL);
++	if (!st)
++		return ERR_PTR(-ENOMEM);
++	if (mutex_lock_killable(sr->lock)) {
++		kfree(st);
++		return ERR_PTR(-EINTR);
++	}
++	ppe_sr_status_fill(priv, st);
++	ppe_offload_sr_flags(priv, &st->off_enabled, &st->off_degraded, &st->off_tripped);
++	mutex_unlock(sr->lock);
++
++	return st;
++}
++
++/* offload_sr read: "state S td SW/PPE inhibit ... last VERB RET". */
++static int ppe_sr_ctl_show(struct seq_file *m, void *v)
++{
++	const struct ppe_sr_out out = { .ctx = m, .vprintf = ppe_sr_ctl_vprintf };
++	struct ppe_sr_status *st = ppe_sr_ctl_status(m->private);
++
++	if (IS_ERR(st))
++		return PTR_ERR(st);
++	ppe_sr_ctl_print(st, &out);
++	kfree(st);
++
++	return 0;
++}
++
++/* Run one verb (WP3-DESIGN §4.2). */
++static int ppe_sr_ctl_run(struct ppe_offload_priv *priv, const struct ppe_sr_cmd *cmd)
++{
++	struct ppe_sr *sr = ppe_offload_sr(priv);
++	unsigned long deadline = jiffies + (unsigned long)cmd->secs * HZ;
++	struct ppe_sr_arm_args args;
++	enum ppe_sr_why why;
++	int ret;
++
++	switch (cmd->verb) {
++	case PPE_SR_V_ARM:
++		ret = ppe_offload_ctl_lock(priv, true);
++		if (ret)
++			return ret;
++		args = (struct ppe_sr_arm_args){ .deadline = deadline, .offers = cmd->on };
++		ret = ppe_sr_arm(priv, &args, &why);
++		ppe_offload_ctl_unlock(priv, true);
++		return ret;
++	case PPE_SR_V_OFFERS:
++	case PPE_SR_V_DEADLINE:
++		ret = ppe_offload_ctl_lock(priv, false);
++		if (ret)
++			return ret;
++		if (mutex_lock_killable(sr->lock)) {
++			ret = -EINTR;
++		} else {
++			if (cmd->verb == PPE_SR_V_OFFERS)
++				ret = ppe_sr_offers(priv, cmd->on);
++			else
++				ret = ppe_sr_deadline_set(priv, deadline);
++			mutex_unlock(sr->lock);
++		}
++		ppe_offload_ctl_unlock(priv, false);
++		return ret;
++	case PPE_SR_V_DISARM:
++		return ppe_sr_disarm_ctl(priv);
++	case PPE_SR_V_UNINHIBIT:
++		return ppe_sr_uninhibit(priv, cmd->gen);
++	}
++
++	return -EINVAL;
++}
++
++static ssize_t ppe_sr_ctl_write(struct file *file, const char __user *ubuf, size_t count,
++				loff_t *ppos)
++{
++	struct seq_file *m = file->private_data;
++	struct ppe_offload_priv *priv = m->private;
++	char buf[PPE_SR_CMD_MAX];
++	struct ppe_sr_cmd cmd;
++	int ret;
++
++	if (!count || count >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, count))
++		return -EFAULT;
++	ret = ppe_sr_cmd_parse(buf, count, &cmd);
++	if (ret)
++		return ret;
++	ret = ppe_sr_ctl_run(priv, &cmd);
++	/* A restarted write runs again: it is counted then. */
++	if (ret != -ERESTARTNOINTR)
++		ppe_sr_ctl_note(priv, cmd.verb, ret);
++
++	return ret ? ret : count;
++}
++
++static int ppe_sr_ctl_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, ppe_sr_ctl_show, inode->i_private);
++}
++
++static const struct file_operations ppe_sr_ctl_fops = {
++	.owner = THIS_MODULE,
++	.open = ppe_sr_ctl_open,
++	.read = seq_read,
++	.write = ppe_sr_ctl_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++/**
++ * struct ppe_sr_ctl_scope - An open offload_sr_scope file.
++ * @priv: The offload.
++ * @edit: The scope being written through it.
++ */
++struct ppe_sr_ctl_scope {
++	struct ppe_offload_priv *priv;
++	struct ppe_sr_scope_edit edit;
++};
++
++/* offload_sr_scope read: "gen G", the scope's lines, "u_uploads 0|1". */
++static int ppe_sr_ctl_scope_show(struct seq_file *m, void *v)
++{
++	const struct ppe_sr_out out = { .ctx = m, .vprintf = ppe_sr_ctl_vprintf };
++	struct ppe_sr_ctl_scope *f = m->private;
++	struct ppe_sr *sr = ppe_offload_sr(f->priv);
++	struct ppe_sr_scope *scope;
++	bool set, u_uploads;
++	u32 gen;
++
++	scope = kmalloc(sizeof(*scope), GFP_KERNEL);
++	if (!scope)
++		return -ENOMEM;
++	if (mutex_lock_killable(sr->lock)) {
++		kfree(scope);
++		return -EINTR;
++	}
++	set = ppe_sr_scope_get(f->priv, scope, &gen, &u_uploads);
++	mutex_unlock(sr->lock);
++	ppe_sr_scope_print(set ? scope : NULL, gen, u_uploads, &out);
++	kfree(scope);
++
++	return 0;
++}
++
++/* A commit: under the parameter lock and RTNL (the write's). */
++static int ppe_sr_ctl_commit(void *ctx, const struct ppe_sr_scope *scope)
++{
++	return ppe_sr_scope_set(ctx, scope);
++}
++
++static ssize_t ppe_sr_ctl_scope_write(struct file *file, const char __user *ubuf, size_t count,
++				      loff_t *ppos)
++{
++	struct seq_file *m = file->private_data;
++	struct ppe_sr_ctl_scope *f = m->private;
++	char *buf;
++	int ret;
++
++	if (!count)
++		return 0;
++	if (count > PPE_SR_CTL_SCOPE_WRITE_MAX)
++		return -EINVAL;
++	buf = memdup_user(ubuf, count);
++	if (IS_ERR(buf))
++		return PTR_ERR(buf);
++	/* Before the edit is touched: a restart finds it unchanged. */
++	ret = ppe_offload_ctl_lock(f->priv, true);
++	if (!ret) {
++		ret = ppe_sr_scope_edit_feed(&f->edit, buf, count, ppe_sr_ctl_commit, f->priv);
++		ppe_offload_ctl_unlock(f->priv, true);
++	}
++	kfree(buf);
++
++	return ret ? ret : count;
++}
++
++static int ppe_sr_ctl_scope_open(struct inode *inode, struct file *file)
++{
++	struct ppe_sr_ctl_scope *f;
++	int ret;
++
++	f = kzalloc(sizeof(*f), GFP_KERNEL);
++	if (!f)
++		return -ENOMEM;
++	f->priv = inode->i_private;
++	ppe_sr_scope_edit_init(&f->edit);
++	ret = single_open(file, ppe_sr_ctl_scope_show, f);
++	if (ret)
++		kfree(f);
++
++	return ret;
++}
++
++static int ppe_sr_ctl_scope_release(struct inode *inode, struct file *file)
++{
++	struct seq_file *m = file->private_data;
++	struct ppe_sr_ctl_scope *f = m->private;
++	int ret;
++
++	ret = single_release(inode, file);
++	kfree(f);
++
++	return ret;
++}
++
++static const struct file_operations ppe_sr_ctl_scope_fops = {
++	.owner = THIS_MODULE,
++	.open = ppe_sr_ctl_scope_open,
++	.read = seq_read,
++	.write = ppe_sr_ctl_scope_write,
++	.llseek = seq_lseek,
++	.release = ppe_sr_ctl_scope_release,
++};
++
++/* offload_sr_status read: memory only, whole (WP3-DESIGN §4.6). */
++static int ppe_sr_ctl_status_show(struct seq_file *m, void *v)
++{
++	const struct ppe_sr_out out = { .ctx = m, .vprintf = ppe_sr_ctl_vprintf };
++	struct ppe_sr_status *st = ppe_sr_ctl_status(m->private);
++
++	if (IS_ERR(st))
++		return PTR_ERR(st);
++	ppe_sr_status_print(st, &out);
++	kfree(st);
++
++	return 0;
++}
++
++static int ppe_sr_ctl_status_open(struct inode *inode, struct file *file)
++{
++	return single_open_size(file, ppe_sr_ctl_status_show, inode->i_private,
++				PPE_SR_CTL_STATUS_SIZE);
++}
++
++static const struct file_operations ppe_sr_ctl_status_fops = {
++	.owner = THIS_MODULE,
++	.open = ppe_sr_ctl_status_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++/* offload_sr_hw read: reads registers, idle only (ppe_sr_hw_show()). */
++static int ppe_sr_ctl_hw_show(struct seq_file *m, void *v)
++{
++	return ppe_sr_hw_show(m->private, m);
++}
++DEFINE_SHOW_ATTRIBUTE(ppe_sr_ctl_hw);
++
++static ssize_t ppe_sr_ctl_guard_write(struct file *file, const char __user *ubuf, size_t count,
++				      loff_t *ppos)
++{
++	struct ppe_offload_priv *priv = file->private_data;
++	char buf[2];
++	int ret;
++
++	if (!count || count > sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, count))
++		return -EFAULT;
++	ret = ppe_sr_guard_parse(buf, count);
++	if (!ret)
++		ret = ppe_sr_guard(priv);
++
++	return ret ? ret : count;
++}
++
++static const struct file_operations ppe_sr_ctl_guard_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = ppe_sr_ctl_guard_write,
++	.llseek = noop_llseek,
++};
++
++const struct ppe_sr_ctl_file ppe_sr_ctl_files[PPE_SR_CTL_FILES] = {
++	{ .name = "offload_sr", .mode = 0600, .fops = &ppe_sr_ctl_fops },
++	{ .name = "offload_sr_scope", .mode = 0600, .fops = &ppe_sr_ctl_scope_fops },
++	{ .name = "offload_sr_status", .mode = 0400, .fops = &ppe_sr_ctl_status_fops },
++	{ .name = "offload_sr_hw", .mode = 0400, .fops = &ppe_sr_ctl_hw_fops },
++	{ .name = "offload_sr_guard", .mode = 0200, .fops = &ppe_sr_ctl_guard_fops },
++};
