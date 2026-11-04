@@ -1351,23 +1351,36 @@ static int rtl8372n_validate_topology(struct dsa_switch *ds, u16 *members)
 static void rtl8372n_quiesce(struct dsa_switch *ds)
 {
 	struct rtl837x_priv *priv = ds->priv;
+	unsigned int cpu_mask = dsa_cpu_ports(ds);
+	int cpu = cpu_mask ? __ffs(cpu_mask) : -1;
 	int port, ret;
 
 	/*
 	 * Best effort on setup failure/teardown; never hide the first error.
-	 * The S-VLAN off values first, the uplink first of all; tagger_data
-	 * and the S-R control state are not touched.
+	 * Isolation first, the CPU port first of all, then the PHYs down (no
+	 * read-back), then the S-VLAN off values, the uplink first, unless a
+	 * forced path keeps S steering (WP3-DESIGN D3): the tagger is already
+	 * gone, so the PPE's final state is unknown here. tagger_data and the
+	 * S-R control state are not touched.
 	 */
-	rtl8372n_svlan_quiesce(priv);
+	if (cpu >= 0) {
+		ret = rtl8372n_port_set_isolation(priv, cpu, 0);
+		if (ret)
+			dev_warn(priv->dev, "failed to isolate port %d: %d\n", cpu, ret);
+	}
 	for (port = 0; port <= RTL8372N_INTERNAL_CPU_PORT; port++) {
+		if (port == cpu)
+			continue;
 		ret = rtl8372n_port_set_isolation(priv, port, 0);
 		if (ret)
 			dev_warn(priv->dev, "failed to isolate port %d: %d\n", port, ret);
 	}
 	ret = rtl837x_phys_write_c45(priv, RTL8372N_PHY_PORT_MASK,
-				    31, 0xa610, 0x2858);
+				     MDIO_MMD_VEND2, RTL8372N_PHY_OCP_PMA_CTRL1,
+				     RTL8372N_PHY_PMA_LOWPOWER);
 	if (ret)
 		dev_warn(priv->dev, "failed to power down PHYs: %d\n", ret);
+	rtl8372n_svlan_quiesce(priv);
 	cancel_delayed_work_sync(&priv->fdb_resync_work);
 	rtl8372n_fdb_reset(priv);
 }
@@ -1532,7 +1545,8 @@ static int rtl8372n_setup(struct dsa_switch *ds)
 	if (ret)
 		goto fail;
 	ret = rtl837x_phys_write_c45(priv, RTL8372N_PHY_PORT_MASK,
-				    31, 0xa610, 0x2858);
+				     MDIO_MMD_VEND2, RTL8372N_PHY_OCP_PMA_CTRL1,
+				     RTL8372N_PHY_PMA_LOWPOWER);
 	if (ret)
 		goto fail;
 	/*

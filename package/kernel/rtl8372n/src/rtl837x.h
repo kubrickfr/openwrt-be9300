@@ -27,6 +27,13 @@
 
 #define RTL8372N_NUM_PORTS 9
 #define RTL8372N_PHY_PORT_MASK GENMASK(7, 4)
+/*
+ * OCP 0xa610 of an internal PHY (MMD 31) mirrors PMA/PMD control 1: 0x2858
+ * is low power (MDIO_CTRL1_LPOWER set), 0x2058 up. Setup, quiesce and the
+ * S-R forced path write 0x2858; phylib owns the bit otherwise.
+ */
+#define RTL8372N_PHY_OCP_PMA_CTRL1 0xa610
+#define RTL8372N_PHY_PMA_LOWPOWER 0x2858
 /* Hardware port 9 is the internal 8051 CPU; it is not a DSA port. */
 #define RTL8372N_INTERNAL_CPU_PORT 9
 /* VLAN that VLAN-unaware ports classify untagged frames into (PVID). */
@@ -62,9 +69,10 @@ static inline enum rtl8372n_vlan_mode rtl8372n_vlan_mode(bool aware)
 }
 
 /*
- * S-R steering (rtl8372n_svlan.c, WP1-DESIGN §4). Lock order: RTNL -> lock
- * -> vlan_lock -> table_lock -> map_lock -> MII bus; fdb_lock is never taken
- * under lock. Nothing takes RTNL while holding lock. The deadline work takes
+ * S-R steering (rtl8372n_svlan.c, WP1-DESIGN §4, WP3-DESIGN §2). Lock
+ * order: RTNL -> lock -> vlan_lock -> table_lock -> map_lock -> MII bus, and
+ * lock -> phy_lock -> map_lock; fdb_lock is never taken under lock. Nothing
+ * takes RTNL while holding lock. The deadline and isolate cpu works take
  * lock only, and under lock only the non-sync cancel_delayed_work() and
  * mod_delayed_work() are used.
  */
@@ -80,8 +88,13 @@ struct rtl8372n_svlan {
 	bool ctl_ready;
 	/* The state machine (lock); seq.state is also read lock-free. */
 	struct sv_seq seq;
-	/* The deadline, and the disarm retry after FAULT disarm_incomplete. */
+	/*
+	 * The deadline, the disarm retry after FAULT disarm_incomplete, and
+	 * the follow-up disarm after a forced path.
+	 */
 	struct delayed_work deadline;
+	/* The isolate cpu bench verb's restore. */
+	struct delayed_work iso_bench;
 	/* Ports that left the VLAN-aware bridge while armed (lock-free). */
 	atomic_t topo_warn;
 	struct dentry *dir;
@@ -294,7 +307,10 @@ int rtl8372n_svlan_setup_post_reset(struct rtl837x_priv *priv);
 void rtl8372n_svlan_quiesce(struct rtl837x_priv *priv);
 void rtl8372n_svlan_report(struct rtl837x_priv *priv);
 int rtl8372n_svlan_arm(struct rtl837x_priv *priv, unsigned int deadline_s);
-int rtl8372n_svlan_disarm(struct rtl837x_priv *priv, bool force);
+int rtl8372n_svlan_disarm(struct rtl837x_priv *priv, unsigned int flags);
+int rtl8372n_svlan_renew(struct rtl837x_priv *priv, unsigned int secs);
+int rtl8372n_svlan_iso_bench(struct rtl837x_priv *priv, unsigned int secs);
+int rtl8372n_svlan_bind_check(struct device *dev);
 int rtl8372n_svlan_prechangeupper(struct dsa_switch *ds, int port,
 				  struct netdev_notifier_changeupper_info *info);
 void rtl8372n_svlan_topology_note(struct dsa_switch *ds, int port);

@@ -221,6 +221,15 @@ static int rtl837x_mdio_probe(struct mdio_device *mdiodev)
 	ret = rtl8372n_check_dt(dev);
 	if (ret)
 		return dev_err_probe(dev, ret, "unsupported P0 device tree\n");
+	/*
+	 * After a remove that left S-R steering armed under a PPE claim, no
+	 * bind before a module reload (WP3-DESIGN D16): setup would reset the
+	 * switch, write the S block off and open the CPU port again. Checked
+	 * before any register access and before the reset GPIO.
+	 */
+	ret = rtl8372n_svlan_bind_check(dev);
+	if (ret)
+		return ret;
 
 	priv = devm_kzalloc(dev, size_add(sizeof(*priv), variant->chip_data_sz),
 			    GFP_KERNEL);
@@ -338,7 +347,9 @@ static struct mdio_driver rtl837x_mdio_driver = {
 		 * mdio_driver_register() leaves the owner unset. phy_attach_direct()
 		 * then sees a user port's parent driver owned by no module, unlike
 		 * the internal MDIO bus, and pins this module once per attached
-		 * PHY, so rmmod could never succeed.
+		 * PHY, so rmmod could never succeed. qcom-ppe also takes its
+		 * reference on this module through it (ds->dev->driver->owner)
+		 * while it may emit S-R frames (WP3-DESIGN D16).
 		 */
 		.owner = THIS_MODULE,
 		.name = "rtl8372n-mdio",

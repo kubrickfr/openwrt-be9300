@@ -4,15 +4,27 @@
  * pure sequences of rtl8372n_svlan_seq.c.
  *
  * svlan=1 (latched at probe) binds the rtl8_4s tagger; arming is then an
- * explicit control, debugfs rtl8372n/svlan: "arm <deadline_s>", "disarm",
- * "disarm force". An arm writes 8 driver-owned VLAN entries ({p untagged,
- * CPU} at 3900 + p and 3910 + p, outside the bridge shadow), then, inside an
- * accept-NONE window and with the uplink last, the S-VLAN block, verifies
- * everything and hands the tagger accept S. Every disarm clears the uplink
- * first and alone, removes the entries and fast-ages the user ports. Every
- * arm has a deadline. The switch does not enforce C-VLAN membership on S-R
- * frames (CPU-source transparency is left as it is): that is the WP2
- * resolver's job.
+ * explicit control, debugfs rtl8372n/svlan: "arm <deadline_s>", "renew
+ * <deadline_s>", "disarm", "disarm force", and the bench verbs "disarm force
+ * nophy" and "isolate cpu <s>". An arm writes 8 driver-owned VLAN entries
+ * ({p untagged, CPU} at 3900 + p and 3910 + p, outside the bridge shadow),
+ * then, inside an accept-NONE window and with the uplink last, the S-VLAN
+ * block, verifies everything and hands the tagger accept S. Every disarm
+ * clears the uplink first and alone, removes the entries and fast-ages the
+ * user ports. Every arm has a deadline, which "renew" moves later (the
+ * daily lease). The switch does not enforce C-VLAN membership on S-R frames
+ * (CPU-source transparency is left as it is): that is the WP2 resolver's
+ * job.
+ *
+ * A disarm clears steering only from PPE OFF. Over a PPE claim, REMOVE,
+ * SHUTDOWN and "disarm force" take the forced path instead (WP3-DESIGN
+ * §2.2): FAULT, the CPU port isolated and the S-R PHYs powered down, each
+ * read back, S steering kept; the deadline work then completes the disarm
+ * once the PPE is off (the follow-up), and quiesce keeps the S block while
+ * forced steering is live. A REMOVE that took the forced path refuses every
+ * later bind until the module is reloaded (D16), which the PPE's reference
+ * on this module (it holds ds->dev->driver->owner while it may emit S-R
+ * frames) refuses until it is off.
  *
  * The tagger shares struct rtl8_4s_tagger_data (<linux/dsa/rtl8_4s.h>,
  * ABI 1): this driver writes accept, s_ports, disarm_at, sw_gen and the sw
@@ -23,14 +35,17 @@
  * rtl8372n_svlan_ctl_stop(); shutdown never frees it. It is never stored.
  *
  * Lock order: RTNL -> svlan lock -> vlan_lock -> table_lock -> map_lock ->
- * MII bus. Only the arm takes RTNL (trylock, restarting the write), before
- * the svlan lock, for the topology check; it only trylocks the svlan lock
- * under RTNL, and waits for a busy one killably without RTNL. Nothing takes
- * RTNL under the svlan lock. The deadline work takes the svlan lock only.
+ * MII bus, and svlan lock -> phy_lock -> map_lock with vlan_lock released
+ * (F2). Only the arm takes RTNL (trylock, restarting the write), before the
+ * svlan lock, for the topology check; it only trylocks the svlan lock under
+ * RTNL, and waits for a busy one killably without RTNL. Nothing takes RTNL
+ * under the svlan lock. The deadline and isolate cpu works take the svlan
+ * lock only.
  * svlan_counters reads memory only, so it may be read under load; svlan
  * reads the switch and is for idle use.
  */
 #include <linux/atomic.h>
+#include <linux/bitops.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -39,6 +54,7 @@
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
+#include <linux/mdio.h>
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
 #include <linux/rcupdate.h>
@@ -154,6 +170,11 @@ static u64 sv_io_ms(void *ctx)
 	return ktime_to_ms(ktime_get());
 }
 
+static u64 sv_io_us(void *ctx)
+{
+	return ktime_to_us(ktime_get());
+}
+
 static void sv_io_timer(void *ctx, bool mod, unsigned long delay)
 {
 	struct sv_ctx *c = ctx;
@@ -163,6 +184,71 @@ static void sv_io_timer(void *ctx, bool mod, unsigned long delay)
 		mod_delayed_work(system_percpu_wq, &c->priv->sv.deadline, delay);
 	else
 		cancel_delayed_work(&c->priv->sv.deadline);
+}
+
+static void sv_io_iso_timer(void *ctx, bool mod, unsigned long delay)
+{
+	struct sv_ctx *c = ctx;
+
+	if (mod)
+		mod_delayed_work(system_percpu_wq, &c->priv->sv.iso_bench, delay);
+	else
+		cancel_delayed_work(&c->priv->sv.iso_bench);
+}
+
+/*
+ * F1 and isolate cpu (struct sv_io). vlan_lock covers the isolation words;
+ * only setup, quiesce and these write the CPU port's (link and unlink write
+ * user ports' words). As sv_clear(): a read-back that shows @val succeeds
+ * whatever the write returned.
+ */
+static int sv_io_cpu_word(void *ctx, unsigned int cpu, u32 *was, u32 val)
+{
+	struct sv_ctx *c = ctx;
+	struct rtl837x_priv *priv = c->priv;
+	u32 reg = RTL837X_PORT_ISOLATION_REG(cpu), now = 0;
+	int ret, wret;
+
+	mutex_lock(&priv->vlan_lock);
+	if (was && regmap_read(priv->map, reg, was))
+		*was = SV_WORD_UNREAD;
+	wret = regmap_write(priv->map, reg, val);
+	ret = regmap_read(priv->map, reg, &now);
+	mutex_unlock(&priv->vlan_lock);
+	if (ret)
+		return ret;
+	if ((now & RTL837X_PORT_ISOLATION_MASK) ==
+	    (val & RTL837X_PORT_ISOLATION_MASK))
+		return 0;
+	return wret ?: -EIO;
+}
+
+/*
+ * F2 (struct sv_io): the setup and quiesce broadcast of PMA low power, then
+ * each PHY read back. Called with the svlan lock only (phy_lock ->
+ * map_lock); phylib may power a PHY up again later (WP3-DESIGN K-P).
+ */
+static int sv_io_phy_down(void *ctx, u16 mask)
+{
+	struct sv_ctx *c = ctx;
+	unsigned long m = mask;
+	unsigned int p;
+	int ret, wret;
+	u16 v;
+
+	wret = rtl837x_phys_write_c45(c->priv, mask, MDIO_MMD_VEND2,
+				      RTL8372N_PHY_OCP_PMA_CTRL1,
+				      RTL8372N_PHY_PMA_LOWPOWER);
+	for_each_set_bit(p, &m, RTL8372N_NUM_PORTS) {
+		v = 0;
+		ret = rtl837x_phy_read_c45(c->priv, p, MDIO_MMD_VEND2,
+					   RTL8372N_PHY_OCP_PMA_CTRL1, &v);
+		if (ret)
+			return ret;
+		if (!(v & MDIO_CTRL1_LPOWER))
+			return wret ?: -EIO;
+	}
+	return 0;
 }
 
 static void sv_io_warn(void *ctx)
@@ -211,7 +297,11 @@ static const struct sv_io sv_io_template = {
 	.sleep_ms = sv_io_sleep_ms,
 	.jiffies = sv_io_jiffies,
 	.ms = sv_io_ms,
+	.us = sv_io_us,
 	.timer = sv_io_timer,
+	.iso_timer = sv_io_iso_timer,
+	.cpu_word = sv_io_cpu_word,
+	.phy_down = sv_io_phy_down,
 	.warn = sv_io_warn,
 	.log = sv_io_log,
 };
@@ -233,6 +323,9 @@ static void sv_bind(struct rtl837x_priv *priv, struct sv_io *io,
 	io->ctx = c;
 	cfg->cpu = cpu ? __ffs(cpu) : 0;
 	cfg->user_ports = dsa_user_ports(ds);
+	cfg->phy_ports = cfg->user_ports & RTL8372N_PHY_PORT_MASK;
+	/* What rtl8372n_setup_cpu_forwarding() writes to the CPU port. */
+	cfg->user_mask = dsa_user_ports(ds);
 	cfg->hz = HZ;
 }
 
@@ -250,6 +343,25 @@ static void sv_deadline_fn(struct work_struct *work)
 	if (sv->ctl_ready) {
 		sv_bind(priv, &io, &c, &cfg, true);
 		sv_seq_work(&sv->seq, &io, &cfg);
+	}
+	mutex_unlock(&sv->lock);
+}
+
+/* The isolate cpu restore; a forced path in the window cancels it. */
+static void sv_iso_bench_fn(struct work_struct *work)
+{
+	struct rtl8372n_svlan *sv = container_of(to_delayed_work(work),
+						 struct rtl8372n_svlan,
+						 iso_bench);
+	struct rtl837x_priv *priv = container_of(sv, struct rtl837x_priv, sv);
+	struct sv_ctx c;
+	struct sv_cfg cfg;
+	struct sv_io io;
+
+	mutex_lock(&sv->lock);
+	if (sv->ctl_ready) {
+		sv_bind(priv, &io, &c, &cfg, true);
+		sv_seq_iso_restore(&sv->seq, &io, &cfg);
 	}
 	mutex_unlock(&sv->lock);
 }
@@ -359,8 +471,11 @@ int rtl8372n_svlan_arm(struct rtl837x_priv *priv, unsigned int deadline_s)
 	return ret;
 }
 
-/* The debugfs disarm, without RTNL. In WP1 @force is only counted (D9). */
-int rtl8372n_svlan_disarm(struct rtl837x_priv *priv, bool force)
+/*
+ * The debugfs disarm, without RTNL. @flags: SV_DISARM_FORCE takes the
+ * forced path over a PPE claim, SV_DISARM_NOPHY skips its PHY power-down.
+ */
+int rtl8372n_svlan_disarm(struct rtl837x_priv *priv, unsigned int flags)
 {
 	struct rtl8372n_svlan *sv = &priv->sv;
 	struct sv_ctx c;
@@ -376,11 +491,82 @@ int rtl8372n_svlan_disarm(struct rtl837x_priv *priv, bool force)
 		return -EINTR;
 	if (sv->ctl_ready) {
 		sv_bind(priv, &io, &c, &cfg, true);
-		ret = sv_seq_disarm(&sv->seq, &io, &cfg, SV_TRIG_DEBUGFS, force);
+		ret = sv_seq_disarm(&sv->seq, &io, &cfg, SV_TRIG_DEBUGFS, flags);
 	} else {
 		ret = -ESHUTDOWN;
 	}
 	mutex_unlock(&sv->lock);
+	return ret;
+}
+
+/* "renew <s>": the lease (WP3-DESIGN §2.5), without RTNL or registers. */
+int rtl8372n_svlan_renew(struct rtl837x_priv *priv, unsigned int secs)
+{
+	struct rtl8372n_svlan *sv = &priv->sv;
+	struct sv_ctx c;
+	struct sv_cfg cfg;
+	struct sv_io io;
+	int ret;
+
+	if (!sv->enabled) {
+		dev_err(priv->dev, "svlan: renew: S mode is off (svlan=0 at bind)\n");
+		return -EOPNOTSUPP;
+	}
+	if (mutex_lock_killable(&sv->lock))
+		return -EINTR;
+	if (sv->ctl_ready) {
+		sv_bind(priv, &io, &c, &cfg, true);
+		ret = sv_seq_renew(&sv->seq, &io, &cfg, secs);
+	} else {
+		ret = -ESHUTDOWN;
+	}
+	mutex_unlock(&sv->lock);
+	return ret;
+}
+
+/* "isolate cpu <s>", a bench verb: svlan lock, then vlan_lock (cpu_word). */
+int rtl8372n_svlan_iso_bench(struct rtl837x_priv *priv, unsigned int secs)
+{
+	struct rtl8372n_svlan *sv = &priv->sv;
+	u8 ppe = RTL8_4S_PPE_OFF;
+	struct sv_ctx c;
+	struct sv_cfg cfg;
+	struct sv_io io;
+	int ret;
+
+	if (!sv->enabled) {
+		dev_err(priv->dev, "svlan: isolate cpu: S mode is off (svlan=0 at bind)\n");
+		return -EOPNOTSUPP;
+	}
+	if (mutex_lock_killable(&sv->lock))
+		return -EINTR;
+	if (sv->ctl_ready) {
+		sv_bind(priv, &io, &c, &cfg, true);
+		if (c.td)
+			ppe = rtl8_4s_word_ppe(atomic_read(&c.td->st));
+		ret = sv_seq_iso_bench(&sv->seq, &io, &cfg, secs, ppe);
+	} else {
+		ret = -ESHUTDOWN;
+	}
+	mutex_unlock(&sv->lock);
+	return ret;
+}
+
+/*
+ * D16 (WP3-DESIGN): set by a REMOVE that took the forced path, read by
+ * every probe. Only a module reload clears it; the PPE's reference on this
+ * module refuses that while it may still emit S-R frames.
+ */
+static struct sv_latch sv_latch;
+
+/* rtl837x_mdio_probe(), before any register access. */
+int rtl8372n_svlan_bind_check(struct device *dev)
+{
+	int ret = sv_latch_check(&sv_latch);
+
+	if (ret)
+		dev_err(dev,
+			"svlan: bind refused: a forced remove kept S-R steering; reload rtl8372n_dsa once the PPE is off\n");
 	return ret;
 }
 
@@ -390,6 +576,7 @@ void rtl8372n_svlan_probe_init(struct rtl837x_priv *priv)
 
 	mutex_init(&sv->lock);
 	INIT_DELAYED_WORK(&sv->deadline, sv_deadline_fn);
+	INIT_DELAYED_WORK(&sv->iso_bench, sv_iso_bench_fn);
 	atomic_set(&sv->topo_warn, 0);
 	memset(&sv->seq, 0, sizeof(sv->seq));
 	sv->seq.state = RTL8_4S_SW_OFF;
@@ -430,7 +617,7 @@ static ssize_t svlan_write(struct file *file, const char __user *ubuf,
 {
 	struct seq_file *m = file->private_data;
 	struct rtl837x_priv *priv = m->private;
-	unsigned int deadline_s;
+	unsigned int secs;
 	/* Zeroed for -Wmaybe-uninitialized (see the Makefile). */
 	char buf[32] = { }, *cmd;
 	int ret;
@@ -442,13 +629,24 @@ static ssize_t svlan_write(struct file *file, const char __user *ubuf,
 	buf[len] = '\0';
 	cmd = strim(buf);
 	if (str_has_prefix(cmd, "arm ")) {
-		if (kstrtouint(skip_spaces(cmd + 4), 10, &deadline_s))
+		if (kstrtouint(skip_spaces(cmd + 4), 10, &secs))
 			return -EINVAL;
-		ret = rtl8372n_svlan_arm(priv, deadline_s);
+		ret = rtl8372n_svlan_arm(priv, secs);
+	} else if (str_has_prefix(cmd, "renew ")) {
+		if (kstrtouint(skip_spaces(cmd + 6), 10, &secs))
+			return -EINVAL;
+		ret = rtl8372n_svlan_renew(priv, secs);
+	} else if (str_has_prefix(cmd, "isolate cpu ")) {
+		if (kstrtouint(skip_spaces(cmd + 12), 10, &secs))
+			return -EINVAL;
+		ret = rtl8372n_svlan_iso_bench(priv, secs);
 	} else if (!strcmp(cmd, "disarm")) {
-		ret = rtl8372n_svlan_disarm(priv, false);
+		ret = rtl8372n_svlan_disarm(priv, 0);
 	} else if (!strcmp(cmd, "disarm force")) {
-		ret = rtl8372n_svlan_disarm(priv, true);
+		ret = rtl8372n_svlan_disarm(priv, SV_DISARM_FORCE);
+	} else if (!strcmp(cmd, "disarm force nophy")) {
+		ret = rtl8372n_svlan_disarm(priv, SV_DISARM_FORCE |
+					    SV_DISARM_NOPHY);
 	} else {
 		return -EINVAL;
 	}
@@ -498,9 +696,13 @@ void rtl8372n_svlan_ctl_start(struct rtl837x_priv *priv)
 
 /*
  * Remove and shutdown: close the window, remove debugfs (which waits for
- * handlers in flight), cancel the work outside the lock, then disarm.
- * tagger_data is still connected: dsa_unregister_switch() comes after, and
- * shutdown never disconnects it.
+ * handlers in flight), cancel the works outside the lock, then disarm:
+ * over a PPE claim that is the forced path (no work is queued again), and a
+ * REMOVE that took it latches every later bind (D16). tagger_data is still
+ * connected: dsa_unregister_switch() comes after, and shutdown never
+ * disconnects it. An isolate cpu window ends without its restore: the
+ * forced path and a remove's quiesce isolate the CPU port anyway, and a
+ * shutdown is followed by a reset.
  */
 void rtl8372n_svlan_ctl_stop(struct rtl837x_priv *priv, bool shutdown)
 {
@@ -519,6 +721,7 @@ void rtl8372n_svlan_ctl_stop(struct rtl837x_priv *priv, bool shutdown)
 	mutex_unlock(&sv->lock);
 	debugfs_remove_recursive(dir);
 	cancel_delayed_work_sync(&sv->deadline);
+	cancel_delayed_work_sync(&sv->iso_bench);
 
 	if (!sv->enabled)
 		return;
@@ -530,7 +733,8 @@ void rtl8372n_svlan_ctl_stop(struct rtl837x_priv *priv, bool shutdown)
 	}
 	mutex_lock(&sv->lock);
 	sv_bind(priv, &io, &c, &cfg, true);
-	ret = sv_seq_disarm(&sv->seq, &io, &cfg, trigger, true);
+	ret = sv_seq_disarm(&sv->seq, &io, &cfg, trigger, 0);
+	sv_latch_note(&sv_latch, &sv->seq);
 	mutex_unlock(&sv->lock);
 	if (shutdown)
 		dev_info(priv->dev, "svlan: shutdown disarm (%d, state %s)\n",
@@ -575,7 +779,14 @@ int rtl8372n_svlan_setup_post_reset(struct rtl837x_priv *priv)
 	return 0;
 }
 
-/* Teardown and setup failure: best effort; no tagger_data, no state. */
+/*
+ * Teardown and setup failure, after rtl8372n_quiesce() has isolated every
+ * port and powered the PHYs down: best effort; no tagger_data, no state.
+ * The S block stays as it is while a forced path's steering is live
+ * (WP3-DESIGN D3): the PPE may still emit S-R frames, which the tagger can
+ * no longer report, and the next setup writes the off values after its
+ * reset. A setup failure never keeps it: the probe zeroed the state.
+ */
 void rtl8372n_svlan_quiesce(struct rtl837x_priv *priv)
 {
 	struct sv_ctx c;
@@ -583,6 +794,10 @@ void rtl8372n_svlan_quiesce(struct rtl837x_priv *priv)
 	struct sv_io io;
 	bool rest_ok;
 
+	if (sv_seq_quiesce_keep_s(&priv->sv.seq)) {
+		dev_warn(priv->dev, "svlan: quiesce: S steering kept (forced)\n");
+		return;
+	}
 	sv_bind(priv, &io, &c, &cfg, false);
 	sv_seq_off(&io, &cfg, "quiesce", &rest_ok);
 }
@@ -668,18 +883,6 @@ static const char *sv_state_name(enum rtl8_4s_state st)
 	return (unsigned int)st < ARRAY_SIZE(names) ? names[st] : "?";
 }
 
-static const char *sv_ppe_name(unsigned int ppe)
-{
-	static const char * const names[] = {
-		[RTL8_4S_PPE_OFF] = "off",
-		[RTL8_4S_PPE_SR_READY] = "sr_ready",
-		[RTL8_4S_PPE_ACTIVE] = "active",
-		[RTL8_4S_PPE_FAULT] = "fault",
-	};
-
-	return ppe < ARRAY_SIZE(names) ? names[ppe] : "?";
-}
-
 static const char * const sv_rx_names[RTL8_4S_RX_NUM] = {
 	[RTL8_4S_RX_S] = "rx_s",
 	[RTL8_4S_RX_S_NESTED] = "rx_s_nested",
@@ -710,7 +913,10 @@ static unsigned long sv_secs_left(unsigned long now, unsigned long until)
 /*
  * debugfs svlan_counters: memory only (no register or MDIO access, which the
  * harness checks), so it may be read under load. state, sw_state and
- * ppe_state come from one read of the state word.
+ * ppe_state come from one read of the state word. The forced_* lines
+ * describe the last forced path ("none" and "-" before the first);
+ * steer_live is sv_seq_may_be_live(), spelt out (calls here stay on the
+ * harness's memory-only list).
  */
 static int svlan_counters_show(struct seq_file *m, void *unused)
 {
@@ -718,9 +924,11 @@ static int svlan_counters_show(struct seq_file *m, void *unused)
 	struct rtl8372n_svlan *sv = &priv->sv;
 	struct rtl8_4s_tagger_data *td = NULL;
 	const struct sv_seq *s = &sv->seq;
+	const char *iso_cpu = "-", *iso_phy = "-";
 	struct rtl8_4s_counters *cnt;
 	unsigned long now = jiffies;
 	unsigned int i, j;
+	bool steer_live;
 	u8 accept;
 	int st, ret;
 
@@ -748,10 +956,11 @@ static int svlan_counters_show(struct seq_file *m, void *unused)
 	seq_printf(m, "bound %d\n", td ? 1 : 0);
 	seq_printf(m, "state %s\n", sv_state_name(rtl8_4s_word_state(st)));
 	seq_printf(m, "sw_state %s\n", sv_sw_state_name(rtl8_4s_word_sw(st)));
-	seq_printf(m, "fault%s%s%s%s\n", s->fault ? "" : " none",
+	seq_printf(m, "fault%s%s%s%s%s\n", s->fault ? "" : " none",
 		   s->fault & SV_FAULT_DISARM_INCOMPLETE ? " disarm_incomplete" : "",
 		   s->fault & SV_FAULT_OFF_INERT ? " off_inert" : "",
-		   s->fault & SV_FAULT_ENTRIES ? " entries" : "");
+		   s->fault & SV_FAULT_ENTRIES ? " entries" : "",
+		   s->fault & SV_FAULT_FORCED_PPE ? " forced_ppe" : "");
 	seq_printf(m, "accept %s\n", sv_accept_name(accept));
 	seq_printf(m, "s_ports %#x\n", td ? READ_ONCE(td->s_ports) : s->s_ports);
 	seq_printf(m, "ppe_state %s\n", sv_ppe_name(rtl8_4s_word_ppe(st)));
@@ -773,6 +982,36 @@ static int svlan_counters_show(struct seq_file *m, void *unused)
 			   s->disarm[i]);
 	seq_printf(m, "force_requests %u\n", s->force_requests);
 	seq_printf(m, "topo_warn %d\n", atomic_read(&sv->topo_warn));
+	if (s->forced_n) {
+		iso_cpu = s->forced_iso & SV_ISO_CPU_OK ? "ok" : "FAILED";
+		if (s->forced_iso & SV_ISO_PHY_SKIPPED)
+			iso_phy = "skipped";
+		else
+			iso_phy = s->forced_iso & SV_ISO_PHY_OK ? "ok" : "FAILED";
+	}
+	steer_live = s->state != RTL8_4S_SW_OFF &&
+		     (s->state != RTL8_4S_SW_FAULT || s->incomplete ||
+		      s->forced_live);
+	seq_printf(m, "forced_n %u\n", s->forced_n);
+	seq_printf(m, "forced_trig %s\n",
+		   s->forced_n ? sv_trigger_name(s->forced_trig) : "none");
+	seq_printf(m, "forced_ppe_state %s\n",
+		   s->forced_n ? sv_ppe_name(s->forced_ppe) : "none");
+	seq_printf(m, "forced_iso cpu %s phy %s\n", iso_cpu, iso_phy);
+	seq_printf(m, "forced_cpu_was %#x\n", s->forced_cpu_was);
+	seq_printf(m, "forced_us %u\n", s->forced_us);
+	seq_printf(m, "steer_live %d\n", steer_live);
+	seq_printf(m, "iso_failed %d\n", s->iso_failed);
+	seq_printf(m, "renew_ok %u\n", s->renew_ok);
+	seq_printf(m, "renew_refused_range %u\n",
+		   s->renew_refused[SV_RENEW_RANGE]);
+	seq_printf(m, "renew_refused_state %u\n",
+		   s->renew_refused[SV_RENEW_STATE]);
+	seq_printf(m, "renew_refused_shorter %u\n",
+		   s->renew_refused[SV_RENEW_SHORTER]);
+	seq_printf(m, "followup_n %u\n", s->followup_n);
+	seq_printf(m, "bind_refused %u\n", READ_ONCE(sv_latch.refused));
+	seq_printf(m, "iso_bench_n %u\n", s->iso_bench_n);
 	seq_printf(m, "last_err %d %s\n", s->last_err,
 		   sv_step_name(s->last_step));
 	for (i = 0; i < RTL8_4S_RX_NUM; i++)
@@ -786,7 +1025,10 @@ static int svlan_counters_show(struct seq_file *m, void *unused)
 	return 0;
 }
 
-/* debugfs svlan, read: a live read-back of the S block (idle only). */
+/*
+ * debugfs svlan, read: a live read-back of the S block and of the CPU
+ * port's isolation word (idle only).
+ */
 static __printf(2, 3) void sv_out_print(void *ctx, const char *fmt, ...)
 {
 	va_list args;
@@ -804,18 +1046,16 @@ static int svlan_show(struct seq_file *m, void *unused)
 	struct sv_ctx c;
 	struct sv_cfg cfg;
 	struct sv_io io;
-	bool armed;
 	int ret;
 
 	ret = mutex_lock_killable(&sv->lock);
 	if (ret)
 		return ret;
-	armed = sv_seq_expect_armed(&sv->seq);
 	seq_printf(m, "svlan %d sw_state %s accept %s\n", sv->enabled,
 		   sv_sw_state_name(sv->seq.state),
 		   sv_accept_name(sv->seq.accept));
 	sv_bind(priv, &io, &c, &cfg, false);
-	sv_seq_show(&io, &cfg, armed, &out);
+	sv_seq_show(&sv->seq, &io, &cfg, &out);
 	mutex_unlock(&sv->lock);
 	return 0;
 }

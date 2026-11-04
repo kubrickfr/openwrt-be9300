@@ -29,6 +29,7 @@
 #define SV_ONCE(x)		(*(volatile __typeof__(x) *)&(x))
 #define SV_SET_STATE(s, v)	(SV_ONCE((s)->state) = (v))
 #define SV_SET_INCOMPLETE(s, v)	(SV_ONCE((s)->incomplete) = (v))
+#define SV_SET_FORCED_LIVE(s, v) (SV_ONCE((s)->forced_live) = (v))
 
 /* @io is always a plain pointer variable. */
 #define sv_log(io, lvl, ...)	((io)->log((io)->ctx, (lvl), __VA_ARGS__))
@@ -40,6 +41,7 @@ static const char * const sv_trigger_names[SV_TRIG_NUM] = {
 	[SV_TRIG_REMOVE] = "remove",
 	[SV_TRIG_SHUTDOWN] = "shutdown",
 	[SV_TRIG_ROLLBACK] = "rollback",
+	[SV_TRIG_FORCED_FOLLOWUP] = "forced_followup",
 };
 
 static const char * const sv_refusal_names[SV_REF_NUM] = {
@@ -63,6 +65,7 @@ static const char * const sv_step_names[SV_STEP_NUM] = {
 	[SV_STEP_A8] = "A8", [SV_STEP_A9] = "A9",
 	[SV_STEP_X3] = "X3", [SV_STEP_X4] = "X4", [SV_STEP_X5] = "X5",
 	[SV_STEP_X8] = "X8",
+	[SV_STEP_F1] = "F1", [SV_STEP_F2] = "F2",
 };
 
 const char *sv_trigger_name(unsigned int trigger)
@@ -105,6 +108,21 @@ const char *sv_sw_state_name(unsigned int sw)
 	case RTL8_4S_SW_DISARMING:
 		return "disarming";
 	case RTL8_4S_SW_FAULT:
+		return "fault";
+	}
+	return "?";
+}
+
+const char *sv_ppe_name(unsigned int ppe)
+{
+	switch (ppe) {
+	case RTL8_4S_PPE_OFF:
+		return "off";
+	case RTL8_4S_PPE_SR_READY:
+		return "sr_ready";
+	case RTL8_4S_PPE_ACTIVE:
+		return "active";
+	case RTL8_4S_PPE_FAULT:
 		return "fault";
 	}
 	return "?";
@@ -562,11 +580,12 @@ static void sv_accept(struct sv_seq *s, const struct sv_io *io, u8 accept)
 }
 
 static void sv_fault_names(u8 fault, const char **a, const char **b,
-			   const char **c)
+			   const char **c, const char **d)
 {
 	*a = fault & SV_FAULT_DISARM_INCOMPLETE ? " disarm_incomplete" : "";
 	*b = fault & SV_FAULT_OFF_INERT ? " off_inert" : "";
 	*c = fault & SV_FAULT_ENTRIES ? " entries" : "";
+	*d = fault & SV_FAULT_FORCED_PPE ? " forced_ppe" : "";
 }
 
 /*
@@ -683,7 +702,7 @@ static int sv_disarm_run(struct sv_seq *s, const struct sv_io *io,
 			 const struct sv_cfg *cfg, enum sv_trigger trigger)
 {
 	bool hot = trigger != SV_TRIG_REMOVE && trigger != SV_TRIG_SHUTDOWN;
-	const char *fa, *fb, *fc;
+	const char *fa, *fb, *fc, *fd;
 	u8 pending = 0;
 	int ret, err = 0;
 	unsigned int p;
@@ -713,8 +732,12 @@ static int sv_disarm_run(struct sv_seq *s, const struct sv_io *io,
 		return sv_incomplete(s, io, cfg, trigger, SV_STEP_X3, ret);
 	}
 
-	/* X4: from here on the switch is no longer as A9 left it. */
+	/*
+	 * X4: from here on the switch is no longer as A9 left it, and S
+	 * steering a forced path kept is off.
+	 */
 	s->armed_intact = false;
+	SV_SET_FORCED_LIVE(s, false);
 	ret = sv_clear(io, RTL837X_CPU_TAG_CTRL, RTL837X_CPU_TAG_INSERT_MODE,
 		       sv_prep(RTL837X_CPU_TAG_INSERT_MODE,
 			       RTL837X_CPU_TAG_INSERT_ALL));
@@ -765,21 +788,142 @@ static int sv_disarm_run(struct sv_seq *s, const struct sv_io *io,
 	sv_log(io, SV_LOG_INFO, "svlan: disarmed (%s) none_ms %u\n",
 	       sv_trigger_name(trigger), s->none_ms);
 	if (s->fault) {
-		sv_fault_names(s->fault, &fa, &fb, &fc);
-		sv_log(io, SV_LOG_WARN, "svlan: FAULT latched:%s%s%s\n", fa, fb,
-		       fc);
+		sv_fault_names(s->fault, &fa, &fb, &fc, &fd);
+		sv_log(io, SV_LOG_WARN, "svlan: FAULT latched:%s%s%s%s\n", fa,
+		       fb, fc, fd);
 	}
 	return err;
 }
 
-int sv_seq_disarm(struct sv_seq *s, const struct sv_io *io,
-		  const struct sv_cfg *cfg, enum sv_trigger trigger, bool force)
+/*
+ * F1 and the isolate cpu restore: the CPU port's isolation word to @val, up
+ * to SV_ATTEMPTS tries SV_ATTEMPT_GAP_MS apart; the first try reads the
+ * word into *was first, when @was is set.
+ */
+static int sv_cpu_word(const struct sv_io *io, const struct sv_cfg *cfg,
+		       u32 *was, u32 val)
 {
+	int i, ret = 0;
+
+	for (i = 0; i < SV_ATTEMPTS; i++) {
+		if (i)
+			io->sleep_ms(io->ctx, SV_ATTEMPT_GAP_MS);
+		ret = io->cpu_word(io->ctx, cfg->cpu, i ? NULL : was, val);
+		if (!ret)
+			return 0;
+	}
+	return ret;
+}
+
+/* F2: the PHYs of @mask to low power, read back, as sv_cpu_word() tries. */
+static int sv_phy_down(const struct sv_io *io, u16 mask)
+{
+	int i, ret = 0;
+
+	for (i = 0; i < SV_ATTEMPTS; i++) {
+		if (i)
+			io->sleep_ms(io->ctx, SV_ATTEMPT_GAP_MS);
+		ret = io->phy_down(io->ctx, mask);
+		if (!ret)
+			return 0;
+	}
+	return ret;
+}
+
+/*
+ * WP3-DESIGN §2.2: a disarm that met a PPE claim, on REMOVE, SHUTDOWN or
+ * "disarm force". S steering is kept: a PPE that still emits S-R frames is
+ * then either delivered correctly (steering armed) or blocked (the CPU port
+ * isolated, the S-R PHYs down). Nothing here writes the S block, the C2S
+ * table or a VLAN entry; accept, s_ports, disarm_at and armed_intact stay.
+ * Returns 0 when either barrier verified, else -EIO.
+ */
+static int sv_forced(struct sv_seq *s, const struct sv_io *io,
+		     const struct sv_cfg *cfg, enum sv_trigger trigger,
+		     unsigned int flags, u8 ppe)
+{
+	u16 m = s->s_ports & cfg->phy_ports;
+	const char *phy;
+	int f1, f2 = 0;
+	u64 t0;
+
+	/*
+	 * F0: sw FAULT, the ppe byte kept. Offers decline and no claim or
+	 * move succeeds from here on; the PPE disarms on its own.
+	 */
+	t0 = io->us(io->ctx);
+	s->forced_n++;
+	s->forced_trig = trigger;
+	s->forced_ppe = ppe;
+	s->forced_iso = 0;
+	s->forced_cpu_was = SV_WORD_UNREAD;
+	sv_set_state(s, io, RTL8_4S_SW_FAULT);
+	if (trigger == SV_TRIG_REMOVE)
+		s->bind_latch = true;
+	if (trigger != SV_TRIG_DEBUGFS)
+		io->warn(io->ctx);
+	/* A pending isolate cpu restore would open the CPU port again. */
+	if (s->iso_bench_live) {
+		s->iso_bench_live = false;
+		io->iso_timer(io->ctx, false, 0);
+	}
+
+	/* F1: the CPU port reaches no port. */
+	f1 = sv_cpu_word(io, cfg, &s->forced_cpu_was, 0);
+	if (!f1)
+		s->forced_iso |= SV_ISO_CPU_OK;
+	else
+		sv_note(s, SV_STEP_F1, f1);
+
+	/* F2: the S-R PHYs down (vlan_lock released). */
+	if ((flags & SV_DISARM_NOPHY) || !m) {
+		s->forced_iso |= SV_ISO_PHY_SKIPPED;
+	} else {
+		f2 = sv_phy_down(io, m);
+		if (!f2)
+			s->forced_iso |= SV_ISO_PHY_OK;
+		else
+			sv_note(s, SV_STEP_F2, f2);
+	}
+
+	/* F3 */
+	s->fault |= SV_FAULT_FORCED_PPE;
+	SV_SET_FORCED_LIVE(s, true);
+	s->iso_failed = !(s->forced_iso & (SV_ISO_CPU_OK | SV_ISO_PHY_OK));
+	/* The follow-up; ctl_stop has cancelled the work for REMOVE/SHUTDOWN. */
+	if (trigger == SV_TRIG_DEBUGFS)
+		io->timer(io->ctx, true,
+			  (unsigned long)SV_YIELD_PERIOD_S * cfg->hz);
+
+	/* F4 */
+	s->forced_us = (u32)(io->us(io->ctx) - t0);
+	if (s->forced_iso & SV_ISO_PHY_SKIPPED)
+		phy = "skipped";
+	else
+		phy = f2 ? "FAILED" : "down";
+	sv_log(io, SV_LOG_ERR,
+	       "svlan: forced (%s): ppe %s, CPU port %u isolation %s (was %#x), PHYs %#x %s; S steering kept\n",
+	       sv_trigger_name(trigger), sv_ppe_name(ppe), cfg->cpu,
+	       f1 ? "FAILED" : "ok", s->forced_cpu_was, m, phy);
+	if (!s->iso_failed)
+		return 0;
+	sv_log(io, SV_LOG_ERR, "svlan: forced isolation FAILED (%s)\n",
+	       sv_trigger_name(trigger));
+	return -EIO;
+}
+
+int sv_seq_disarm(struct sv_seq *s, const struct sv_io *io,
+		  const struct sv_cfg *cfg, enum sv_trigger trigger,
+		  unsigned int flags)
+{
+	bool hard = trigger == SV_TRIG_REMOVE || trigger == SV_TRIG_SHUTDOWN ||
+		    (trigger == SV_TRIG_DEBUGFS && (flags & SV_DISARM_FORCE));
 	u8 ppe = RTL8_4S_PPE_OFF;
 
-	if (trigger >= SV_TRIG_NUM)
+	/* The follow-up runs only from the deadline work (sv_seq_work()). */
+	if (trigger >= SV_TRIG_NUM || trigger == SV_TRIG_FORCED_FOLLOWUP)
 		return -EINVAL;
-	if (force && trigger == SV_TRIG_DEBUGFS)
+	if ((flags & SV_DISARM_FORCE) && trigger == SV_TRIG_DEBUGFS)
 		s->force_requests++;
 	s->disarm[trigger]++;
 
@@ -787,22 +931,19 @@ int sv_seq_disarm(struct sv_seq *s, const struct sv_io *io,
 	if (s->state == RTL8_4S_SW_OFF && !s->entries_written)
 		return 0;
 
-	/* X1 (D9: in WP1 force never overrides a PPE claim). */
+	/*
+	 * X1: steering is cleared only from ppe OFF (cmpxchg). Over a claim,
+	 * REMOVE, SHUTDOWN and force isolate instead (WP3-DESIGN D1).
+	 */
 	if (trigger != SV_TRIG_RETRY && !io->sw_begin_disarm(io->ctx, &ppe)) {
 		s->last_ppe = ppe;
-		if (trigger != SV_TRIG_REMOVE && trigger != SV_TRIG_SHUTDOWN) {
-			/* The deadline work logs its yield once. */
-			if (trigger != SV_TRIG_DEADLINE || !s->yield_logged)
-				sv_log(io, SV_LOG_ERR,
-				       "svlan: disarm refused: PPE S-R state %u\n",
-				       ppe);
-			return -EBUSY;
-		}
-		io->warn(io->ctx);
-		sv_log(io, SV_LOG_ERR,
-		       "svlan: %s disarm over PPE S-R state %u\n",
-		       sv_trigger_name(trigger), ppe);
-		io->sw_set(io->ctx, RTL8_4S_SW_DISARMING);
+		if (hard)
+			return sv_forced(s, io, cfg, trigger, flags, ppe);
+		/* The deadline work logs its yield once. */
+		if (trigger != SV_TRIG_DEADLINE || !s->yield_logged)
+			sv_log(io, SV_LOG_ERR,
+			       "svlan: disarm refused: PPE S-R state %u\n", ppe);
+		return -EBUSY;
 	}
 	if (trigger != SV_TRIG_RETRY)
 		SV_SET_STATE(s, RTL8_4S_SW_DISARMING);
@@ -813,12 +954,35 @@ void sv_seq_work(struct sv_seq *s, const struct sv_io *io,
 		 const struct sv_cfg *cfg)
 {
 	unsigned long now = io->jiffies(io->ctx);
+	u8 ppe = RTL8_4S_PPE_OFF;
 	int ret;
 
 	/* Retry mode: FAULT disarm_incomplete, from X2. */
 	if (s->state == RTL8_4S_SW_FAULT && s->incomplete && s->retry_until) {
 		s->disarm[SV_TRIG_RETRY]++;
 		sv_disarm_run(s, io, cfg, SV_TRIG_RETRY);
+		return;
+	}
+
+	/*
+	 * Follow-up mode (WP3-DESIGN §2.2): a debugfs forced path kept S
+	 * steering. Once the PPE has released, the same begin_disarm as X1
+	 * succeeds and X2-X10 clear steering; until then, look again every
+	 * SV_YIELD_PERIOD_S without a log line. The FAULT stays latched.
+	 */
+	if (s->state == RTL8_4S_SW_FAULT && s->forced_live) {
+		s->disarm[SV_TRIG_FORCED_FOLLOWUP]++;
+		if (!io->sw_begin_disarm(io->ctx, &ppe)) {
+			s->last_ppe = ppe;
+			io->timer(io->ctx, true,
+				  (unsigned long)SV_YIELD_PERIOD_S * cfg->hz);
+			return;
+		}
+		s->followup_n++;
+		SV_SET_STATE(s, RTL8_4S_SW_DISARMING);
+		ret = sv_disarm_run(s, io, cfg, SV_TRIG_FORCED_FOLLOWUP);
+		sv_log(io, SV_LOG_WARN, "svlan: forced follow-up disarm %d\n",
+		       ret);
 		return;
 	}
 
@@ -831,7 +995,7 @@ void sv_seq_work(struct sv_seq *s, const struct sv_io *io,
 	}
 	if (!s->yield_logged)
 		sv_log(io, SV_LOG_INFO, "svlan: deadline reached, disarming\n");
-	ret = sv_seq_disarm(s, io, cfg, SV_TRIG_DEADLINE, false);
+	ret = sv_seq_disarm(s, io, cfg, SV_TRIG_DEADLINE, 0);
 	if (ret != -EBUSY || s->state != RTL8_4S_SW_READY)
 		return;
 	if (!s->yield_logged) {
@@ -841,6 +1005,134 @@ void sv_seq_work(struct sv_seq *s, const struct sv_io *io,
 		s->yield_logged = true;
 	}
 	io->timer(io->ctx, true, (unsigned long)SV_YIELD_PERIOD_S * cfg->hz);
+}
+
+static int sv_renew_refuse(struct sv_seq *s, const struct sv_io *io,
+			   unsigned int cause, int err, const char *why)
+{
+	s->renew_refused[cause]++;
+	sv_log(io, SV_LOG_INFO, "svlan: renew refused (%s)\n", why);
+	return err;
+}
+
+/*
+ * WP3-DESIGN §2.5: the lease. Memory only, no register: the new deadline
+ * is published to the tagger (td->disarm_at, which the PPE caps its own
+ * deadline by) and the deadline work moved. Renewing under a claim is the
+ * point; it only ever moves the deadline later.
+ */
+int sv_seq_renew(struct sv_seq *s, const struct sv_io *io,
+		 const struct sv_cfg *cfg, unsigned int secs)
+{
+	unsigned long now, at;
+
+	if (secs < SV_DEADLINE_MIN_S || secs > SV_DEADLINE_MAX_S)
+		return sv_renew_refuse(s, io, SV_RENEW_RANGE, -EINVAL, "range");
+	if (s->state != RTL8_4S_SW_READY)
+		return sv_renew_refuse(s, io, SV_RENEW_STATE, -ENOTCONN,
+				       "state");
+	now = io->jiffies(io->ctx);
+	at = now + (unsigned long)secs * cfg->hz;
+	if (sv_before(at, s->disarm_at))
+		return sv_renew_refuse(s, io, SV_RENEW_SHORTER, -ERANGE,
+				       "shorter");
+	s->disarm_at = at ?: 1;
+	/* READY: accept is S; s_ports unchanged, disarm_at released with it. */
+	sv_accept(s, io, RTL8_4S_ACCEPT_S);
+	s->yield_logged = false;
+	io->timer(io->ctx, true, sv_deadline_step(cfg, s->disarm_at - now));
+	s->renew_ok++;
+	return 0;
+}
+
+/* The isolate cpu restore: the word read before the bench write, back. */
+static void sv_iso_bench_restore(struct sv_seq *s, const struct sv_io *io,
+				 const struct sv_cfg *cfg)
+{
+	int ret;
+
+	s->iso_bench_live = false;
+	ret = sv_cpu_word(io, cfg, NULL, s->iso_bench_was);
+	if (ret)
+		sv_log(io, SV_LOG_ERR,
+		       "svlan: isolate cpu restore FAILED: CPU port %u word %#x: %d\n",
+		       cfg->cpu, s->iso_bench_was, ret);
+	else
+		sv_log(io, SV_LOG_INFO, "svlan: isolate cpu restored (%#x)\n",
+		       s->iso_bench_was);
+}
+
+/*
+ * WP3-DESIGN §2.6, a bench verb (I4-S2a): the CPU port isolated for @secs
+ * while the PPE is ACTIVE, nothing else written and no state changed, so
+ * that a PPE frame met by the isolation alone can be looked for. A forced
+ * path in the window cancels the restore (sv_forced()); ctl_stop cancels
+ * the work, as REMOVE and SHUTDOWN isolate anyway.
+ */
+int sv_seq_iso_bench(struct sv_seq *s, const struct sv_io *io,
+		     const struct sv_cfg *cfg, unsigned int secs, u8 ppe)
+{
+	u32 was = SV_WORD_UNREAD;
+	int ret;
+
+	if (secs < SV_ISO_BENCH_MIN_S || secs > SV_ISO_BENCH_MAX_S) {
+		sv_log(io, SV_LOG_INFO,
+		       "svlan: isolate cpu refused (range): %u..%u s\n",
+		       SV_ISO_BENCH_MIN_S, SV_ISO_BENCH_MAX_S);
+		return -EINVAL;
+	}
+	if (s->state != RTL8_4S_SW_READY || ppe != RTL8_4S_PPE_ACTIVE) {
+		sv_log(io, SV_LOG_INFO,
+		       "svlan: isolate cpu refused (state): sw %s, ppe %s\n",
+		       sv_sw_state_name(s->state), sv_ppe_name(ppe));
+		return -ENOTCONN;
+	}
+	if (s->iso_bench_live) {
+		sv_log(io, SV_LOG_INFO, "svlan: isolate cpu refused (busy)\n");
+		return -EBUSY;
+	}
+	s->iso_bench_n++;
+	/* One try: a failure is the result, after the restore. */
+	ret = io->cpu_word(io->ctx, cfg->cpu, &was, 0);
+	/* A word not read is restored to what setup wrote. */
+	s->iso_bench_was = was == SV_WORD_UNREAD ? cfg->user_mask : was;
+	if (ret) {
+		sv_log(io, SV_LOG_ERR, "svlan: isolate cpu %u: FAILED (%d)\n",
+		       secs, ret);
+		sv_iso_bench_restore(s, io, cfg);
+		return -EIO;
+	}
+	s->iso_bench_live = true;
+	io->iso_timer(io->ctx, true, (unsigned long)secs * cfg->hz);
+	sv_log(io, SV_LOG_INFO, "svlan: isolate cpu %u: ok (was %#x)\n", secs,
+	       was);
+	return 0;
+}
+
+void sv_seq_iso_restore(struct sv_seq *s, const struct sv_io *io,
+			const struct sv_cfg *cfg)
+{
+	if (s->iso_bench_live)
+		sv_iso_bench_restore(s, io, cfg);
+}
+
+bool sv_seq_quiesce_keep_s(const struct sv_seq *s)
+{
+	return SV_ONCE(s->forced_live);
+}
+
+int sv_latch_check(struct sv_latch *l)
+{
+	if (!SV_ONCE(l->latched))
+		return 0;
+	l->refused++;
+	return -EBUSY;
+}
+
+void sv_latch_note(struct sv_latch *l, const struct sv_seq *s)
+{
+	if (s->bind_latch)
+		SV_ONCE(l->latched) = true;
 }
 
 static int sv_refuse(struct sv_seq *s, const struct sv_io *io,
@@ -968,7 +1260,7 @@ int sv_seq_arm(struct sv_seq *s, const struct sv_io *io,
 {
 	struct sv_verify v = { .io = io, .cfg = cfg, .pfx = "svlan: A9: ",
 			       .lvl = SV_LOG_ERR };
-	const char *fa, *fb, *fc;
+	const char *fa, *fb, *fc, *fd;
 	unsigned int i, step = SV_STEP_NONE;
 	unsigned long now, at;
 	struct sv_field f;
@@ -1058,7 +1350,7 @@ int sv_seq_arm(struct sv_seq *s, const struct sv_io *io,
 rollback:
 	s->arm_fail++;
 	sv_note(s, step, ret);
-	err = sv_seq_disarm(s, io, cfg, SV_TRIG_ROLLBACK, false);
+	err = sv_seq_disarm(s, io, cfg, SV_TRIG_ROLLBACK, 0);
 	if (s->state == RTL8_4S_SW_OFF) {
 		sv_log(io, SV_LOG_ERR, "svlan: arm failed at %s: %d; rolled back\n",
 		       sv_step_name(step), ret);
@@ -1067,10 +1359,10 @@ rollback:
 		       "svlan: arm failed at %s: %d; ROLLBACK FAILED (refused)\n",
 		       sv_step_name(step), ret);
 	} else {
-		sv_fault_names(s->fault, &fa, &fb, &fc);
+		sv_fault_names(s->fault, &fa, &fb, &fc, &fd);
 		sv_log(io, SV_LOG_ERR,
-		       "svlan: arm failed at %s: %d; ROLLBACK FAILED (fault%s%s%s)\n",
-		       sv_step_name(step), ret, fa, fb, fc);
+		       "svlan: arm failed at %s: %d; ROLLBACK FAILED (fault%s%s%s%s)\n",
+		       sv_step_name(step), ret, fa, fb, fc, fd);
 	}
 	return ret;
 }
@@ -1164,24 +1456,33 @@ bool sv_seq_may_be_live(const struct sv_seq *s)
 		return false;
 	if (state != RTL8_4S_SW_FAULT)
 		return true;
-	return SV_ONCE(s->incomplete);
+	return SV_ONCE(s->incomplete) || SV_ONCE(s->forced_live);
 }
 
 bool sv_seq_expect_armed(const struct sv_seq *s)
 {
 	return s->state == RTL8_4S_SW_READY ||
-	       (s->state == RTL8_4S_SW_FAULT && s->incomplete &&
-		s->armed_intact);
+	       (s->state == RTL8_4S_SW_FAULT && s->armed_intact &&
+		(s->incomplete || s->forced_live));
 }
 
-int sv_seq_show(const struct sv_io *io, const struct sv_cfg *cfg, bool armed,
-		const struct sv_out *out)
+int sv_seq_show(const struct sv_seq *s, const struct sv_io *io,
+		const struct sv_cfg *cfg, const struct sv_out *out)
 {
 	struct sv_verify v = { .io = io, .cfg = cfg, .out = out };
+	bool armed = sv_seq_expect_armed(s);
+	struct sv_field f;
 	unsigned int i, n;
 	u32 t;
 
-	if (sv_verify_run(&v, armed, SVV_ALL)) {
+	/* Only setup restores the CPU port after F1 (WP3-DESIGN D4). */
+	t = s->fault & SV_FAULT_FORCED_PPE ? 0 : cfg->user_mask;
+	f = (struct sv_field){ RTL837X_PORT_ISOLATION_REG(cfg->cpu),
+			       RTL837X_PORT_ISOLATION_MASK, t, t, SV_STEP_NONE,
+			       "CPU isolation" };
+	sv_verify_run(&v, armed, SVV_ALL);
+	sv_v_field(&v, &f, t);
+	if (!v.nbad) {
 		out->print(out->ctx, "expect %s: match\n", armed ? "armed" : "off");
 		return 0;
 	}

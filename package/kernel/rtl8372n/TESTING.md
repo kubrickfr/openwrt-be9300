@@ -397,10 +397,11 @@ config bridge-vlan
 
 `rtl8372n_dsa.svlan=1`, latched at probe, binds the `rtl8_4s` tagger of
 patch 0460 instead of `rtl8_4` (`tagging` writes are refused either way).
-`/sys/kernel/debug/rtl8372n/svlan` then arms (`arm <deadline_s>`, 30-86400)
-and disarms (`disarm`, `disarm force`) with the LAN up, and reads the S block
-back (idle only); `svlan_counters` reads memory only and may be read under
-load. With `svlan=0` (the default) the driver is the offload driver plus the
+`/sys/kernel/debug/rtl8372n/svlan` then arms (`arm <deadline_s>`, 30-86400),
+renews (`renew <deadline_s>`) and disarms (`disarm`, `disarm force`) with
+the LAN up, and reads the S block and the CPU port's isolation word back
+(idle only); `svlan_counters` reads memory only and may be read under load.
+The bench verbs `disarm force nophy` and `isolate cpu <s>` exist for 8.4. With `svlan=0` (the default) the driver is the offload driver plus the
 S block off writes at setup and quiesce, and setup fails if the S-VLAN uplink
 cannot be cleared. VIDs 3900-3919 are refused on bridge ports, the host and
 8021q uppers while `svlan=1`.
@@ -414,6 +415,7 @@ cannot be cleared. VIDs 3900-3919 are refused on bridge ports, the host and
 | D3 | Switch harness: arm, disarm, retry and deadline sequences on a fake regmap with a fault at every I/O; deadlines from 30 s to 86400 s in steps of at most 30 s against a model of the timer wheel; REMOVE and SHUTDOWN never queue the work; the topology notes' predicate; the state-word race on threads; `svlan_counters` makes no register access; the contract header is 0460's | all pass under ASan/UBSan; fails on each of five injected sequence bugs |
 | D4 | Lifetime and concurrency review (tagger connect/disconnect, control window, deadline work, shutdown order), one Codex and one Claude round | done: an S-tag's user port is found from the CPU port rcv loaded (the conduit teardown clears `dsa_ptr` under it); the arm never waits for the svlan lock under RTNL and the debugfs disarm waits killably; the deadline work waits 30 s at most at a time (the timer wheel fires a 1800 s delay up to 41 s late at HZ 100); the bridge-leave warning only while S-R may be live; REMOVE and SHUTDOWN leave no retry. The 8 byte tag path keeps `rtl8_4_tag_rcv()`'s own `dsa_ptr` load, as upstream `rtl8_4` |
 | D5 | 0460 adds lines only; scrub check | 0 and 0 |
+| D6 (WP3, 2026-11-04) | `sr/wp3/harness/switch`: the forced path for REMOVE, SHUTDOWN and `disarm force` over each claimed PPE state (FAULT published before F1, the ppe byte kept, no S block, C2S or entry write, the bind latch on REMOVE only), F1/F2 failures and `nophy`, a fault at every I/O of the forced path and of the follow-up disarm, the follow-up (silent while the PPE holds, X2-X10 once it is off, nothing queued after REMOVE/SHUTDOWN), `renew` (refusals, forward only, memory only), `isolate cpu` (refusals, restore of the word read first, cancelled by a forced path, restore after a failed write), the bind latch, the CPU word in the `svlan` read, F0 raced against claim/move/release on threads, the glue order (quiesce isolates and powers down before the S off values; the probe checks the latch before any register access), the stop regex over every log line; WP1's D3 harness re-run; package built with `-Werror` and W=1, checkpatch `--strict` | all pass under ASan/UBSan; fails on each of 23 injected bugs; 0 compiler warnings; checkpatch as D1 (the volatile store, the user-space `format` attribute, macro argument reuse) |
 
 ### 8.2 Live acceptance (image 2 with the two modules hot-swapped, `flow_offload=0`): L1-L5 run 2026-11-03 (8.3)
 
@@ -481,3 +483,82 @@ GRO is unaffected, and software forwarding through them ran at
 Not run yet: Wi-Fi to wired, LAN-to-LAN, throughput, traps, the forged
 "port 7" frame, own-port 39xx C-VIDs and the nested 88a8, foreign 39xx
 forms, configuration while armed, L6, L7 and L8.
+
+### 8.4 WP3: forced isolation, lease, bench verbs (desk only so far)
+
+`svlan` takes one verb per write:
+
+| Verb | Effect | Errors |
+| --- | --- | --- |
+| `arm <s>` | as 8.2 | as 8.2 |
+| `renew <s>` (30-86400) | READY only: the deadline becomes now + s, never earlier (equal is accepted); memory only, no register, no log line on success | `-EINVAL` range, `-ENOTCONN` not READY (FAULT included), `-ERANGE` shorter; each logs `svlan: renew refused (range\|state\|shorter)` |
+| `disarm` | as 8.2; refused (`-EBUSY`) while the PPE holds a claim | |
+| `disarm force` | PPE off: an ordinary disarm. Over a claim: the forced path below | `-EIO` when neither barrier verified |
+| `disarm force nophy` (bench) | the same without the PHY power-down | as above |
+| `isolate cpu <s>` (bench, 1-10) | READY with the PPE ACTIVE: the CPU port's isolation word (`0x50cc`) to 0, read back, and the word read first written back after s seconds; nothing else written, no state changed | `-EINVAL`, `-ENOTCONN`, `-EBUSY` (one already running), `-EIO` (read-back failed; the restore was attempted) |
+
+**Forced path.** A disarm that finds the PPE holding S-R (its byte of the
+state word not off) on REMOVE (unbind), SHUTDOWN (`svlan_shutdown_disarm=1`)
+or `disarm force` does not clear steering. It publishes sw FAULT keeping the
+ppe byte (offers decline, no claim or move succeeds), isolates the CPU port
+(F1: `0x50cc` to 0, read back) and powers the armed PHYs down (F2: OCP
+`0xa610` = `0x2858`, each read back), and keeps the S block, the entries,
+accept and the deadline as they are: a PPE frame is then either blocked or
+delivered correctly. REMOVE and SHUTDOWN WARN once. It logs `svlan: forced
+(<trigger>): ppe <state>, CPU port 3 isolation ok|FAILED (was <word>), PHYs
+0xf0 down|FAILED|skipped; S steering kept`, and `svlan: forced isolation
+FAILED (<trigger>)` when neither barrier verified. After `disarm force` the
+deadline work looks every 5 s, silently, and once the PPE is off disarms by
+itself (`svlan: disarmed (forced_followup)`, `svlan: FAULT latched:
+forced_ppe`, `svlan: forced follow-up disarm <ret>`); the switch stays in
+FAULT with the CPU port isolated until a rebind (`ppe-sr rewire`, which is
+`rmmod` and `modprobe rtl8372n_dsa`, PPE off only) or a reboot. Teardown
+after a forced REMOVE isolates every port first, then powers the PHYs down,
+and keeps the S block (`svlan: quiesce: S steering kept (forced)`); the
+next setup's `svlan: pre-reset` line shows whether the soft reset clears it.
+
+**Bind latch and module reference.** After a forced REMOVE every bind is
+refused (`-EBUSY`, `svlan: bind refused: ...`, before any register access)
+until `rtl8372n_dsa` is reloaded. qcom-ppe holds a reference on this module
+while it may emit S-R frames, so `rmmod rtl8372n_dsa` fails ("in use") until
+the PPE is off, FAULT included. Sysfs unbind ignores module references, hence
+the latch.
+
+**`svlan_counters` additions:** `fault ... forced_ppe`; `disarm_forced_followup`
+(follow-up ticks); `forced_n`; `forced_trig remove|shutdown|debugfs|none`;
+`forced_ppe_state sr_ready|active|fault|none`; `forced_iso cpu ok|FAILED|-
+phy ok|FAILED|skipped|-`; `forced_cpu_was` (the CPU word F1 read first;
+`0xffffffff` if that read failed); `forced_us`; `steer_live` (S steering may
+be live: not OFF, and not a FAULT with the uplink verified clear);
+`iso_failed`; `renew_ok`, `renew_refused_range|state|shorter`; `followup_n`;
+`bind_refused` (counted in a module-static, so a reload, the only way to bind
+again, resets it: the log line is the evidence); `iso_bench_n`; `last_err`
+steps F1 and F2. The `svlan` read adds `CPU isolation 0x50cc`, expecting 0
+under `forced_ppe` and the user ports otherwise.
+
+Stop lines (the union with the PPE's and the controller's, WP3-DESIGN §4.7):
+
+```
+rtl8_4s: drop|svlan: (disarm refused|disarm incomplete|disarm retry gave up|entry removal failed|arm failed|deadline yields|S-VLAN uplink not cleared|FAULT latched|forced|quiesce: S steering kept|bind refused|isolate cpu restore FAILED)|svlan: (off|quiesce) .*MISMATCH|S-VLAN block not off|ppe_offload: sr: (FAULT|verify MISMATCH|switch left READY|switch gone)|ppe-sr: (enable failed|unwind failed|rewire failed|FAULT|health FAIL|stop)
+```
+
+Routine: `svlan: armed`, `disarmed (<trigger>)`, `renew refused`, `isolate
+cpu <s>: ok`, `isolate cpu restored`, `isolate cpu refused`. `svlan: isolate
+cpu <s>: FAILED` is a bench result, not a stop line.
+
+Live drills (WP5 I4, owner OK per step, management over Wi-Fi; fixture:
+PPE ACTIVE, a 100 pps marked UDP download and a TCP download in hardware,
+witnesses on lan2 and lan1 capturing `ether proto 0x88a8 or vlan`):
+
+| # | Do | Expect |
+| --- | --- | --- |
+| I4-S1 | `echo 90000.mdio-1:1d > /sys/bus/mdio_bus/drivers/rtl8372n-mdio/unbind` | `svlan: forced (remove)`, one WARN, then in any order the PPE's `switch left READY`/`switch gone` and `disarmed (user_gone\|switch_not_ready)`, `svlan: lanN left the VLAN-aware bridge while armed` (expected here: steering is live), `svlan: quiesce: S steering kept (forced)`; no 88a8 or marker frame as VLAN-1 data at any witness; PPE off. `bind` refused (`svlan: bind refused`); `rmmod rtl8372n_dsa` then succeeds (PPE `sw_module_ref 0`); reload with `svlan=1`; record its `svlan: pre-reset` line |
+| I4-S2a | `isolate cpu 10` with the download running | PPE stays ACTIVE and its hardware counter advances; markers at lan2 during the window (K2a) and a router-to-lan2 ping (K2c) recorded; `svlan: isolate cpu restored`, CPU word back |
+| I4-S2b | `disarm force nophy` with the download running | `forced_iso cpu ok phy skipped`; PPE off within 30 s; follow-up with no manual step: FAULT, `steer_live 0`, accept 8899; router-to-lan2 ping recorded (K2c in FAULT); `ppe-sr rewire` brings OFF |
+| I4-S3 | `disarm force` from ACTIVE, once | lan1-4 down, `forced_iso cpu ok phy ok`, PPE off, follow-up; `ppe-sr rewire` brings lan1-4 back |
+
+S2b and S3 allowlist `switch left READY`, `FAULT latched: forced_ppe` and
+`forced follow-up`; S1 allowlists `switch gone`, `switch left READY`,
+`quiesce: S steering kept` and `bind refused`, each only after its own
+`svlan: forced` line. SHUTDOWN over a claim (the PPE's reboot notifier
+skipped) is desk-only.

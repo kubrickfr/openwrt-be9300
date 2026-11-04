@@ -132,6 +132,8 @@ enum rtl837x_cpu_tag_insert {
 #define RTL837X_PORT_ISOLATION_BASE                 0x50c0
 #define RTL837X_PORT_ISOLATION_REG(port) \
 	(RTL837X_PORT_ISOLATION_BASE + ((port) * 4))
+/* The ports, 0-9, that frames entering this port may leave by. */
+#define RTL837X_PORT_ISOLATION_MASK                 GENMASK(9, 0)
 
 /* Public ZTE DSA map: per-port learning limit and global flood masks. */
 #define RTL837X_L2_LEARN_LIMIT_REG(port) (0x5384 + (port) * 4)
