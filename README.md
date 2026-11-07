@@ -66,7 +66,7 @@ profiles of the trees it grew from are not carried.
 | LAN (RTL8372N via DSA + EDMA/PPE) | working with the new driver, one bridge switched in hardware (bench results in `package/kernel/rtl8372n/TESTING.md`) |
 | WAN (2.5G) | working at 2.5 Gbps; 1G/100M link rates untested |
 | VLANs (bridge-vlan on DSA) | working: one VLAN-aware bridge offloaded, access and trunk ports, tagged-only ports; checked with traffic between two LAN ports (open checks in `TESTING.md`) |
-| Flow offloading | PPE hardware offload of IPv4 downloads (NAT, PPPoE over a VLAN WAN), on by default on this board, used when "Hardware flow offloading" is selected in LuCI; uploads, Wi-Fi and IPv6 stay in the software flowtable. Validated live on one gateway, October 2026 (see below) |
+| Flow offloading | PPE hardware offload of IPv4 downloads (NAT, PPPoE over a VLAN WAN), on by default on this board, used when "Hardware flow offloading" is selected in LuCI; uploads, Wi-Fi and IPv6 stay in the software flowtable (uploads can be offloaded only in the experimental S-R mode, package `ppe-sr`, off by default and desk-tested only). Validated live on one gateway, October 2026 (see below) |
 | Wi-Fi 7, all three bands | working |
 | MLO (AP MLD across 2.4/5/6 GHz) | working |
 | DFS | working: CAC and secondary AP after CAC tested (a radar event itself not yet tested) |
@@ -135,7 +135,8 @@ Offloading → Flow offloading type**:
 - **Hardware flow offloading** (recommended). The PPE forwards IPv4
   downloads into the LAN switch, including PPPoE over a VLAN WAN.
   Everything it declines runs in the software flowtable: uploads, Wi-Fi
-  clients, IPv6, and VLANs other than 1.
+  clients, IPv6, and VLANs other than 1 (some uploads and other VLANs are
+  offloaded in the experimental S-R mode, see Known effects).
 - **Software flow offloading.** The software flowtable only, built on
   `br-lan`: a flow through `br-lan` is then not offloaded at all (see
   Software flowtable notes), so flows to LAN and Wi-Fi clients take the
@@ -162,7 +163,7 @@ kmod-qcom-ppe options `KERNEL_QCOM_PPE_FLOW_OFFLOAD` and
 - `/sys/module/qcom_ppe/parameters/` changes it at runtime.
 - Its state is in `/sys/kernel/debug/ppe/offload_flows`. `declined` counts
   offers, not flows: the kernel re-offers each active flow about once a
-  second, and every upload half is declined.
+  second, and every upload half is declined (outside the S-R mode).
 
 **Quality status, October 2026: validated live on one GL-BE9300.** The line
 is FTTH, with PPPoE over the ISP's WAN VLAN, 2.2/0.8 Gbit/s. Offload ran there for four days
@@ -223,7 +224,12 @@ only if something else on the line upstream of the ONT can send them
 - **Uploads stay in software.** The PPE's parser cannot read past the
   switch's `rtl8_4` tag. Only the switch-side tag emulation is used
   (egress only); the ingress parser alias that would offload uploads breaks
-  a VLAN WAN.
+  a VLAN WAN, and its bench profile A is dropped (0461). The experimental
+  S-R mode (patches 0460-0468, package `ppe-sr`, nothing enabled by
+  default) has the switch put a per-port S-tag on uploads so that the PPE
+  can offload them. The switch side (0460, `svlan=1`) had one short live
+  session (`package/kernel/rtl8372n/TESTING.md` section 8.3); the PPE side
+  (0461-0468) and `ppe-sr` are desk-tested only.
 
 ### Software flowtable notes
 
@@ -244,10 +250,11 @@ hardware offloading for every flow the PPE declines.
 - Do not combine flow offloading with SQM on a PPPoE or VLAN WAN: the
   flowtable catches downloads on the device below (`wan`), so they skip a
   download (ingress) shaper on `pppoe-wan` or on the VLAN device. Uploads
-  are still shaped, and so are both directions with SQM on a plain `wan`.
-  With `flow_offloading_hw=1` fw4 also lists the device below a VLAN WAN,
-  which is the case of firewall4 issue #114. The downloads the PPE forwards
-  skip every shaper, on any WAN.
+  are still shaped (except those the PPE forwards, below), and so are both
+  directions with SQM on a plain `wan`. With `flow_offloading_hw=1` fw4
+  also lists the device below a VLAN WAN, which is the case of firewall4
+  issue #114. The downloads the PPE forwards skip every shaper, on any
+  WAN, and so do the uploads it forwards in the experimental S-R mode.
 - Pending patch 716 marks the frames the flowtable sends straight to a
   switch port for TX forwarding offload, as the bridge does for the frames
   it forwards, so that the switch delivers them from its own FDB; for
@@ -407,8 +414,8 @@ picked from it since.
   adds a safety layer, PPPoE download offload, and an egress-only emulation
   of the `rtl8_4` tag (patches 0435–0439, 0441 and 0442, kernel pending
   714). His ingress
-  parser alias is kept only as a bench-only profile: it stops 802.1Q
-  parsing on the WAN. His IPv6 path and `tag_8021q` encapsulation are not
+  parser alias was kept as a bench-only profile (0439) and is dropped by
+  0461: it stops 802.1Q parsing on the WAN. His IPv6 path and `tag_8021q` encapsulation are not
   carried. The switch uses the native `rtl8_4` tag, with perceival's EDMA
   checksum fallback carried as patch 0431. See
   `target/linux/qualcommbe/docs/ppe-flow-offload/PROVENANCE.md`.

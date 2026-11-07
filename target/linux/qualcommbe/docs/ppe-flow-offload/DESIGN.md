@@ -1,7 +1,9 @@
 # PPE flow offload for PPPoE on the GL-BE9300: design
 
 Branch `be9300-next-ppe-pppoe`, on top of `be9300-next-rtl8372n`, kernel
-6.18. Validated live on one GL-BE9300 between 2026-10-22 and 2026-10-27
+6.18. On `be9300-next-sr`, 0461 drops profile A (section 8) and 0460-0468
+add the S-R mode, which offloads uploads through per-port S-tags; this
+document describes the ppe-pppoe series. Validated live on one GL-BE9300 between 2026-10-22 and 2026-10-27
 (TESTING.md section 0). The fake-ISP rig was never built, so the gates that
 need it are still open (section 9). Evidence labels: **[src]** read from
 a public source (PROVENANCE.md has path:line), **[meas-P]** measured by Kamil
@@ -568,7 +570,7 @@ That such an interface (bound to no port, MAC_BITMAP 0, routing off; the
 vendor always sets routing) gives a nexthop its source MAC, with its MTU
 the one checked, is hypothesis HB.
 
-## 8. Profile A (bench only, 0439)
+## 8. Profile A (bench only, 0439; dropped by 0461 on be9300-next-sr)
 
 perceival's full ingress alias, on top of E: IPR and TPR VLAN_TPID =
 0x88990000 (S 0x8899, C 0x0000); PORT_EG_VLAN[0] (CPU port) VLAN_TYPE,

@@ -344,8 +344,9 @@ config bridge-vlan
   - Routed traffic crosses the CPU unless both are on.
   - With both on, only downloads into the switch are offloaded (the
     nexthop emulates the rtl8_4 tag).
-  - Uploads from the switch cross the CPU, except under the PPE offload's
-    bench-only profile A.
+  - Uploads from the switch cross the CPU, except in the S-R mode (section
+    8). The PPE offload's bench profile A, which also let them hit, is
+    dropped by 0461.
 - The PPE parser does not walk past the 8-byte rtl8_4 tag: frames from the
   LAN ports nearly all land on one EDMA Rx ring and CPU (95% on one PPE queue
   in 1.3; RPS still spreads the protocol work) and get no Rx checksum offload
@@ -354,8 +355,9 @@ config bridge-vlan
   offload series) reprograms the chip-wide TPIDs (ingress C-TPID 0x0000) and
   the CPU port's egress VLAN mode; his own notes record that flows entering
   through a tagged WAN then never hit, so a VLAN WAN loses its offload and,
-  by the same parse, its RSS spread and Rx checksum. Carried only as the PPE
-  offload's bench profile A (0439), applied for minutes on a bench.
+  by the same parse, its RSS spread and Rx checksum. Carried as the PPE
+  offload's bench profile A (0439), applied for minutes on a bench, and
+  dropped by 0461.
 - In a VLAN-unaware offloaded bridge, unicast tagged with a VID other than 1
   towards the router floods to the bridge ports: use a VLAN-aware br-lan for
   VLANs that end on the router.
