@@ -874,9 +874,8 @@ static int rtl8372n_port_bridge_join(struct dsa_switch *ds, int port,
 	/*
 	 * The driver programs 802.1Q VLANs only: offloaded, a bridge with
 	 * another vlan_protocol (802.1ad) would have its S-tagged frames
-	 * switched by C-tag rules without any error. DSA does not pass a
-	 * later protocol change on to the driver, so this holds only for the
-	 * protocol the bridge has when the port joins.
+	 * switched by C-tag rules without any error. A later protocol change
+	 * is refused by rtl8372n_port_vlan_protocol().
 	 */
 	if (!br_vlan_get_proto(bridge.dev, &proto) && proto != ETH_P_8021Q) {
 		NL_SET_ERR_MSG_MOD(extack,
@@ -932,6 +931,27 @@ static int rtl8372n_port_bridge_join(struct dsa_switch *ds, int port,
 	dev_dbg(priv->dev, "port %d joined bridge %u, linked %#x\n", port,
 		bridge.num, peers);
 	return 0;
+}
+
+/*
+ * Refuse a vlan_protocol change on a bridge this port offloads, for the
+ * reason rtl8372n_port_bridge_join() refuses to offload a bridge that is
+ * not 802.1Q. DSA calls this only for ports that offload the bridge
+ * (OpenWrt's pending 644); ports bridged in software are not asked. The
+ * bridge treats -EOPNOTSUPP as acceptance, so the refusal is -EBUSY: take
+ * the ports out of the bridge, change the protocol, and add them back,
+ * which bridges them in software.
+ */
+static int rtl8372n_port_vlan_protocol(struct dsa_switch *ds, int port,
+				       u16 proto,
+				       struct netlink_ext_ack *extack)
+{
+	if (proto == ETH_P_8021Q)
+		return 0;
+
+	NL_SET_ERR_MSG_MOD(extack,
+			   "Only 802.1Q bridges are offloaded: remove the switch ports, change the protocol, then add them back");
+	return -EBUSY;
 }
 
 /*
@@ -1561,6 +1581,7 @@ static const struct dsa_switch_ops rtl8372n_switch_ops_mdio = {
 	.port_pre_bridge_flags = rtl8372n_port_pre_bridge_flags,
 	.port_bridge_flags = rtl8372n_port_bridge_flags,
 	.port_vlan_filtering = rtl8372n_port_vlan_filtering,
+	.port_vlan_protocol = rtl8372n_port_vlan_protocol,
 	.port_vlan_add = rtl8372n_port_vlan_add,
 	.port_vlan_del = rtl8372n_port_vlan_del,
 	.port_stp_state_set = rtl8372n_port_stp_state_set,

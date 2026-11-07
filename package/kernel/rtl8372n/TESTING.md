@@ -357,10 +357,10 @@ config bridge-vlan
   still drops that VID from the port in the switch (DSA adds it first):
   delete and re-add the bridge VLAN.
 - A port joining a bridge whose `vlan_protocol` is not 802.1Q (802.1ad) is
-  bridged in software. DSA does not pass a later protocol change on to the
-  driver: ports of an offloaded bridge switched to 802.1ad stay offloaded
-  with 802.1Q rules until they are taken out and added back. Set the
-  protocol before adding the ports.
+  bridged in software. Switching an offloaded bridge to 802.1ad is refused
+  (`Device or resource busy`, through OpenWrt's pending 644; not yet run on
+  hardware): take the switch ports out, change the protocol, and add them
+  back. Set the protocol before adding the ports.
 - Only learning, flood, mcast_flood and bcast_flood are offloaded; other
   bridge port flags (isolated, hairpin, locked, MAB, multicast-to-unicast)
   are refused on offloaded ports (`RTNETLINK answers: Not supported`; MAB
