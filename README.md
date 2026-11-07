@@ -65,7 +65,7 @@ profiles of the trees it grew from are not carried.
 | LAN (RTL8372N via DSA + EDMA/PPE) | working |
 | WAN (2.5G) | working at 2.5 Gbps; 1G/100M link rates untested |
 | VLANs (bridge-vlan on DSA) | working, with one VLAN-filtering bridge on the switch ports (see Known issues) |
-| Flow offloading | software flowtable only; no PPE hardware flow offload (see below) |
+| Flow offloading | software flowtable only (set `flow_offloading_hw=1`, see below); no PPE hardware flow offload |
 | Wi-Fi 7, all three bands | working |
 | MLO (AP MLD across 2.4/5/6 GHz) | working |
 | DFS | working: CAC and secondary AP after CAC tested (a radar event itself not yet tested) |
@@ -75,7 +75,9 @@ profiles of the trees it grew from are not carried.
 Throughput measured between two units over a 2.5G trunk: **~1.8–1.9 Gbit/s**.
 Through a PPPoE WAN with software flowtable offload: **2.04 Gbit/s down**
 (4 TCP streams, PPE clock 200 MHz, 2026-10-04), with no drops in the
-EDMA/PPE counters. The busiest core was at 78% softirq.
+EDMA/PPE counters. The busiest core was at 78% softirq. That was measured
+with `br-lan` in the flowtable (`flow_offloading_hw=0`), a path that this
+tree no longer offloads (see Flow offloading).
 
 The kernel's AES and GCM use the ARMv8 Crypto Extensions (`aes-ce`,
 `gcm-aes-ce`; "qualcommbe: enable ARMv8 CE AES and GHASH in the kernel",
@@ -88,23 +90,33 @@ from it (`/etc/uci-defaults/99-gl-be9300-wifi-macs`).
 
 ## Flow offloading
 
-Use **software** flow offloading only:
+Turn on flow offloading with `flow_offloading_hw` set too:
 
 ```sh
 uci set firewall.@defaults[0].flow_offloading='1'
-uci set firewall.@defaults[0].flow_offloading_hw='0'
+uci set firewall.@defaults[0].flow_offloading_hw='1'
 uci commit firewall && fw4 reload
 ```
 
 - This tree has **no PPE hardware flow offload**: no driver implements
-  flowtable offload (`TC_SETUP_FT`).
-- fw4 builds the flowtable on the ports of `br-lan` (`lan1`–`lan4`) and the
-  Wi-Fi interfaces, not on `br-lan` itself, so flows to wired clients are
-  sent straight to a switch port. Since OpenWrt's fw4 update of 2026-10-25
-  (a3296754c154, "list lower devices for software flow offloading") it does
-  this in software mode too; before, only `flow_offloading_hw=1` did. fw4
-  still accepts `flow_offloading_hw=1`, because pending patch 701 makes its
-  probe pass, but nothing is offloaded to hardware then either.
+  flowtable offload (`TC_SETUP_FT`), so every offloaded flow stays in the
+  software flowtable. fw4 accepts `flow_offloading_hw=1` because pending
+  patch 701 makes its probe pass.
+- `flow_offloading_hw=1` is what makes fw4 build the flowtable on the ports
+  of `br-lan` (`lan1`–`lan4`) and the Wi-Fi interfaces instead of `br-lan`
+  itself. With `flow_offloading_hw=0` the flowtable lists `br-lan`, and since
+  OpenWrt's backport of "netfilter: flowtable: bail out if forward path
+  cannot be discovered" (706-03) a flow through `br-lan` is not offloaded at
+  all: flows to LAN and Wi-Fi clients take the normal forwarding path. fw4
+  briefly listed the ports in software mode too, but reverted that
+  (firewall4 issue #114); OpenWrt is working on a kernel fix
+  (openwrt/openwrt#26305) and a new fw4 change (firewall4 PR #116).
+- Do not combine flow offloading with SQM on a PPPoE or VLAN WAN: the
+  flowtable catches downloads on the device below (`wan`), so they skip a
+  download (ingress) shaper on `pppoe-wan` or on the VLAN device. Uploads
+  are still shaped, and so are both directions with SQM on a plain `wan`.
+  With `flow_offloading_hw=1` fw4 also lists the device below a VLAN WAN,
+  which is the case of firewall4 issue #114.
 - The flowtable marks the frames it sends straight to a switch port for TX
   forwarding offload (pending patch 716), as the bridge does for the frames
   it forwards: they go out on the bridge's VLAN and the switch delivers them
@@ -147,15 +159,16 @@ uci commit firewall && fw4 reload
     the first forwarding port: wired clients on the other ports cannot
     resolve the stations answered for. 766 hid this; both are off by
     default, so leave them off on this board.
-- Bypassing the bridge is worth a few percent on a single stream: with
+- Bypassing the bridge was worth a few percent on a single stream: with
   `lan1`–`lan4` in the software flowtable, one PPPoE download went from ~1.84
   to ~1.92–2.08 Gbit/s (2026-10-09, RPS on the WAN). That was measured with
-  the older fw4, the ports added by hand, and 766, before 716 replaced it.
+  `flow_offloading_hw=0`, the ports added by hand, and 766, before 716
+  replaced it. The ~1.84 baseline had `br-lan` in the flowtable, which this
+  tree no longer offloads: with `flow_offloading_hw=0` the difference is
+  now offload or none.
 - 716 does not cover ports of a VLAN-filtering bridge, nor flows offloaded
-  to hardware. Since fw4 now puts the ports in the flowtable in software
-  mode too, this applies to every flow-offloading setup: with VLAN
-  filtering, put the LAN on a `br-lan.N` VLAN interface, not directly on
-  `br-lan`.
+  to hardware: with VLAN filtering and the ports in the flowtable, put the
+  LAN on a `br-lan.N` VLAN interface, not directly on `br-lan`.
 - A PPPoE WAN cannot be hardware-offloaded even with the experimental PPE
   offload series in perceival/openwrt-flint3: that driver declines PPPoE in
   both directions.
