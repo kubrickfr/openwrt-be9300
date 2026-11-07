@@ -989,9 +989,9 @@ Assisted-by: Claude:claude-opus-5-5
  	return true;
  }
  
-+/* Every dissector key the match parsing below interprets. The flowtable
-+ * fills the VLAN keys without setting them in used_keys (see
-+ * ppe_offload_rule_has_vlan_key()); they are listed for when it does.
++/* Every dissector key the match parsing below interprets. The v6.18
++ * flowtable fills the VLAN keys without setting them in used_keys (see
++ * ppe_offload_rule_has_vlan_key()); OpenWrt's pending 709 sets them.
 + * A rule with any other key asks for a condition the flow entry would
 + * silently drop, so it is declined.
 + */
@@ -1325,12 +1325,12 @@ Assisted-by: Claude:claude-opus-5-5
 - * one. The software flowtable has the same blind spot -- its direct transmit
 - * path is bound to the port it resolved at creation -- and nothing lets a
 - * driver tear a flow down (the cookie is opaque). What the driver can do is
-+ * one. The software flowtable has the same blind spot for a client that
-+ * moves between two ports that both stay up -- its direct transmit path is
-+ * bound to the port it resolved at creation -- and nothing lets a driver
-+ * tear a flow down (the cookie is opaque). A move that takes the old
-+ * port's link down is not this case: the flowtable tears the flow down on
-+ * the carrier loss (pending 709) and offers it afresh. What the driver can
++ * one. The software flowtable also binds its direct transmit path to the
++ * port it resolved at creation. It tears the flow down when that port loses
++ * carrier (pending 717), and at its next gc pass once the bridge FDB names
++ * another port (OpenWrt's pending 708, nftables only); nothing lets a
++ * driver tear a flow down itself (the cookie is opaque). Until then, and
++ * for flows the flowtable never tears down, what the driver can
 + * do is
   * follow the move: the bridge learns the client's new port from the first
   * frame that reaches the CPU and reports it as SWITCHDEV_FDB_ADD_TO_DEVICE

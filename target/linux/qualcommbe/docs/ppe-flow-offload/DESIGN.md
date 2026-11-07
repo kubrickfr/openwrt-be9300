@@ -12,9 +12,10 @@ with a bench gate (section 9, TESTING.md).
 ## 0. Goal and scope
 
 Goal: CPU headroom at line rate on a PPPoE-over-VLAN WAN (2.2/0.8
-Gbit/s). Today a single-stream download runs at 2.0-2.16 Gbit/s with one core
-about 90% busy in the software flowtable [meas-U]; the upload is not limited
-by the router [meas-U]. The download is the target.
+Gbit/s). On 2026-10-21 a single-stream download ran at 2.0-2.16 Gbit/s with
+one core about 90% busy in the software flowtable [meas-U], with `br-lan` in
+the flowtable (`flow_offloading_hw=0`), a path this tree no longer offloads
+(README, Flow offloading); the upload is not limited by the router [meas-U]. The download is the target.
 
 Result [meas-U]: the downloads stay off the CPU. 0.01-0.2% of their
 packets reached it, at 1.3-2.2 Gbit/s. What remains on the CPU is the
@@ -27,7 +28,8 @@ sampling included (an idle router reads 2-4% per core; TESTING.md section
 BusyBox top, a four-core average, reads far lower.
 
 - **Current image** (with the generic backports 651-01/02, the ACKs take
-  the software flowtable; three runs of each on 2026-10-27):
+  the software flowtable; three runs of each on 2026-10-27; 651-01 is now
+  OpenWrt's own 706-04):
   - one stream at 1.3-1.8 Gbit/s costs 14-23% of one core (the two faster
     runs each include a second of a cron job);
   - Ookla's multi-stream download (2110-2133 Mbit/s) keeps the busiest
@@ -120,11 +122,12 @@ run. An image then
 offloads from boot whenever fw4's hardware flow offloading is on (section
 3). Profile A never applies itself.
 
-The branch also carries the generic backports `651-01/02` (image r37586
-has them):
-the flowtable keys on the VLAN ID, not the whole TCI, and resets the
-transport header. Without them, LAN uploads tagged with a priority missed
-the software flowtable [meas-U]. They are independent of the PPE.
+The tree also has two generic flowtable fixes (image r37586 had both, as
+the branch's backports `651-01/02`): the flowtable keys on the VLAN ID, not
+the whole TCI (OpenWrt now carries it as `backport-6.18/706-04`, and the
+branch dropped its 651-01), and resets the transport header (`651-02`,
+still the branch's). Without the first, LAN uploads tagged with a priority
+missed the software flowtable [meas-U]. They are independent of the PPE.
 
 `0433`/`0434` are Kamil's code from perceival/openwrt-flint3 (his patches
 0411-0456 at `2365932733`) ported onto this tree's EDMA base: IPv6, the
@@ -250,9 +253,16 @@ IPv4 is declined unless every header exception read back; TCP unless the
 flag exceptions did; PPPoE unless codes 1-3 did.
 
 **Fail closed on match keys.** A rule with a dissector key the driver does
-not interpret is declined. (The flowtable fills the VLAN keys without setting
-them in `used_keys`; the driver finds them by their offset, as perceival
-measured.)
+not interpret is declined. (The v6.18 flowtable fills the VLAN keys without
+setting them in `used_keys`; the driver finds them by their offset, as
+perceival measured. OpenWrt's pending 709 now sets them, which the driver
+accepts too.) So is a rule with an action it does not apply: a flow with a
+non-zero priority, which OpenWrt's pending 708 ("carry a priority into the
+offload") turns into a FLOW_ACTION_PRIORITY, is declined ("action id=...
+unsupported") and stays in software. With the default
+`ip_forward_update_priority` and nothing that sets a packet's priority on
+the way (such as `meta priority set`), forwarded IPv4 flows carry
+priority 0 and no such action.
 
 **Stale entries.** The flowtable re-offers a flow about once a second while
 its packets cross the software path. For a flow already in hardware the
@@ -406,10 +416,16 @@ it applies the same conditions to the new port and, in a VLAN-aware bridge,
 follows only learns in VID 1. It only acts on a move between two ports that
 both stay up with no STP change (a client moved between two switches behind
 lan1 and lan4): a move that takes the old port's link down drops the port's
-flows first, through the flowtable's carrier-loss teardown (pending 709) and
-the bridge change above, and the flowtable offers them afresh. On the live
-line 709 had already removed them when the bridge change came, and the
-connection was back in hardware on the new port at once [meas-U].
+flows first, through the flowtable's carrier-loss teardown (pending 717,
+then numbered 709) and the bridge change above, and the flowtable offers
+them afresh. On the live line 717 had already removed them when the bridge
+change came, and the connection was back in hardware on the new port at
+once [meas-U]. Since be9300-next's 2026-10-28 rebase the flowtable also tears a flow
+down itself at its next gc pass once the bridge FDB names another port for
+its destination (OpenWrt's pending 708, nftables flowtables only): after
+a move between two ports that stay up, the follower re-points the flow
+first and the gc pass then tears it down and the flowtable offers it
+afresh. That interplay has not run on hardware.
 
 ## 6. PPPoE (0438 download, 0439 upload)
 
@@ -427,7 +443,8 @@ PPPoE session, as cls_flower sets the key. Without the key a PPPoE download
 is declined as before (the driver's address check). mtk and airoha ignore
 the key and are unchanged; that a driver which does not understand a key
 must decline it is their business (this driver does, section 3). The VLAN
-key's missing `used_keys` bit is a separate upstream bug, not touched here.
+key's missing `used_keys` bit is a separate upstream bug, which OpenWrt's
+pending 709 fixes.
 
 **Resolving the session.** For a download entering EDMA port P (with the
 VLAN key V) with PPPoE key S: `__ip_dev_find(net, match_dst)` (the rule's

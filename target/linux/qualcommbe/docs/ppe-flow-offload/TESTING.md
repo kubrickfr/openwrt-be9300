@@ -37,7 +37,7 @@ the session is `pppoe-wan` on `wan.<vid>`, `<vid>` being the ISP's WAN VLAN ID. 
   VLAN, 2.2/0.8 Gbit/s.
 - **Images:** r37585-0e253b519f, flashed 2026-10-22. Then
   r37586-b82b97e5be from 2026-10-23 13:30, which adds the generic
-  backports 651-01/02.
+  backports 651-01/02 (651-01 is now OpenWrt's 706-04).
 - **Client:** a PC on a 2.5G USB adapter, behind the managed switch on
   lan1; for the port tests of 2026-10-27, plugged straight into lan2,
   then lan3.
@@ -98,9 +98,9 @@ the session is `pppoe-wan` on `wan.<vid>`, `<vid>` being the ISP's WAN VLAN ID. 
      5.4 GB 10 s later), and 0.05% of the run's 7.4M download packets
      reached the CPU. `stuck 0`, no warning, no `moved to`.
    - There was no `bridge change` line either. 709's carrier-loss teardown
-     had taken lan2's flows out of hardware before lan2's STP state change
-     reached the driver, so its flush found nothing to drop (it logs only
-     a count above 0).
+     (pending 717 since the 2026-10-28 rebase) had taken lan2's flows out
+     of hardware before lan2's STP state change reached the driver, so its
+     flush found nothing to drop (it logs only a count above 0).
    - Conntrack showed the connection as `[OFFLOAD]`, not `[HW_OFFLOAD]`,
      at all three reads after the move, while the PPE forwarded it. A
      fresh 20 s download on lan3 showed `[HW_OFFLOAD]` (1821 Mbit/s, 0.07%
@@ -186,8 +186,10 @@ Nothing stays armed across a break.
    `dmesg | tail` for `disabled: N flow(s)`; `disable incomplete` means
    entries may still forward: go to 3.
 2. `uci set firewall.@defaults[0].flow_offloading_hw=0; fw4 reload`:
-   software flowtable. `uci revert firewall` does the same only while the
-   hardware setting is uncommitted.
+   software flow offloading, so the PPE is offered nothing. fw4 then lists
+   `br-lan`, not its ports, and since 706-03 LAN flows take the normal
+   forwarding path, not the software flowtable. `uci revert firewall` does
+   the same only while the hardware setting is uncommitted.
 3. `reboot` (the PPE is reset at probe). With `0442`'s defaults and fw4's
    hardware offload committed, offload comes back on with the first flows
    after the reboot. If it must stay off, persist that first:
@@ -535,14 +537,16 @@ stop-line message is not read again.
   in hardware within seconds; delete VID 30.
 - Client move: re-cabling geekom from lan1 to lan4 during a download takes
   lan1's link down: the flowtable tears the flow down on carrier loss
-  (pending 709). The driver logs `bridge change: N port-addressed flow(s)
-  back to software` only if some of lan1's flows are still in hardware
-  when lan1's STP state change reaches it; on the live line 709 had
-  removed them first (section 0, note 4). Once geekom is up on lan4 the
-  download resumes: back in hardware towards lan4 (`offload_flows` names
-  lan4's port) if the flow is offered after the bridge learned geekom
-  there, otherwise in software for the rest of the connection. No `moved
-  to` line is expected; pass is data again at the sender's first
+  (pending 717, numbered 709 when this was written). The driver logs
+  `bridge change: N port-addressed flow(s) back to software` only if some
+  of lan1's flows are still in hardware when lan1's STP state change
+  reaches it; on the live line 709 had removed them first (section 0, note
+  4). Once geekom is up on lan4 the download resumes: through the normal
+  forwarding path until the bridge has learned geekom on lan4 (706-03 sets
+  up no flow without a forward path), then back in hardware towards lan4
+  (`offload_flows` names lan4's port); a flow set up towards a stale port
+  is torn down at the next gc pass (OpenWrt's 708). No `moved to` line is
+  expected; pass is data again at the sender's first
   retransmission after lan4's link-up. Conntrack may then show the
   connection as `[OFFLOAD]` while the PPE forwards it: judge by
   `offload_flows` and the CPU-path count. The FDB follower itself needs a

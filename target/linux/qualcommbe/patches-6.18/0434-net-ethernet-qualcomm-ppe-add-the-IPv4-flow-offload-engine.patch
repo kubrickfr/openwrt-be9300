@@ -1870,7 +1870,7 @@ new file mode 100644
 + * bridge, so the move is noticed when the client next ARPs, renews its
 + * lease or opens a connection (the switch driver reports no hardware
 + * learning to the bridge), and until then its inbound traffic stays on the
-+ * old port, exactly as the software flowtable would leave it for good.
++ * old port, as the software flowtable keeps it until a gc pass (708).
 + *
 + * Only a move within the flow's own VLAN-unaware bridge counts, learned
 + * without a VLAN: that is the one domain in which the bridge itself would
@@ -2045,11 +2045,11 @@ new file mode 100644
 +		 * address that keeps moving (a loop, a station on two ports,
 +		 * or any host on the bridge sending frames with that source)
 +		 * would drag the flow, and each re-point rewrites the table
-+		 * under RTNL. The software fast path never follows a move at
-+		 * all, so past a few moves in a short window the flow goes
-+		 * back to it: the entry is dropped, the flowtable's next
-+		 * refresh re-offers it, and the port it resolves then is
-+		 * whatever the bridge says at that moment.
++		 * under RTNL. The software fast path follows a move only
++		 * through a gc teardown (708), so past a few moves in a short
++		 * window the flow goes back to it: the entry is dropped, the
++		 * flowtable re-offers it on its original route until a gc
++		 * pass tears it down for the port the bridge has then.
 +		 */
 +		if (time_after(jiffies, entry->move_window + PPE_OFFLOAD_FDB_FLAP_WINDOW)) {
 +			entry->move_window = jiffies;

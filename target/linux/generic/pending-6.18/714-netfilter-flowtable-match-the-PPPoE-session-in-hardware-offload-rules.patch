@@ -12,9 +12,9 @@ IP frame with the same 5-tuple, does not hit the flow.
 nf_flow_rule_match() only turns 802.1Q encapsulations into match keys.
 For a direction of a flow received through a PPPoE interface, the
 hardware rule therefore matches the ingress device and the inner
-5-tuple (the VLAN key is filled but not flagged in used_keys), and
-nothing says that the packets arrive in a PPPoE session, let alone which
-one. A driver that programs the rule as given accepts frames that
+5-tuple (in v6.18 the VLAN key is filled but not flagged in used_keys),
+and nothing says that the packets arrive in a PPPoE session, let alone
+which one. A driver that programs the rule as given accepts frames that
 software never forwards through this flow: plain IP, or another session,
 on the same port with the same 5-tuple.
 
@@ -34,8 +34,8 @@ ignore this one, as they already ignore the VLAN; mlx5 checks used_keys
 against the keys it supports and now declines such a rule, as it already
 declines the opposite direction, which carries FLOW_ACTION_PPPOE_PUSH.
 
-The VLAN keys set by this function are still not in used_keys; that is
-left alone here.
+The VLAN keys set by this function are not in used_keys in v6.18;
+OpenWrt's pending 709 sets them.
 
 Assisted-by: Claude:claude-opus-5-5
 ---

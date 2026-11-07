@@ -532,7 +532,7 @@ Assisted-by: Claude:claude-opus-5-5
  			pr_info_once("ppe_offload: %s table full, flows stay in software\n",
 @@ -2041,9 +2271,11 @@ static int ppe_offload_flow_destroy(struct ppe_offload_priv *priv, struct flow_c
   * learning to the bridge), and until then its inbound traffic stays on the
-  * old port, exactly as the software flowtable would leave it for good.
+  * old port, as the software flowtable keeps it until a gc pass (708).
   *
 - * Only a move within the flow's own VLAN-unaware bridge counts, learned
 - * without a VLAN: that is the one domain in which the bridge itself would
