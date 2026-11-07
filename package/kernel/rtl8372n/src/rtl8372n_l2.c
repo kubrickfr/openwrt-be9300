@@ -352,16 +352,13 @@ int rtl8372n_set_ageing_time(struct dsa_switch *ds, unsigned int msecs)
  * Other VIDs follow DSA's adds and deletes directly; a delete that fails is
  * retried by the driver (struct rtl8372n_fdb_pending), as for VLAN 1.
  *
- * `bridge fdb replace` moves an entry without a delete for its old owner,
- * and DSA passes a CPU-port add to the driver only while it holds no
- * reference to the address, which a replace never drops. This hides two
- * cases, for every VID. A host address replaced onto a user port and
- * deleted there stays uninstalled (its unicast floods) until DSA adds it
- * again. Replaced back onto a foreign port (Wi-Fi) instead, it only bumps
- * DSA's refcount: the driver never hears of it, and the static entry stays
- * on the user port, where LAN hosts cannot reach the address, until a user
- * port's add or delete of it or a CPU-port add that DSA passes on replaces
- * it, which may not happen before the module is reloaded.
+ * `bridge fdb replace` moves an entry without a delete for its old owner.
+ * Since OpenWrt's pending 643, DSA holds a host address on the CPU port
+ * only while the bridge has the entry on a foreign port: an add on a user
+ * port releases it, so the CPU-port delete follows the user-port add (from
+ * DSA's workqueue), and a move back onto a foreign port (Wi-Fi) adds it on
+ * the CPU port again. Before 643, DSA counted these events per address and
+ * a replace never dropped a count, so the driver heard of neither case.
  */
 static int rtl8372n_fdb_vid(struct dsa_switch *ds, int port,
 			    const unsigned char *addr, u16 vid,
@@ -387,18 +384,16 @@ static int rtl8372n_fdb_vid(struct dsa_switch *ds, int port,
  * replace` sends no delete for the old port), and, apart from it, whether
  * the CPU port holds it; a user port takes precedence. An add for the CPU
  * port, which the bridge sends when the entry moved to a foreign port,
- * drops a user hold of that VID, which no delete would ever release; DSA
- * passes it on only while it holds no reference to the address, though.
+ * drops a user hold of that VID, which no delete would ever release.
  *
- * DSA deletes a CPU-port address only once its last reference goes, and
- * not at all for a host address that `bridge fdb replace` moved onto a
- * user port. So a CPU hold that a user-port add takes over may be stale:
- * it is marked shadowed, and goes with the user hold. The entry is then
- * removed, and the address floods, which reaches the station wherever it
- * is, instead of going back to the CPU port, which would cut a station on
- * a LAN port off the LAN for good. The cost: a station that comes back on
- * Wi-Fi only bumps DSA's refcount, and its unicast floods until DSA adds
- * it again. A CPU-port add or delete of the VID ends the shadow.
+ * A CPU hold that a user-port add takes over may be stale until DSA's
+ * delete of it arrives (OpenWrt's pending 643 sends it right after; before
+ * 643, a `bridge fdb replace` onto a user port sent none): it is marked
+ * shadowed, and goes with the user hold. The entry is then removed, and
+ * the address floods, which reaches the station wherever it is, instead of
+ * going back to the CPU port, which would cut a station on a LAN port off
+ * the LAN for good. A CPU-port add or delete of the VID ends the shadow;
+ * with 643, a station that comes back on Wi-Fi brings that add.
  *
  * Only the DSA VID the bridge looks up counts: 0 while it is VLAN-unaware,
  * 1 while it is VLAN-aware. The other one is inert in the bridge as well,

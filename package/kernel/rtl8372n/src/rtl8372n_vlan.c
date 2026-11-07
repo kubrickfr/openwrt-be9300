@@ -320,10 +320,11 @@ int rtl8372n_port_vlan_mode_repair(struct dsa_switch *ds, int port,
  * port with no VLAN receives nothing. On a normal leave of a VLAN-aware
  * bridge the port is VLAN-aware here, as DSA believes, and DSA's reset call
  * (port_vlan_filtering(false)) follows: making it VLAN-unaware is then
- * routine and logged at debug level only. DSA sends a normal leave after it
- * has dropped dp->bridge; its join rollback still has dp->bridge set. A
- * change there, or from a mode that is unknown or not DSA's, follows a
- * failure and keeps the "re-applied" warning.
+ * routine and logged at debug level only. A change from a mode that is
+ * unknown or not DSA's follows a failure and keeps the "re-applied"
+ * warning. Since OpenWrt's pending 643, DSA drops dp->bridge before a join
+ * rollback's leave too, so undoing a VLAN-aware join is logged at debug
+ * level as well; the join's own error reports that failure.
  */
 int rtl8372n_port_vlan_mode_standalone(struct dsa_switch *ds, int port)
 {

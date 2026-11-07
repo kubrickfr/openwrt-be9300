@@ -33,8 +33,8 @@ r37571-89c18ad1cb, hosts: a PC on lan1 and a managed switch on lan4.
 
 2026-10-27, same unit, image r37586-b82b97e5be from the PPE offload branch
 (be9300-next-ppe-pppoe): this driver unchanged (kmod-dsa-rtl8372n 0.0.2-r10,
-debug build, offload on) plus a PPE flow offload series this tree does not
-carry, which was on. br-lan stayed VLAN-aware, in a layout other than phase
+debug build, offload on) plus that branch's PPE flow offload series, which
+was on. br-lan stayed VLAN-aware, in a layout other than phase
 3's: lan1 the trunk (VID 1 PVID, tagged in 1, 10 and 20), lan2-lan4 untagged
 in VID 1; so the phase 1 and 2 checks below ran with offload on and a
 VLAN-aware bridge. Hosts: a laptop straight on lan2 (2.5G USB adapter) and a
@@ -371,8 +371,10 @@ config bridge-vlan
   limiting, MIB counters or GPIO; EEE off.
 - Ageing is clamped to 14-800 s; `ip -d link show br-lan` shows the value set.
 - A failed runtime `vlan_filtering` change splits the bridge until repeated.
-- `bridge fdb replace` of a host address onto a LAN port: once deleted there
-  it floods; replaced back onto Wi-Fi, the entry stays on the LAN port.
+- `bridge fdb replace` of a host address onto a LAN port and back onto Wi-Fi
+  relies on OpenWrt's pending 643 to move the entry back to the CPU port;
+  before it, DSA kept the entry on the LAN port. Not yet run on hardware
+  with 643.
 - Link-local traps need 0432; 01:80:c2:00:00:10-2f, CDP, SSTP and PTP keep
   their reset actions (on the bench, :10, :20, :21, CDP, SSTP and PTP were
   switched in hardware as other multicast). A VLAN-aware port without a PVID
