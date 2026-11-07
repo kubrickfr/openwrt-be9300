@@ -1,0 +1,136 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: take the offload defaults 
+ from Kconfig
+
+flow_offload and pppoe_offload default to off. The owner wants images to
+offload from boot. That follows four days of use on a live GL-BE9300
+(PPPoE over the ISP's WAN VLAN, 2.2/0.8 Gbit/s), five since the first enable, with
+offload off only once, briefly, for a comparison run. The bench record is
+in the tree's docs/ppe-flow-offload/TESTING.md.
+The nftables flowtable stays the switch for a running system: with no
+"flags offload" flowtable (OpenWrt's fw4 with flow_offloading_hw off,
+"Software flow offloading" in LuCI) no flow is offered and the PPE
+forwards nothing.
+
+Two bool options set the parameters' defaults:
+
+- QCOM_PPE_FLOW_OFFLOAD, for flow_offload;
+- QCOM_PPE_PPPOE_OFFLOAD, for pppoe_offload; it depends on the first.
+
+Both default to N here, as the parameters did. The parameters still
+override them, at module load or at runtime. The OpenWrt package turns
+them on for the ipq53xx subtarget only (the GL-BE9300); nothing has run on
+IPQ9574.
+
+The header comment's /etc/modules.conf example becomes "options qcom-ppe":
+OpenWrt's kmodloader matches options to the module's file name,
+qcom-ppe.ko, exactly.
+
+With flow_offload set at load, offload is enabled at the end of probe,
+before the RTL8372N's DSA driver has attached to the conduit. That case
+was already handled:
+
+- profile E is applied on the first flow towards the conduit instead
+  (ppe_offload_egress_apply() from the flow path), so with fw4's hardware
+  offload off it is not applied at all;
+- the conduit's later MTU change reprograms its L3 interface
+  (edma_port_change_mtu()).
+
+It has not run on hardware yet; the first boot of an image with the
+defaults on is the check.
+---
+ drivers/net/ethernet/qualcomm/Kconfig         | 26 +++++++++++++++++++
+ .../net/ethernet/qualcomm/ppe/ppe_offload.c   | 18 +++++++------
+ 2 files changed, 36 insertions(+), 8 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/Kconfig
++++ b/drivers/net/ethernet/qualcomm/Kconfig
+@@ -81,6 +81,32 @@ config QCOM_PPE
+ 	  To compile this driver as a module, choose M here. The module
+ 	  will be called qcom-ppe.
+ 
++config QCOM_PPE_FLOW_OFFLOAD
++	bool "Offload flowtable flows to the PPE by default"
++	depends on QCOM_PPE
++	help
++	  Sets the default of the qcom_ppe.flow_offload module parameter:
++	  the PPE takes the IPv4 flows that an nftables flowtable with
++	  "flags offload" offers from the moment it probes. That flowtable
++	  is what decides at runtime: without one (OpenWrt's fw4 with
++	  flow_offloading_hw off) no flow is offered and the PPE forwards
++	  none. The parameter, given at module load or written at runtime,
++	  overrides this default.
++
++	  If unsure, say N.
++
++config QCOM_PPE_PPPOE_OFFLOAD
++	bool "Also offload PPPoE downloads by default"
++	depends on QCOM_PPE_FLOW_OFFLOAD
++	help
++	  Sets the default of the qcom_ppe.pppoe_offload module parameter.
++	  The PPE's PPPoE session match has no VLAN: while a session is in
++	  hardware, frames with its session ID from its access concentrator's
++	  MAC address also reach its flows on another VLAN of the WAN port,
++	  or untagged, where software would drop them. Saying Y accepts that.
++
++	  If unsure, say N.
++
+ source "drivers/net/ethernet/qualcomm/rmnet/Kconfig"
+ 
+ endif # NET_VENDOR_QUALCOMM
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -147,11 +147,13 @@
+  * encapsulation are not carried here, and the ingress parser alias for
+  * rtl8_4 only as bench profile A (ppe_offload_profile_a_apply()).
+  *
+- * OFF BY DEFAULT. The flowtable block binds either way, so that a flowtable
++ * OFF UNTIL ASKED. The flowtable block binds either way, so that a flowtable
+  * with "flags offload" always loads, but every flow is declined and no offload
+- * register is written until the flow_offload module parameter is set
+- * (/sys/module/qcom_ppe/parameters/flow_offload, or "options qcom_ppe
+- * flow_offload=1" in /etc/modules.conf). Enabling saves every static register
++ * register is written until the flow_offload module parameter is set: at load,
++ * by default with CONFIG_QCOM_PPE_FLOW_OFFLOAD, or later
++ * (/sys/module/qcom_ppe/parameters/flow_offload, or "options qcom-ppe
++ * flow_offload=1" in OpenWrt's /etc/modules.conf, keyed by the module's file
++ * name). Enabling saves every static register
+  * it is about to change (exception actions and enables, the per-port L3
+  * interface, MY_MAC and L3_VP_PORT entries and MTU command, the PPPoE session
+  * entries and their L3 interfaces, the source MAC L3 interfaces), programs and
+@@ -676,7 +678,7 @@ struct ppe_offload_priv {
+ };
+ 
+ /* qcom_ppe.pppoe_offload, see ppe_offload_pppoe_param_set(). */
+-static bool ppe_offload_pppoe_param;
++static bool ppe_offload_pppoe_param = IS_ENABLED(CONFIG_QCOM_PPE_PPPOE_OFFLOAD);
+ 
+ static int ppe_offload_snap_save(struct ppe_offload_priv *priv, u32 addr,
+ 				 unsigned int words);
+@@ -5802,7 +5804,7 @@ static const struct file_operations ppe_offload_profile_fops = {
+  * ppe_offload_param_lock, which also orders parameter writes.
+  */
+ static struct ppe_offload_priv *ppe_offload_instance;
+-static bool ppe_offload_param;
++static bool ppe_offload_param = IS_ENABLED(CONFIG_QCOM_PPE_FLOW_OFFLOAD);
+ static DEFINE_MUTEX(ppe_offload_param_lock);
+ 
+ static int ppe_offload_param_set(const char *val, const struct kernel_param *kp)
+@@ -5869,7 +5871,7 @@ static void ppe_offload_trip_work(struct work_struct *work)
+ 	mutex_unlock(&ppe_offload_param_lock);
+ }
+ MODULE_PARM_DESC(flow_offload,
+-		 "Offload nftables flowtable flows to the PPE (default N; writable at runtime)");
++		 "Offload nftables flowtable flows to the PPE (default CONFIG_QCOM_PPE_FLOW_OFFLOAD; writable at runtime)");
+ 
+ /* PPPoE flows (downloads, and uploads under bench profile A) need this
+  * as well as flow_offload: the session table
+@@ -5914,7 +5916,7 @@ static const struct kernel_param_ops ppe_offload_pppoe_param_ops = {
+ 
+ module_param_cb(pppoe_offload, &ppe_offload_pppoe_param_ops, NULL, 0644);
+ MODULE_PARM_DESC(pppoe_offload,
+-		 "Also offload PPPoE downloads (uploads only under bench profile A); accepts that the session match has no VLAN (default N)");
++		 "Also offload PPPoE downloads (uploads only under bench profile A); accepts that the session match has no VLAN (default CONFIG_QCOM_PPE_PPPOE_OFFLOAD)");
+ 
+ /**
+  * ppe_offload_enabled() - Whether flow offload is on.
