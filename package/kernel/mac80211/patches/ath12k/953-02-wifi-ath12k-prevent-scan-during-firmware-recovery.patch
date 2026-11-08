@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jose Ignacio Tornos Martinez <jtornosm@redhat.com>
+Date: Tue, 4 Aug 2026 17:50:00 +0000
+Subject: [PATCH] wifi: ath12k: prevent scan during firmware recovery
+
+When firmware crashes while wpa_supplicant has an active connection,
+wpa_supplicant may immediately attempt a scan via nl80211 while the
+firmware is still powering on through MHI. ath12k_mac_op_hw_scan()
+proceeds without checking the recovery state, accessing partially
+initialized radio structures which leads to a NULL pointer dereference:
+
+  BUG: unable to handle page fault for address: 0000000000001508
+  RIP: ath12k_mac_op_hw_scan+0x148/0x2b0 [ath12k]
+  Call Trace:
+   drv_hw_scan+0x88/0x140 [mac80211]
+   __ieee80211_start_scan+0x2bc/0x6b0 [mac80211]
+   nl80211_trigger_scan+0x54a/0x9f0 [cfg80211]
+
+Fix by checking ATH12K_FLAG_RECOVERY at the start of
+ath12k_mac_op_hw_scan() and returning -EBUSY. mac80211 will retry the
+scan after the recovery completes.
+
+Tested on WCN7850 with MLO (Wi-Fi 7).
+
+Signed-off-by: Jose Ignacio Tornos Martinez <jtornosm@redhat.com>
+Link: https://patchwork.kernel.org/project/linux-wireless/patch/20260804175004.1761075-3-jtornosm@redhat.com/
+[ applied without patch 1/3 of the series: 903-12 already keeps
+  ATH12K_FLAG_RECOVERY set until mac80211 reconfiguration completes,
+  and 903-07 sets it on every device of the hw group during a rootPD
+  recovery. With only 953-01, hostapd gets -ESHUTDOWN and leaves the
+  link disabled; -EBUSY makes its ACS retry every 5 s (up to 50 times).
+  mac80211 itself does not retry: __ieee80211_start_scan() returns the
+  error to nl80211. Not covered: a scan already in flight when the
+  firmware crashes can still end ACS with the link disabled (no oops),
+  and if mac80211 reconfiguration fails after a crash, RECOVERY stays
+  set and every scan returns -EBUSY until a reboot ]
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 9c7fd8e..5e67995 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -5856,6 +5856,11 @@ int ath12k_mac_op_hw_scan(struct ieee80211_hw *hw,
+ 
+ 	lockdep_assert_wiphy(hw->wiphy);
+ 
++	for_each_ar(ah, ar, i) {
++		if (test_bit(ATH12K_FLAG_RECOVERY, &ar->ab->dev_flags))
++			return -EBUSY;
++	}
++
+ 	chan_list = kzalloc_objs(*chan_list, hw_req->req.n_channels);
+ 	if (!chan_list)
+ 		return -ENOMEM;
