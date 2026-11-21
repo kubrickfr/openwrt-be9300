@@ -1,43 +1,12 @@
 # OpenWrt for the GL.iNet Flint 3 (GL-BE9300)
 
-Mainline **OpenWrt** support for the **GL.iNet Flint 3 (GL-BE9300)** — Qualcomm
+Mainline **OpenWrt** support for the **GL.iNet Flint 3 (GL-BE9300)**: Qualcomm
 **IPQ5332** (quad Cortex-A53) with tri-band Wi-Fi 7, a Realtek **RTL8372N** 10G
 switch and a **RTL8221B** 2.5G WAN PHY.
 
-> **This branch (`be9300`) is a complete, buildable OpenWrt tree.**
-> Clone it and build — there is nothing to drop into another checkout.
-> `be9300-next` is where the series is rebased onto newer upstream `main`;
-> `be9300` follows it once the result has been tested on hardware.
-
-## Where this tree comes from
-
-This repository carries
-[perceival's Flint 3 port](https://github.com/perceival/openwrt-flint3)
-(branch `flint3-be9300`), to which
-[François Guerraz](https://github.com/kubrickfr) contributed, rebased onto
-upstream OpenWrt `main`. That port was itself built on
-[JiaY-shi's GL-BE6500 (Flint 3e) work](https://github.com/JiaY-shi/openwrt),
-which provided the IPQ5332 Wi-Fi and RTL837x DSA foundation.
-
-The rebase is not a plain replay. The series was reorganised and refreshed
-for current upstream, picks up newer ath12k and hostapd fixes from JiaY-shi's
-tree, and adds further GL-BE9300 work: PPE clocking, PPE hardware flow
-offload for PPPoE and NAT downloads, Wi-Fi MAC addresses, the regulatory
-country and fan control.
-
-The goal of this project is simply to have a version that tracks upstream
-more closely: the same GL-BE9300 support, carried as a curated patch series
-on a recent upstream `main` instead of an older fork point. Hopefully this
-makes the work easier to keep current, to review and to send upstream, and
-helps the community.
-
-Target: **`qualcommbe/ipq53xx`**, kernel **6.18**.
-
-The tree is upstream OpenWrt `main` with a curated series on top: the IPQ53xx
-subtarget from [openwrt/openwrt#23161](https://github.com/openwrt/openwrt/pull/23161),
-the IPQ5332 platform, ath12k and PPE patches, the RTL837x DSA driver and the
-GL-BE9300 device support. The GL-BE6500 (Flint 3e) and UniFi U7 Pro XGS
-profiles of the trees it grew from are not carried.
+This is a complete, buildable OpenWrt tree: upstream OpenWrt `main` with a
+curated GL-BE9300 series on top. Build from `be9300-next`. Target
+**`qualcommbe/ipq53xx`**, kernel **6.18**.
 
 > [!WARNING]
 > **Unofficial, community-maintained port — not affiliated with, endorsed by, or supported
@@ -47,85 +16,79 @@ profiles of the trees it grew from are not carried.
 > unit's unique radio calibration data and MAC addresses and cannot be recovered from
 > anywhere else. If this router matters to you, test on a spare unit before relying on it.
 
+## Where this tree comes from
+
+It carries [perceival's Flint 3 port](https://github.com/perceival/openwrt-flint3)
+(branch `flint3-be9300`), rebased onto upstream OpenWrt `main`. That port was
+built on [JiaY-shi's GL-BE6500 (Flint 3e) work](https://github.com/JiaY-shi/openwrt),
+which provided the IPQ5332 Wi-Fi and RTL837x DSA foundation, and on the IPQ53xx
+subtarget of [openwrt/openwrt#23161](https://github.com/openwrt/openwrt/pull/23161).
+
+The rebase is not a plain replay. On top of the port it adds:
+
+- an SDK-free RTL8372N DSA driver that offloads a VLAN-aware bridge to the
+  switch;
+- PPE hardware flow offload of IPv4 downloads, PPPoE included;
+- EDMA and PPE driver fixes (WAN ingress at line rate, RPS, ring mapping);
+- newer ath12k and hostapd fixes, Wi-Fi MAC addresses, the regulatory
+  country and fan control.
+
+The aim is a tree that tracks upstream closely and is easy to review and to
+send upstream. The GL-BE6500 and UniFi U7 Pro XGS profiles of the trees it
+grew from are not carried.
+
 ## Hardware
 
 | Block | Detail |
 |---|---|
 | SoC | Qualcomm IPQ5332, 4× Cortex-A53 |
 | Wi-Fi 2.4 GHz | on-SoC radio, ath12k over AHB |
-| Wi-Fi 5 / 6 GHz | 2× QCN9274, ath12k over PCIe |
-| Switch | RTL8372N, out-of-tree SDK-free DSA driver (`realtek,rtl8372n`, native `rtl8_4` tag; benched on a GL-BE9300 in October 2026, see `package/kernel/rtl8372n/TESTING.md`); SoC↔switch link is 10GBASE-R |
+| Wi-Fi 5 / 6 GHz | one QCN9274 over PCIe, split into a 5 GHz and a 6 GHz radio |
+| Switch | RTL8372N, SDK-free DSA driver (`realtek,rtl8372n`, `rtl8_4` tag), 10GBASE-R to the SoC |
 | WAN | RTL8221B 2.5G PHY, `2500base-x` to the SoC |
 | Storage | eMMC |
+
+Wi-Fi MAC addresses come from the ART partition (offset 0x04, as on stock);
+the secondary links of an MLD get locally administered addresses derived
+from it. The kernel's AES and GCM use the ARMv8 Crypto Extensions.
 
 ## Status
 
 | Subsystem | State |
 |---|---|
-| Boot / procd / SSH | working |
-| LAN (RTL8372N via DSA + EDMA/PPE) | working with the new driver, one bridge switched in hardware (bench results in `package/kernel/rtl8372n/TESTING.md`) |
-| WAN (2.5G) | working at 2.5 Gbps; 1G/100M link rates untested |
-| VLANs (bridge-vlan on DSA) | working: one VLAN-aware bridge offloaded, access and trunk ports, tagged-only ports; checked with traffic between two LAN ports (open checks in `TESTING.md`) |
-| Flow offloading | PPE hardware offload of IPv4 downloads (NAT, PPPoE over a VLAN WAN), on by default on this board, used when "Hardware flow offloading" is selected in LuCI; uploads, Wi-Fi and IPv6 stay in the software flowtable (uploads can be offloaded only in the experimental S-R mode, package `ppe-sr`, off by default and desk-tested only). Validated live on one gateway, October 2026 (see below) |
-| Wi-Fi 7, all three bands | working |
-| MLO (AP MLD across 2.4/5/6 GHz) | working |
-| DFS | working: CAC and secondary AP after CAC tested (a radar event itself not yet tested) |
+| Boot, sysupgrade, return to stock | working |
+| LAN switch | working; one VLAN-aware bridge switched in hardware, access, trunk and tagged-only ports |
+| WAN | working at 2.5 Gbit/s, line rate into the SoC |
+| Flow offloading | working; IPv4 downloads in hardware, PPPoE included. The PPE driver is on by default; fw4's hardware flow offloading, off in a fresh configuration, turns it on |
+| Wi-Fi 7, all three bands; MLO across 5 and 6 GHz | working |
+| DFS | working: CAC, and the secondary AP after CAC |
 | 802.11k / 802.11v | working |
-| eMMC sysupgrade + return to stock | working |
 
-With this driver, through a PPPoE WAN with software flowtable offload and
-the core split in `packet-steering.sh`: **one TCP download at 2.00–2.16
-Gbit/s** (7 of 8 runs, 2026-10-21), with the forwarding core about 90%
-busy. With PPE hardware offload on the same line, **2.1–2.2 Gbit/s down**
-with several streams (Ookla's CLI) and **1.3–2.0 Gbit/s** on one (from
-proof.ovh.net, which varies from run to run). The router is not the limit:
-a PC running PPPoE straight on the ONT got 2.08–2.11 Gbit/s down from the
-same Ookla server, and 1.44 Gbit/s from proof.ovh.net in one stream
-(2026-10-27). The downloads stay off the CPU: 0.01–0.2% of their packets
-reach it. What the CPU still does is forward the client's ACKs in
-software (the cores doing it at 1.1 GHz):
+What is untested and what is open is under
+[Known limitations](#known-limitations).
 
-- **one stream (2026-10-27):** 14–23% of one core at 1.3–1.8 Gbit/s (the
-  two faster runs each include a second of a cron job);
-- **Ookla's multi-stream download (2026-10-27):** 24–36% of the busiest
-  core and 13–22% of a second;
-- **before the flowtable VLAN-id fix (then our backport 651-01, now
-  OpenWrt's 706-04; 2026-10-23):** those ACKs took the slow path: 43% of
-  one core for one stream at 2.0 Gbit/s, and 56% for the multi-stream
-  download.
+## Performance
 
-These are busy times measured from idle time (TESTING.md section 6.4 in
-`target/linux/qualcommbe/docs/ppe-flow-offload/`), with the router's
-background and the sampling included: idle, it reads 2–4% per core.
-BusyBox `top` on the router shows far less, a few percent `sirq`: its CPU
-line averages the four cores, rounds down and refreshes every 5 s, and on
-this kernel softirq that runs between timer ticks on an otherwise idle core
-is not counted at all.
+Measured on this board, over PPPoE on a VLAN WAN:
 
-With the previous, SDK-based driver (`tag_8021q`): between two units over a
-2.5G trunk, **~1.8–1.9 Gbit/s**; **2.04 Gbit/s down** with 4 TCP streams
-(PPE clock 200 MHz, 2026-10-04).
+- With hardware flow offload on, one TCP download at 2202 Mbit/s with
+  the busiest core 24.7% busy. In software the same stream ran at
+  2010 Mbit/s with a core at 99.4%. 0.002-0.004% of the download's
+  packets reach the CPU; what is left on the CPU is the client's ACKs.
+  (Mock-ISP bench, 2.5G client, 2026-11-12.)
+- On a 2.2/0.8 Gbit/s FTTH line, 2110-2133 Mbit/s down with Ookla's CLI. A
+  PC on the ONT without the router got 2080-2107 Mbit/s from the same
+  server, so the router does not limit the line (2026-10-27).
+- The WAN port takes 2370 Mbit/s with no FIFO overflow (bench,
+  2026-11-12). FIFO overflow, from the PPE's TDM table, caused the old
+  1.9 Gbit/s ceiling; the fix is in this tree.
+- Port to port through the switch, 2.35 Gbit/s with the router's cores
+  under 4% busy.
 
-The two software flowtable figures (2026-10-21 and 2026-10-04) were
-measured with `br-lan` in the flowtable (`flow_offloading_hw=0`), a path
-that this tree no longer offloads (see Flow offloading).
-
-The `rtl8_4` tag costs the EDMA/PPE datapath: the PPE parser does not walk
-past its 8 bytes, so frames from the LAN ports nearly all land on one EDMA
-Rx ring and CPU (95% on one queue, measured; RSS needs L3, RPS still spreads
-the protocol work) without Rx checksum offload, and frames to them go
-without Tx checksum offload or TSO (patch 0431 falls back to software).
-`lanN` counters count only what crosses the CPU; the previous driver read
-the switch MIB.
-
-The kernel's AES and GCM use the ARMv8 Crypto Extensions (`aes-ce`,
-`gcm-aes-ce`; "qualcommbe: enable ARMv8 CE AES and GHASH in the kernel",
-checked 2026-10-04), which helps IPsec, OpenVPN DCO, dm-crypt and SMB3
-encryption. WireGuard does not use AES and is unaffected.
-
-Wi-Fi MAC addresses come from the ART partition (offset 0x04, as on stock);
-the secondary links of an MLD get locally administered addresses derived
-from it (`/etc/uci-defaults/99-gl-be9300-wifi-macs`).
+The CPU figures are busy time measured from idle time. BusyBox `top`
+reads far lower on this kernel. Method and raw figures:
+`target/linux/qualcommbe/docs/ppe-flow-offload/TESTING.md` (sections 0,
+0b and 6.4).
 
 ## Flow offloading
 
@@ -133,15 +96,13 @@ Choose in LuCI: **Network → Firewall → General Settings → Routing/NAT
 Offloading → Flow offloading type**:
 
 - **Hardware flow offloading** (recommended). The PPE forwards IPv4
-  downloads into the LAN switch, including PPPoE over a VLAN WAN.
-  Everything it declines runs in the software flowtable: uploads, Wi-Fi
-  clients, IPv6, and VLANs other than 1 (some uploads and other VLANs are
-  offloaded in the experimental S-R mode, see Known effects).
-- **Software flow offloading.** The software flowtable only, built on
-  `br-lan`: a flow through `br-lan` is then not offloaded at all (see
-  Software flowtable notes), so flows to LAN and Wi-Fi clients take the
-  normal forwarding path. For the software flowtable on the ports without
-  the PPE, choose hardware flow offloading and set `flow_offload=0` (below).
+  downloads into the LAN switch, PPPoE over a VLAN WAN included.
+  Everything it declines runs in the software flowtable.
+- **Software flow offloading.** The software flowtable only. It is built
+  on `br-lan`, and since OpenWrt's 706-03 a flow through `br-lan` is not
+  offloaded at all, so LAN and Wi-Fi traffic takes the normal forwarding
+  path. For the software flowtable without the PPE, choose hardware flow
+  offloading and set `flow_offload=0` (below).
 - **None.**
 
 Or with uci:
@@ -152,158 +113,153 @@ uci set firewall.@defaults[0].flow_offloading_hw='1'   # '0' for software only
 uci commit firewall && fw4 reload
 ```
 
-**The PPE driver.** It takes what fw4 offers by default in this tree: the
-kmod-qcom-ppe options `KERNEL_QCOM_PPE_FLOW_OFFLOAD` and
-`KERNEL_QCOM_PPE_PPPOE_OFFLOAD`, both on for this subtarget (see
-[Building](#building)).
+The PPE driver takes what fw4 offers. Its two switches, `flow_offload` and
+`pppoe_offload`, default to on for ipq53xx (kmod-qcom-ppe options
+`KERNEL_QCOM_PPE_FLOW_OFFLOAD` and `KERNEL_QCOM_PPE_PPPOE_OFFLOAD`; off on
+ipq95xx, where this code has never run). So fw4's setting alone turns
+offload on and off. fw4's hardware flow offloading is off in a fresh
+configuration. To override:
 
-- `options qcom-ppe flow_offload=0` (or `pppoe_offload=0`, to keep PPPoE in
-  software) in `/etc/modules.conf` overrides that at boot. The module name
-  there is `qcom-ppe`, with a hyphen: kmodloader matches the file name.
-- `/sys/module/qcom_ppe/parameters/` changes it at runtime.
-- Its state is in `/sys/kernel/debug/ppe/offload_flows`. `declined` counts
-  offers, not flows: the kernel re-offers each active flow about once a
-  second, and every upload half is declined (outside the S-R mode).
+- at boot: `options qcom-ppe flow_offload=0` (or `pppoe_offload=0`, to
+  keep PPPoE in software) in `/etc/modules.conf`. The module name there is
+  `qcom-ppe`, with a hyphen;
+- at runtime: `/sys/module/qcom_ppe/parameters/`;
+- state: `/sys/kernel/debug/ppe/offload_flows`. `declined` counts offers,
+  not flows: the kernel re-offers each active flow about once a second.
 
-**Quality status, October 2026: validated live on one GL-BE9300.** The line
-is FTTH, with PPPoE over the ISP's WAN VLAN, 2.2/0.8 Gbit/s. Offload ran there for four days
-(five since the first enable), switched on at runtime and off only once,
-briefly, for a comparison run, with no stuck entry and no fault latched. The LAN side was one VLAN-1-tagged trunk
-to a managed switch. After the router was powered off for a reference run
-straight on the ONT, offload was switched on again at runtime for two
-tests with a PC plugged straight into the untagged ports `lan2` and
-`lan3`. What was checked:
+**How it was tested.** It was the live gateway on a 2.2 Gbit/s FTTH line
+from 2026-10-22 to 2026-11-09: the first PPPoE session in hardware, a
+night of about 10 hours under a guard, four days of normal use, redials,
+firewall reloads and a client moved between ports. From 2026-11-07 to
+2026-11-09 it booted with offload on by default (`0442`'s defaults). Then
+a mock-ISP bench ran from 2026-11-09 to 2026-11-19 on the same unit:
 
-- the switch-side tag emulation alone leaves the software path as it was;
-- a PPPoE session in hardware keeps LCP and other session traffic going;
-- downloads leave the CPU path and reach line rate; out of the untagged
-  ports `lan2` and `lan3` too (one stream, 1.8–1.9 Gbit/s);
-- forwarded frames match software's: TTL, MAC, DSCP, checksums;
-- a firewall reload and a WAN redial with flows in hardware;
-- a client re-cabled from `lan2` to `lan3` mid-download: its flows were
-  torn down and went back into hardware on `lan3`.
+- PPPoE faults from the ISP side: PADT, TermReq, concentrator restarts and
+  changes, new and reused session IDs, LCP echo loss, a silent
+  concentrator, cable pulls, the flap breaker;
+- a 10-hour soak with 30 injected PPPoE faults;
+- hostile WAN frames, a full flow table, FDB floods past the switch's 4160
+  entries, broadcast and multicast storms at 1G, all cores at 100%;
+- client moves between ports, bridge VLAN changes, firewall reloads,
+  disable under load, a panic, and boots with offload on.
 
-Not validated:
+There was no router failure: no stuck flow, no degraded state, no kernel
+error. Every session came back and its flows went back into hardware. The
+bench found one router bug, in the generic kernel and not the PPE: the
+fraglist GRO TTL bug under Known limitations. The bench image had both
+`0442` options unset and switched offload on at runtime or from
+`/etc/modules.conf`; images built from this tree have both defaults on.
+The record, with the gates and what each showed, is in
+`target/linux/qualcommbe/docs/ppe-flow-offload/` (TESTING.md sections 0
+and 0b, DESIGN.md sections 9-11).
 
-- **The cases that need a fake ISP.** These are frames the PPE must hand
-  to the CPU instead of forwarding: wrong session or concentrator,
-  priority bits from the ISP, PPPoE control, TTL 1, IP options, fragments.
-  They include the residual below.
-- **The first boot with the defaults on.** Offload then starts at probe,
-  before the switch attaches; every test above switched it on at runtime.
-- **Other LAN and WAN layouts.** These were never offloaded:
-  - a VLAN-unaware `br-lan`, which is OpenWrt's default layout (the
-    untagged ports of a VLAN-aware one were);
-  - a WAN without PPPoE (DHCP or static).
-- **Other boards, other ISPs and IPv6.** IPv6 is not offloaded.
+**Uploads.** In the default mode the PPE offloads downloads only: its
+parser cannot read past the switch's `rtl8_4` tag. The S-R mode (patches
+0460-0468, package `ppe-sr`) has the switch put a per-port S-tag on uploads
+so that the PPE can offload them. It is experimental and off by default,
+and enables nothing on its own. It has been tested far less than the
+default mode:
 
-The bench record and the open gates are in
-`target/linux/qualcommbe/docs/ppe-flow-offload/` (TESTING.md section 0,
-DESIGN.md section 9).
+- one night ACTIVE on the live gateway, about 14 hours (2026-11-05/06),
+  with household uploads in hardware and no fault; a speed test at the
+  start reached the line's rate;
+- a bench bring-up on 2026-11-10, in which its arm and disarm paths passed.
 
-**Accepted residuals.** Neither match the PPE uses has a VLAN:
+The bench torture of 2026-11-11 to 2026-11-17 ran with S-R off, and S-R's
+own bench phases, roaming included, have not run.
 
-- **PPPoE.** While a session is in hardware, frames with its session ID
-  from the concentrator's MAC also reach its flows on another VLAN of the
-  WAN port, or untagged. `pppoe_offload=0` avoids that.
-- **A WAN without PPPoE.** A flow's 5-tuple also hits untagged, or on
-  another VLAN of the WAN port. Only `flow_offload=0`, or software
-  offloading, avoids that.
+Notes on the software flowtable and the switch ports are in
+`target/linux/qualcommbe/docs/flowtable-notes.md`.
 
-Either way the PPE forwards frames that software would drop. It matters
-only if something else on the line upstream of the ONT can send them
-(DESIGN.md section 10).
+## Known limitations
 
-**Known effects:**
+Offload scope, by design:
 
-- **A firewall reload stalls fast downloads.** A download running at line
-  rate when fw4 reloads stalls for 0.5–5 s, then recovers by itself. fw4
-  reloads on any firewall change, and twice after every WAN redial. With
-  software offloading it does not stall. Where the packets are lost during
-  the hand-over is not established yet.
-- **Uploads stay in software.** The PPE's parser cannot read past the
-  switch's `rtl8_4` tag. Only the switch-side tag emulation is used
-  (egress only); the ingress parser alias that would offload uploads breaks
-  a VLAN WAN, and its bench profile A is dropped (0461). The experimental
-  S-R mode (patches 0460-0468, package `ppe-sr`, nothing enabled by
-  default) has the switch put a per-port S-tag on uploads so that the PPE
-  can offload them. The switch side (0460, `svlan=1`) had one short live
-  session (`package/kernel/rtl8372n/TESTING.md` section 8.3); the PPE side
-  (0461-0468) and `ppe-sr` are desk-tested only.
+- Only IPv4 downloads into the switch are offloaded. Uploads (outside
+  S-R), IPv6, Wi-Fi clients, VLANs other than 1, hairpin NAT and multicast
+  stay in the software flowtable. At most 4 PPPoE sessions and 4 bridge
+  MACs are in hardware.
+- Neither the PPPoE session match nor the flow key has a VLAN. Frames with
+  the session ID from the concentrator's MAC on another VLAN of the WAN
+  port, or untagged, and a plain-IP flow's tuple in another encapsulation,
+  are forwarded in hardware (measured). Software would drop most of them;
+  sending them needs a host on the ISP side of the ONT. `pppoe_offload=0`
+  or `flow_offload=0` avoids it.
+- Like the software flowtable, the PPE checks neither the PPPoE length
+  field nor TCP RST sequence numbers.
+- Downloads the PPE forwards skip every SQM shaper, and so do uploads it
+  forwards in S-R mode. Without the PPE, flow offloading with SQM on a
+  PPPoE or VLAN WAN still skips the download (ingress) shaper: see
+  `flowtable-notes.md`.
+- LAN frames carry the `rtl8_4` tag past the PPE parser, so LAN ingress
+  nearly all lands on one EDMA Rx ring (RPS spreads the protocol work)
+  without Rx checksum offload, and frames to the LAN ports go without Tx
+  checksum offload or TSO. `lanN` counters count only what crosses the CPU.
 
-### Software flowtable notes
+Open issues:
 
-These apply to the software flowtable: with software offloading, and with
-hardware offloading for every flow the PPE declines.
+- On the production gateway, a firewall reload stalls a download running
+  at line rate for 0.5-5 s; fw4 reloads on any firewall change and twice
+  after a WAN redial. The bench does not reproduce it (0-200 ms; nothing
+  lost where captured). The cause is not known.
+- CPU-forwarded TCP can leave with its TTL not decremented while GRO is on
+  for the WAN (measured: 81-94% of such frames). It is a generic kernel
+  bug in fraglist GRO, not the PPE. Workaround: `ethtool -K wan gro off`.
+  A fix is written and not yet in this tree.
+- A client that moves from a LAN port to the router's Wi-Fi while its old
+  port keeps carrier: untested with offload. The default mode may lose its
+  active hardware downloads until the connections end (inferred).
+- In S-R mode, reading the code says a client that moves to the router's
+  Wi-Fi, to a port of the other tagging form, or out of S-R's scope has
+  its existing hardware downloads sent to the old port until the
+  connections end. The fix (an FDB check on the offer path) is not
+  written. Keep S-R's scope (`list class` in `/etc/config/ppe-sr`) to
+  ports with wired clients that do not move, and leave out ports with
+  access points: a client roaming between access points on two router
+  ports then never enters S-R (inferred from the code, not tested). In the
+  default mode that roam is followed (measured on the bench with both
+  ports up).
+- In two of five PPPoE session restarts under load on the bench, 6-16% of
+  the frames the PPE punted for the dead session (up to about 130) were
+  lost in router software; the other three lost none. No flow got stuck.
+- Wi-Fi: on 2026-11-07 a live 6 GHz restart crashed the QCN9274 firmware,
+  and an ath12k NULL dereference in the `hw_scan` cleanup then rebooted the
+  router. The tree carries the two posted fixes (`953-01`, `953-02`). Ten
+  6 GHz restart cycles on the bench (20 restarts) caused no crash, but
+  the exact production sequence (the radio torn down with a client
+  attached) has not been reproduced, so that path of the fix is unproven.
+  The firmware crash itself is not explained.
+- After hours of sustained load with many clients, the QCN9274 firmware
+  can take a fatal error (reported upstream). The firmware dump is
+  released automatically (`/etc/hotplug.d/devcoredump/10-release-coredump`).
+  One firmware crash takes the 5 and 6 GHz radios down together.
+- In October a simulated firmware crash brought 2.4 GHz back in about
+  6.5 s, but the 5 GHz and MLD APs needed `wifi`. Not retested since.
+- Removing the 5 GHz link from a running MLD (disabling or reconfiguring
+  that radio, or a radar event) has left clients unable to associate on
+  the 6 GHz link until `wifi`. On the bench, bouncing either radio brought
+  the links back by themselves; association on the remaining link was not
+  tested with an MLO client. A similar failure is reported when a client
+  is denied on one link at runtime (`hostapd_cli -i ap-mld0_link1
+  deny_acl ADD_MAC <mac>`, then `deauthenticate <mac>`); not retested.
+- 802.11r is incompatible with MLO: hostapd's FT code has no MLD
+  awareness. Do not enable 11r on an MLO SSID. 11k/11v are fine.
+- 5 GHz at 160 MHz on blocks with DFS channels can fail chandef
+  re-validation after CAC (seen in October). The bench of 2026-11-18/19
+  did not reproduce it on 36-64 or 100-128. If you see `Failed to set
+  beacon parameters`, use EHT80.
+- Switch driver: one bridge is switched in hardware and a second runs in
+  software; there is no MDB, so multicast floods per `mcast_flood`
+  whatever IGMP snooping decides. The full list is section 7 of
+  `package/kernel/rtl8372n/TESTING.md`. The IGMP-snooping issues seen with
+  the previous driver (2026-10-04) have not been retested.
+- Units with no country in ART: the 6 GHz radio fails to come up with
+  country `00`, and `gl-art-country-check` logs a warning at boot. Set it
+  by hand: `uci set wireless.radioN.country=XX; uci commit wireless; wifi`.
 
-- With hardware offloading, fw4 builds the flowtable on `lan1`–`lan4`, the
-  Wi-Fi interfaces and `wan` instead of `br-lan`. Pending patch 701 lets it
-  mix devices that offload with devices that do not. Flows to wired clients
-  that the PPE declines are sent straight to a switch port in software.
-- With software offloading the flowtable lists `br-lan`, and since
-  OpenWrt's backport of "netfilter: flowtable: bail out if forward path
-  cannot be discovered" (706-03) a flow through `br-lan` is not offloaded at
-  all: flows to LAN and Wi-Fi clients take the normal forwarding path. fw4
-  briefly listed the ports in software mode too, but reverted that
-  (firewall4 issue #114); OpenWrt is working on a kernel fix
-  (openwrt/openwrt#26305) and a new fw4 change (firewall4 PR #116).
-- Do not combine flow offloading with SQM on a PPPoE or VLAN WAN: the
-  flowtable catches downloads on the device below (`wan`), so they skip a
-  download (ingress) shaper on `pppoe-wan` or on the VLAN device. Uploads
-  are still shaped (except those the PPE forwards, below), and so are both
-  directions with SQM on a plain `wan`. With `flow_offloading_hw=1` fw4
-  also lists the device below a VLAN WAN, which is the case of firewall4
-  issue #114. The downloads the PPE forwards skip every shaper, on any
-  WAN, and so do the uploads it forwards in the experimental S-R mode.
-- Pending patch 716 marks the frames the flowtable sends straight to a
-  switch port for TX forwarding offload, as the bridge does for the frames
-  it forwards, so that the switch delivers them from its own FDB; for
-  software flowtable traffic (nftables, and iptables `FLOWOFFLOAD`) it
-  replaced patch 766, which did the same inside the tagger for every
-  unmarked unicast frame. Pending patches 767-01/02 keep the tagger from
-  dereferencing a missing or freed bridge if a marked frame reaches a port
-  that just left its bridge. All three serve the previous `tag_8021q`
-  driver, whose bridge FDB had every wired client on the first forwarding
-  port. With the `rtl8_4` driver the bridge sees each frame's real ingress
-  port and the driver offers no TX forwarding offload: 716 marks nothing,
-  767-02 (the `tag_vsc73xx_8021q` half) never runs, and 767-01 still runs in
-  the DSA core, though no tagger reads the bridge. A flow sent straight to a
-  port leaves by the port the bridge FDB named when the flow was set up.
-- A flow sent straight to a port used to stay pinned to it: in testing with
-  766, a download to a client on `lan1` stalled for as long as `lan4` was
-  down, because the bridge had learned the client on `lan4`. Pending patch
-  717 tears flows down when their port loses carrier or joins or leaves a
-  bridge, so the next packet takes the bridge and the flow is set up again.
-  OpenWrt's own pending patch 708 (tear down direct xmit flows when the fdb
-  entry moves) also tears a flow down at the next flowtable gc pass once the
-  bridge learns its destination on another port (nftables flowtables only:
-  the iptables `FLOWOFFLOAD` target does not record the bridge path).
-  717's carrier-loss case ran on hardware on 2026-10-27 (then numbered 709,
-  before this tree carried OpenWrt's 708), with PPE offload on: a client
-  re-cabled from `lan2` to `lan3` mid-download had its flows set up again
-  through `lan3` (`TESTING.md` section 0 in
-  `target/linux/qualcommbe/docs/ppe-flow-offload/`). 716, 767-01/02, 717's
-  bridge join and leave cases, and their interplay with OpenWrt's 708, are
-  not yet tested on hardware.
-- Known limit of sending flows straight to the ports: a station that moves
-  to another switch port, or between a switch port and the router's own
-  Wi-Fi, without changing address and while its old port keeps carrier,
-  gets nothing on its existing flows until the bridge learns it on the new
-  port and OpenWrt's 708 tears them down at the next flowtable gc pass (with
-  iptables `FLOWOFFLOAD`, until they go idle). With the `rtl8_4` driver the
-  bridge learns each wired client's real port, so this also covers moves
-  between switch ports (not yet tested here).
-- Bypassing the bridge was worth a few percent on a single stream: with
-  `lan1`–`lan4` in the software flowtable, one PPPoE download went from ~1.84
-  to ~1.92–2.08 Gbit/s (2026-10-09, RPS on the WAN). That was measured with
-  `flow_offloading_hw=0`, the ports added by hand, 766 and the previous
-  switch driver, before 716 replaced 766. The ~1.84 baseline had `br-lan` in
-  the flowtable, which this tree no longer offloads: with
-  `flow_offloading_hw=0` the difference is now offload or none.
-- The flowtable keys on a frame's VLAN ID, not its whole tag, since the fix
-  OpenWrt backports as 706-04 (carried here as 651-01 before that). Before
-  it, LAN uploads that the managed switch tagged with a priority missed the
-  software flowtable and took the slow path.
+Untested: a VLAN-unaware `br-lan` (OpenWrt's default layout) with
+offload, the WAN at 1G or 100M, a DFS radar event, storms at 2.5G, IPv6 on
+a real line, other boards and ISPs, and IPQ9574.
 
 ## Firmware
 
@@ -313,54 +269,10 @@ hardware offloading for every flow the PPE declines.
   the tree carries WLAN.WBE.1.6-01270 as `ath12k-firmware-ipq5332-legacy` (split
   `.mdt` images, see `package/firmware/ath12k-firmware-legacy/PROVENANCE`).
 
-## Known issues
-
-- **ath12k firmware hang under sustained load.** After hours with many clients
-  the Q6 can take a fatal error. Reported upstream. The firmware dump is now
-  released automatically (`/etc/hotplug.d/devcoredump/10-release-coredump`),
-  so recovery no longer waits 5 minutes for it to be collected. In a simulated
-  crash (2026-10-04) the 2.4 GHz AP was back after about 6.5 s, but the 5 GHz
-  AP and the MLD AP did not come back until `wifi` was run. Under
-  investigation.
-- **Removing a link from a running MLD.** Disabling or reconfiguring the
-  5 GHz radio removes its link from the MLO network, after which clients can
-  no longer complete the handshake on the remaining 6 GHz link until Wi-Fi is
-  restarted (`wifi`). A radar event that forces a new CAC may take the same
-  path. A similar failure is reported without any reconfiguration, when a
-  client is denied on one link at runtime:
-  `hostapd_cli -i ap-mld0_link1 deny_acl ADD_MAC <mac>` then
-  `hostapd_cli -i ap-mld0_link1 deauthenticate <mac>` (undo with
-  `hostapd_cli -i ap-mld0_link1 deny_acl DEL_MAC <mac>`). The client authenticates on the 6 GHz link and
-  never associates. Under investigation; not yet retested on this tree.
-- **5 GHz at 160 MHz.** Blocks that include DFS channels (36–64, 100–128) can
-  fail chandef re-validation after CAC (`Failed to set beacon parameters`,
-  interface down). Use EHT80 on 5 GHz; 6 GHz is fine at 160 MHz.
-- **802.11r is incompatible with MLO.** hostapd's FT code has no MLD
-  awareness — do not enable 11r on an MLO SSID. 11k/11v are fine. An
-  experimental FT-over-MLO hostapd series exists in perceival/openwrt-flint3
-  (patches 992–999a); it is not carried here.
-- **Switch driver limits.** With offload on, one bridge is switched in
-  hardware and a second one runs in software; there is no MDB, so multicast
-  floods per `mcast_flood` whatever IGMP snooping decides. The full list is
-  section 7 of `package/kernel/rtl8372n/TESTING.md`. The VLAN-filtering and
-  IGMP-snooping issues seen with the previous driver (2026-10-04) have not
-  been retested.
-- **PPE offload and firewall reloads.** With hardware flow offloading, a
-  download running at line rate when fw4 reloads stalls for 0.5–5 s.
-  fw4 reloads on any firewall change, and twice after every WAN redial.
-  Under investigation; see [Flow offloading](#flow-offloading).
-- **Unprogrammed ART country.** The regulatory country is read from the ART
-  partition at first boot. Some units have none, and their 6 GHz radio then
-  fails to come up with country `00`. When ART has no country and a radio has
-  none configured either, `gl-art-country-check` logs a warning at boot. Set
-  the country by hand:
-  `uci set wireless.radioN.country=XX; uci commit wireless; wifi`
-  (for each radio, with your two-letter country code).
-
 ## Building
 
 ```sh
-git clone -b be9300 https://github.com/kubrickfr/openwrt-be9300.git
+git clone -b be9300-next https://github.com/kubrickfr/openwrt-be9300.git
 cd openwrt-be9300
 ./scripts/feeds update -a
 ./scripts/feeds install -a
@@ -371,153 +283,58 @@ make -j"$(nproc)"
 ```
 
 The switch driver offloads one bridge and its VLANs to the switch
-(`CONFIG_RTL837X_DSA_OFFLOAD`, on by default). `options rtl8372n_dsa
-offload=0` (or `=1`) in `/etc/modules.conf` overrides that at boot; with
-offload off, every bridge runs in software. See
-`package/kernel/rtl8372n/TESTING.md`.
-
-The PPE driver takes the flows fw4 offers by default: kmod-qcom-ppe's
-`KERNEL_QCOM_PPE_FLOW_OFFLOAD` (and `KERNEL_QCOM_PPE_PPPOE_OFFLOAD` for
-PPPoE). Both are on for the ipq53xx subtarget (the GL-BE9300), and off for
-ipq95xx, where this code has never run. Whether anything is offered is
-fw4's hardware flow offloading setting ([Flow offloading](#flow-offloading)),
-which is off in a fresh configuration. `options qcom-ppe flow_offload=0` (or
-`pppoe_offload=0`) in `/etc/modules.conf` overrides the build default at
-boot. See
-`target/linux/qualcommbe/docs/ppe-flow-offload/`.
+(`CONFIG_RTL837X_DSA_OFFLOAD`, on by default); `options rtl8372n_dsa
+offload=0` in `/etc/modules.conf` keeps every bridge in software. The PPE
+defaults are under [Flow offloading](#flow-offloading).
 
 Images land in `bin/targets/qualcommbe/ipq53xx/`. The build fails if the
 kernel image is larger than the 7 MiB `0:HLOS` partition, rather than
-producing an image that cannot boot (`KERNEL_SIZE` in
-`target/linux/qualcommbe/image/ipq53xx.mk`).
+producing an image that cannot boot.
 
-### Don't want to build from source?
-
-Pre-built images are published on the
-**[perceival/openwrt-flint3 Releases page](https://github.com/perceival/openwrt-flint3/releases)**.
-They are built from perceival's own tree, not from this one, and differ from
-it (see [Differences](#differences-from-perceivalopenwrt-flint3)). If your
-configuration uses `dhcp.odhcpd.maindhcp=1` (perceival's router images do),
-read [Migrating](#migrating-from-perceivalopenwrt-flint3-images) before
-flashing an image built from this tree with that configuration kept.
-
-See the disclaimer above before flashing any of them.
-
-## Differences from perceival/openwrt-flint3
-
-Both trees evolve in parallel. This tree was rebased from perceival's
-`flint3-be9300` as of 2026-09-22 (`b12c85403f`), and some later work was
-picked from it since.
-
-- **PPE hardware flow offload, reworked.** His table primitives and IPv4
-  engine are carried as patches 0433/0434, under his authorship. This tree
-  adds a safety layer, PPPoE download offload, and an egress-only emulation
-  of the `rtl8_4` tag (patches 0435–0439, 0441 and 0442, kernel pending
-  714). His ingress
-  parser alias was kept as a bench-only profile (0439) and is dropped by
-  0461: it stops 802.1Q parsing on the WAN. His IPv6 path and `tag_8021q` encapsulation are not
-  carried. The switch uses the native `rtl8_4` tag, with perceival's EDMA
-  checksum fallback carried as patch 0431. See
-  `target/linux/qualcommbe/docs/ppe-flow-offload/PROVENANCE.md`.
-- **Not carried:** the FT-over-MLO hostapd series (992–999a), and the vendor
-  Q6 memory contract described below.
-- **IPQ5332 UserPD boot.** ath12k describes the UserPD to the RootPD through
-  the legacy boot-info path (DT `qcom,legacy-userpd-bootinfo`, patches
-  903-02a/903-02b), with the reference-board reserved-memory layout:
-  `q6_region` at 0x4a900000 (43 MiB), `m3-dump` at 0x4d400000, `q6-caldb` at
-  0x4d500000, `ramoops` at 0x4da00000 (`ipq5332-gl-be9300.dts` and kernel
-  patch 2012). This was perceival's own design up to
-  the rebase point. The vendor Q6 memory contract (named regions, SMEM-507
-  boot arguments refreshed on every load) reached his tree on 2026-09-23
-  (merge `50800256ec`, with `c7d1cf7b66`) and
-  is not carried here: it cannot be mixed with the legacy path. This was a
-  deliberate choice, not an omission. Known residual: SMEM item 507 is written
-  once at probe, not on every firmware reload.
-- **DHCP:** upstream defaults (dnsmasq + odhcpd-ipv6only), where his router
-  images use full odhcpd as the DHCPv4 server. See below.
-
-## Migrating from perceival/openwrt-flint3 images
-
-This tree keeps upstream OpenWrt's DHCP setup: dnsmasq serves DHCPv4 and DNS,
-and odhcpd-ipv6only serves RA and DHCPv6. perceival's router images run full
-odhcpd as the DHCPv4 server (`dhcp.odhcpd.maindhcp=1`), reportedly with no
-dnsmasq section. This section applies to any kept configuration with
-`maindhcp=1`. odhcpd-ipv6only has no DHCPv4 and silently ignores
-`dhcpv4='server'`, and dnsmasq generates no DHCP ranges while `maindhcp=1`.
-A kept configuration therefore leaves the LAN **without DHCPv4**, and without
-DNS if there is no dnsmasq section. Before flashing, make sure you can reach
-the router with a static address.
-
-**Option A — upstream defaults**, run after the first boot. If unbound
-serves your DNS, read the unbound paragraph below before running it.
-
-```sh
-uci set dhcp.odhcpd.maindhcp='0'
-uci -q show dhcp | grep -q '=dnsmasq$' || {
-	uci add dhcp dnsmasq >/dev/null
-	for o in domainneeded=1 boguspriv=1 localise_queries=1 rebind_protection=1 \
-		rebind_localhost=1 local=/lan/ domain=lan expandhosts=1 cachesize=1000 \
-		authoritative=1 readethers=1 leasefile=/tmp/dhcp.leases \
-		resolvfile=/tmp/resolv.conf.d/resolv.conf.auto nonwildcard=1 \
-		localservice=1 ednspacket_max=1232; do
-		uci set dhcp.@dnsmasq[0].$o
-	done
-}
-uci set dhcp.lan.dhcpv4='server'
-uci commit dhcp && /etc/init.d/odhcpd restart && /etc/init.d/dnsmasq restart
-```
-
-Also set `dhcpv4='server'` on every other `config dhcp` section that should
-serve DHCPv4: dnsmasq treats a missing option as disabled (the defaults above
-are those of `package/network/services/dnsmasq/files/dhcp.conf`). Check that
-`/var/etc/dnsmasq.conf.*` now has a `dhcp-range=set:lan,…` line.
-
-If unbound serves DNS, use the "parallel dnsmasq" setup from unbound's
-README (`feeds/packages/net/unbound/files/README.md`): unbound keeps port 53
-and asks dnsmasq, moved to port 1053, for the names of DHCP clients. Before
-the `uci commit dhcp` line above:
-
-```sh
-uci set dhcp.@dnsmasq[0].port='1053'
-uci set dhcp.@dnsmasq[0].noresolv='1'
-uci add_list dhcp.lan.dhcp_option='option:dns-server,0.0.0.0'
-uci set unbound.@unbound[0].dhcp_link='dnsmasq'
-uci commit unbound
-```
-
-and afterwards `/etc/init.d/unbound restart`. Add the same `dhcp_option` to
-every other section that serves DHCPv4.
-
-**Option B — keep odhcpd as the DHCPv4 server:** build with
-`CONFIG_PACKAGE_odhcpd=y`, which replaces odhcpd-ipv6only in the image
-(upstream `1f7eb34c53`; checked with `make defconfig` on 2026-10-05). Then
-`maindhcp=1` configurations work unchanged, but DNS still needs a server:
-unbound, or a dnsmasq section (which then serves DNS only). Packages
-installed with apk do not survive a sysupgrade, so build it in.
+Pre-built images are on the
+[perceival/openwrt-flint3 Releases page](https://github.com/perceival/openwrt-flint3/releases).
+They are built from perceival's tree, not this one. If your configuration
+uses `dhcp.odhcpd.maindhcp=1` (his router images do), read
+`target/linux/qualcommbe/docs/MIGRATING-FROM-PERCEIVAL.md` before flashing
+an image from this tree with that configuration kept: it would leave the
+LAN without DHCPv4.
 
 ## Installing
 
-Full, hardware-verified instructions — including the round trip back to stock —
-are on the device page:
-
-**https://openwrt.org/toh/gl.inet/gl-be9300**
+Full instructions, including the round trip back to stock, are on the
+device page: **https://openwrt.org/toh/gl.inet/gl-be9300**
 
 Short version: from stock firmware, use the **factory** image with
 `sysupgrade -F -n`. The stock image check requires a QSDK FIT, so `-F` is
 required and the "missing section" warnings for `u-boot`/`tz`/`sb11` are
 expected. Do **not** force the plain sysupgrade image from stock.
 
-Stock QSDK firmware may report `qcom,ipq5332-ap-mi01.6` as its board name.
-That is the generic Qualcomm MI01.6/RDP468 identity used by the vendor path,
-not the OpenWrt GL-BE9300 device identifier. The same compatible is used by
-the upstream Qualcomm RDP468 device tree, so it is intentionally not added to
-this profile's `SUPPORTED_DEVICES`: doing so would advertise the Flint 3 image
-as compatible with other hardware using that generic identity. The resulting
-stock compatibility warning is therefore expected; use the documented `-F`
-factory-image path instead (see [perceival/openwrt-flint3#9](https://github.com/perceival/openwrt-flint3/issues/9)).
+Stock may report `qcom,ipq5332-ap-mi01.6` as its board name. That is the
+generic Qualcomm RDP468 identity, deliberately not in this profile's
+`SUPPORTED_DEVICES`, so the compatibility warning is expected
+([perceival/openwrt-flint3#9](https://github.com/perceival/openwrt-flint3/issues/9)).
 
-**Back up your eMMC first** — the ART partition holds this unit's radio
-calibration and MAC addresses and cannot be recovered from anywhere else.
+**Back up your eMMC first.**
+
+## Differences from perceival/openwrt-flint3
+
+Both trees evolve in parallel. This one was rebased from his `flint3-be9300`
+as of 2026-09-22 (`b12c85403f`), with some later work picked since.
+
+- **Switch driver:** the SDK-free RTL8372N DSA driver (from
+  perceival/openwrt-flint3#104) with the native `rtl8_4` tag and bridge and
+  VLAN offload, in place of the SDK-based driver and `tag_8021q`.
+- **PPE flow offload:** his table primitives and IPv4 engine are carried as
+  0433/0434, under his authorship, with a safety layer, PPPoE download
+  offload and an egress-only emulation of the `rtl8_4` tag on top. His
+  ingress parser alias and IPv6 path are not carried. See
+  `target/linux/qualcommbe/docs/ppe-flow-offload/PROVENANCE.md`.
+- **IPQ5332 UserPD boot:** the legacy boot-info path with the
+  reference-board reserved-memory layout, as his tree had at the rebase
+  point. His later vendor Q6 memory contract cannot be mixed with it and
+  is not carried; SMEM item 507 is written once at probe.
+- **Not carried:** the FT-over-MLO hostapd series (992–999a). DHCP keeps
+  upstream's defaults (dnsmasq and odhcpd-ipv6only).
 
 ## Upstream
 
@@ -525,7 +342,10 @@ Patches from this work that have gone upstream or are in review:
 
 - `wifi: ath12k: advertise AP_VLAN interface mode for IPQ5332` (linux-wireless)
 - hostapd WDS/AP_VLAN `bss->ctx` fix (applied by Jouni Malinen)
-- ath12k `hw_scan` NULL-deref report (with the Qualcomm dev team)
+- ath12k `hw_scan` NULL dereference after a firmware crash: reported
+
+Carried from upstream review: the ath12k `hw_scan` fixes by Chia-Lin Kao
+(AceLan) and Jose Ignacio Tornos Martinez (`953-01`, `953-02`).
 
 ## Links
 
@@ -534,23 +354,22 @@ Patches from this work that have gone upstream or are in review:
 
 ## Credits
 
-Maksims Neroba wrote the SDK-free RTL8372N DSA driver the switch package is
-based on (perceival/openwrt-flint3#104), adapting Airjinkela's DSA refactor;
-his P1 work found the switch's table locking, STP encoding and L2 flush
-completion bit used by the offload (see `package/kernel/rtl8372n/PROVENANCE.md`).
-
-Kamil Bienkiewicz (perceival) wrote the EDMA checksum fallback (0431), the
-earlier rtl837x VLAN ingress and
-standalone-VLAN fixes, the `tag_8021q` bridge-VID patch (766, since replaced
-by the flowtable patch 716), the coredump
-release handler, the faster switch bring-up and the ARMv8 crypto
+Kamil Bienkiewicz (perceival) maintains the Flint 3 port this tree is
+rebased from. He wrote the PPE flow offload primitives (0433/0434), the EDMA
+checksum fallback (0431), the earlier rtl837x VLAN fixes, the `tag_8021q`
+bridge-VID patch (766, since replaced by the flowtable patch 716), the
+coredump release handler, the faster switch bring-up and the ARMv8 crypto
 configuration carried here.
 
-This tree is a rebase of [perceival's](https://github.com/perceival/openwrt-flint3)
-Flint 3 port and the work of its contributors, among them
-[François Guerraz](https://github.com/kubrickfr), who maintains this rebase.
-That port was built on
-[JiaY-shi's](https://github.com/JiaY-shi/openwrt) GL-BE6500 tree (the working
-IPQ5332 Wi-Fi and RTL837x DSA foundation) and on Til Kaiser's IPQ53xx subtarget
-series. Thanks to everyone contributing hardware findings and testing via the
-issue trackers and the forum thread.
+Maksims Neroba wrote the SDK-free RTL8372N DSA driver the switch package is
+based on (perceival/openwrt-flint3#104), adapting Airjinkela's DSA refactor;
+his work found the switch's table locking, STP encoding and L2 flush
+completion bit used by the offload (see `package/kernel/rtl8372n/PROVENANCE.md`).
+
+JiaY-shi's GL-BE6500 tree provided the working IPQ5332 Wi-Fi and RTL837x DSA
+foundation, and Til Kaiser the IPQ53xx subtarget series. Chia-Lin Kao
+(AceLan) and Jose Ignacio Tornos Martinez wrote the ath12k `hw_scan` fixes
+carried as `953-01` and `953-02`.
+[François Guerraz](https://github.com/kubrickfr) maintains this rebase.
+Thanks to everyone contributing hardware findings and testing via the issue
+trackers and the forum thread.
