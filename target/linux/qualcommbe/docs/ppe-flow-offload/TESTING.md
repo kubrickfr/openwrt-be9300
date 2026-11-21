@@ -261,7 +261,10 @@ Up to `0441`, offload is off in the image and nothing else changes. From
 `0442`, two kmod-qcom-ppe menuconfig options set the parameters' defaults,
 both on by default for the ipq53xx subtarget (off for ipq95xx): `KERNEL_QCOM_PPE_FLOW_OFFLOAD` and
 `KERNEL_QCOM_PPE_PPPOE_OFFLOAD`. Unset them for an image that boots with
-offload off.
+offload off. The bench image r36754+1538 (2026-11-09) had both unset so that
+every bench run started from software; the production image built after the
+bench (2026-11-21) has both on, so that the firewall's `flow_offloading_hw`
+alone decides at runtime and `/etc/modules.conf` needs no line.
 
 ```sh
 make defconfig && make -j"$(nproc)"
