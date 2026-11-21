@@ -92,6 +92,29 @@ VID 10. Changes made at runtime and undone after each check.
   conduit tag checks, 3.6, 3.8, and frames to 01:80:c2:00:00:04-0d and :0f
   (RMA slots 4-6) on any port.
 
+2026-11-09 to 2026-11-19, the same unit on the mock-ISP bench of
+`target/linux/qualcommbe/docs/ppe-flow-offload/TESTING.md` section 0b,
+image r36754+1538 (this driver with the S-R mode built in, tagger `rtl8_4`
+from P2 on, offload on, debug build). br-lan VLAN-aware as on 2026-10-27;
+L untagged on lan2 at 2.5G, G1 tagged VLAN 1 on lan1 at 1G. The driver
+carried every test there; the ones that bear on it:
+
+- **Roaming**: a client cloned from lan2 to lan1 with both ports up, and a
+  cable moved from lan2 to lan3 mid-download. In both, the bridge learned
+  the new port and traffic followed (T9: link out 3.1 s, data back 6 s
+  after it stopped). Not run: a move to or from Wi-Fi.
+- **FDB flood**: 8192 and 16384 source MACs on lan2. The software FDB
+  learned all of them (24578 entries, well past the switch's 4160); no
+  flood frame reached lan1. The same floods in VLAN 10 and 20 were dropped
+  at the switch's ingress.
+- **Storms**: broadcast, unknown-unicast and multicast at 100M and 1G from
+  lan2 for 30 s each. PPPoE stayed up, every LCP echo was answered, the
+  hardware download kept its rate. Not run at 2.5G (the sender topped out
+  at 1G).
+- **VLANs**: lan2 as a VID 10 access port to G1's VID 10 behind the lan1
+  trunk, 200 of 200 pings; a bridge VLAN change under load.
+- Six reboots and a panic: the switch came up each time, WAN at 2500.
+
 ## 1. Prerequisites and recovery
 
 - **Unit.** Prefer a spare unit with the AP profile. On the gateway, keep the
@@ -482,11 +505,25 @@ off; created by a hot swap, they have them on, and cannot turn them off.
 GRO is unaffected, and software forwarding through them ran at
 1720 Mbit/s. They stay on until the next boot.
 
-Not run yet: Wi-Fi to wired, LAN-to-LAN, throughput, traps, the forged
-"port 7" frame, own-port 39xx C-VIDs and the nested 88a8, foreign 39xx
-forms, configuration while armed, L6, L7 and L8.
+Since then:
 
-### 8.4 WP3: forced isolation, lease, bench verbs (desk only so far)
+- On the gateway, 2026-11-05/06, S-R ran ACTIVE overnight for about
+  14 hours with household uploads in hardware, with no fault and no drop
+  except 11 counted as not-ready. A speed test at the start reached the
+  line's rate.
+- On the mock-ISP bench, 2026-11-10 (I0): the first boot with `svlan=1`
+  was clean; `ppe-sr` armed to SR_READY with one ping in 1800 lost on each
+  client, the ~100 ms accept-NONE window; traffic from L (untagged) and G1
+  (tagged) and VID 10 passed while armed, and `rx_s` counted on both
+  ports; disarm lost at most 2 pings; the PPE took flows again afterwards
+  (2204 Mbit/s in hardware).
+
+Not run yet: the S-R bench gates (I1-I5): Wi-Fi to wired, throughput
+with uploads in hardware on the bench, traps, the forged "port 7" frame,
+own-port 39xx C-VIDs and the nested 88a8, foreign 39xx forms,
+configuration while armed, L6, L7 and L8.
+
+### 8.4 WP3: forced isolation, lease, bench verbs (desk only; I4 not run)
 
 `svlan` takes one verb per write:
 
