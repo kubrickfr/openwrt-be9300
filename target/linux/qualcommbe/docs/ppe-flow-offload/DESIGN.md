@@ -439,6 +439,22 @@ afresh. On the bench, a client cloned from lan2 to lan1 with both ports
 up had its flow in hardware towards lan1 with no black hole [meas-B,
 TESTING.md section 0b, P3 C].
 
+A move the follower cannot take the flow to (the router's Wi-Fi, a port of
+the other VLAN form, a port that does not forward) used to leave the flow
+in hardware towards the old port, and the follower looked only at learns
+on switch ports. Since `0469` on be9300-next-sr, a learn in the flow's
+VLAN on any port of its bridge reaches the follower, which drops a flow it
+cannot re-point. The offer path also asks the bridge, through 708's
+`nf_br_utils_hook` (under RCU, no RTNL), and declines a download into the
+switch whose client the bridge positively has on another port; a flow
+already in hardware is then withdrawn. Without that check the flowtable's
+re-offer on the original route, about once a second while software
+forwards the flow, would put it straight back towards the old port. An
+absent FDB entry is not a move: offloaded traffic does not refresh it.
+The check runs again once the flow is in the hash the FDB notifier scans,
+which closes the race with a learn. The same applies to S-R downloads in
+their class's VLAN. (I: desk harness only, not run on hardware.)
+
 ## 6. PPPoE (0438 download, 0439 upload)
 
 **Its own switch.** PPPoE flows need a second parameter,
@@ -691,6 +707,9 @@ household offline, the operator on Wi-Fi.
   port's carrier loss) and offered afresh; one moved between two ports that
   both stay up is followed only when the bridge learns it again (VID 1 in a
   VLAN-aware bridge), and until then its downloads stay on the old port.
+  One that the bridge learns on a port hardware cannot reach it by (the
+  router's Wi-Fi included) goes back to software at that learn (`0469`,
+  section 5).
   Moved from lan2 to lan3 during a download, a client went about 6 s
   without data: 3.2 s without link, about 1 s before the link was reported
   down, and about 2 s of the server's retransmission backoff after it was

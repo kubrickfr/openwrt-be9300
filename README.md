@@ -175,10 +175,13 @@ Notes on the software flowtable and the switch ports are in
 
 Offload scope, by design:
 
-- Only IPv4 downloads into the switch are offloaded. Uploads (outside
-  S-R), IPv6, Wi-Fi clients, VLANs other than 1, hairpin NAT and multicast
-  stay in the software flowtable. At most 4 PPPoE sessions and 4 bridge
-  MACs are in hardware.
+- Only IPv4 downloads into the switch are offloaded. Uploads and VLANs
+  other than 1 (outside S-R), IPv6, Wi-Fi clients, hairpin NAT and
+  multicast stay in the software flowtable. S-R covers any VLAN of the
+  bridge that has an L3 device (`br-lan.<v>`); a scope with more than one
+  VLAN needs `option ack_multi_cvid 1`, and only VLAN 1 has run in
+  hardware so far. At most 4 PPPoE sessions and 4 bridge MACs are in
+  hardware.
 - Neither the PPPoE session match nor the flow key has a VLAN. Frames with
   the session ID from the concentrator's MAC on another VLAN of the WAN
   port, or untagged, and a plain-IP flow's tuple in another encapsulation,
@@ -206,19 +209,16 @@ Open issues:
   for the WAN (measured: 81-94% of such frames). It is a generic kernel
   bug in fraglist GRO, not the PPE. Workaround: `ethtool -K wan gro off`.
   A fix is written and not yet in this tree.
-- A client that moves from a LAN port to the router's Wi-Fi while its old
-  port keeps carrier: untested with offload. The default mode may lose its
-  active hardware downloads until the connections end (inferred).
-- In S-R mode, reading the code says a client that moves to the router's
-  Wi-Fi, to a port of the other tagging form, or out of S-R's scope has
-  its existing hardware downloads sent to the old port until the
-  connections end. The fix (an FDB check on the offer path) is not
-  written. Keep S-R's scope (`list class` in `/etc/config/ppe-sr`) to
-  ports with wired clients that do not move, and leave out ports with
-  access points: a client roaming between access points on two router
-  ports then never enters S-R (inferred from the code, not tested). In the
-  default mode that roam is followed (measured on the bench with both
-  ports up).
+- A client that moves from a LAN port to the router's Wi-Fi, to a port of
+  the other tagging form, or out of S-R's scope while its old port keeps
+  carrier: its hardware downloads go back to software as soon as the
+  bridge learns it there, and stay in software until the flowtable's gc
+  pass offers them on the new route (`0469`; before it, both modes could
+  send them to the old port until the connections ended). Desk-tested
+  only; not yet run on hardware. Wired moves between two switch ports of
+  the same form are re-pointed in place, as before (measured on the bench
+  in the default mode with both ports up). `offload_stats` counts the
+  declines as `fdb_moved`, and the S-R status as `decline_moved`.
 - In two of five PPPoE session restarts under load on the bench, 6-16% of
   the frames the PPE punted for the dead session (up to about 130) were
   lost in router software; the other three lost none. No flow got stuck.

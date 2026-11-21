@@ -1,0 +1,609 @@
+From: François Guerraz <kubrick@fgv6.net>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: decline downloads whose client
+ the bridge has elsewhere
+
+A download into the RTL8372N names its port outright: profile E's emulated
+head tag carries the port mask, an S-R download its port's S-tag. When its
+client moves to another port, the flowtable keeps offering the flow on the
+route it was created with, about once a second while software forwards
+it, and the driver accepted it there again, back into hardware towards
+the old port. Software follows the move (br-lan.<v> transmits through the
+bridge, which looks the address up per packet); hardware black-holed the
+download until the connection ended or the client came back. The FDB
+follower only re-points or drops the flows it already holds, so a drop
+was undone by the next re-offer.
+
+The offer path now asks the bridge, through pending 708's
+nf_br_utils_hook, which the flowtable's gc asks the same question with:
+under RCU and without RTNL, which the offer path must not take. A download
+whose client the bridge positively has on another port, in the
+download's VLAN (an S-R download's class's, VLAN 1 for profile E in a
+VLAN-aware bridge, none in a VLAN-unaware one), is declined (S-R reason
+"moved"), so that one already in hardware is withdrawn. An absent entry
+is not a move: offloaded packets do not refresh it, so it ages out under a
+healthy flow (708 keeps such a flow for the same reason), and the switch
+confines an S-R frame for an unknown DA to the S-tag's port. The check
+runs again with the new entry in the hash the FDB notifier scans, under
+its lock: a learn notified after that finds the entry and queues its
+move, and one notified before had already changed the FDB entry, which
+the second check then sees and takes the flow back at once. Without the
+hook nothing is said, as before; such accepts are counted.
+
+Profile E's follower looked only at learns on DSA user ports, and left a
+flow where it was when the new port could not take it. A client gone to
+the router's Wi-Fi, to a port of the other VLAN form, or to a port not
+forwarding kept its downloads in hardware towards the old port until a gc
+pass of the flowtable tore them down. A learn in the flow's VLAN on any
+port of its bridge now reaches it, and a flow that cannot be re-pointed
+is dropped, as S-R's follower already did: software then forwards it, the
+offer path declines its re-offers on the old route, and the gc pass
+re-creates it on the new one.
+
+offload_stats gains a line "fdb_moved N fdb_unchecked N"; the S-R status
+a "decline_moved" line.
+
+Signed-off-by: François Guerraz <kubrick@fgv6.net>
+---
+ drivers/net/ethernet/qualcomm/ppe/ppe_offload.c |  350 ++++++++++++++++++-----
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr.h      |    5 
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_eng.c  |    3 
+ drivers/net/ethernet/qualcomm/ppe/ppe_sr_topo.c |    1 
+ 4 files changed, 275 insertions(+), 84 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_offload.c
+@@ -229,6 +229,7 @@
+ #include <linux/moduleparam.h>
+ #include <linux/mutex.h>
+ #include <linux/netdevice.h>
++#include <linux/netfilter.h>
+ #include <linux/of.h>
+ #include <linux/ppp_defs.h>
+ #include <linux/regmap.h>
+@@ -571,6 +572,11 @@ struct ppe_offload_bind {
+  * @unbound: Flows dropped because their flowtable went away.
+  * @stuck: Hardware entries found undeletable, counted once each time one
+  * becomes stuck.
++ * @moved: Downloads into the switch declined, or taken back right after
++ * their add, because the bridge has their client on another port
++ * (ppe_offload_fdb_elsewhere()).
++ * @fdb_unchecked: Such downloads accepted without asking the bridge (no
++ * nf_br_utils_hook).
+  */
+ struct ppe_offload_counters {
+ 	atomic_long_t accepted;
+@@ -581,6 +587,8 @@ struct ppe_offload_counters {
+ 	atomic_long_t withdrawn;
+ 	atomic_long_t unbound;
+ 	atomic_long_t stuck;
++	atomic_long_t moved;
++	atomic_long_t fdb_unchecked;
+ };
+ 
+ /**
+@@ -1494,6 +1502,60 @@ static int ppe_offload_dsa_egress(struct ppe_offload_priv *priv, struct net_devi
+ 
+ 	return 0;
+ }
++
++/* What the bridge says of a port-addressed download's client, see
++ * ppe_offload_fdb_elsewhere().
++ */
++enum ppe_offload_fdb_where {
++	PPE_OFFLOAD_FDB_HERE,
++	PPE_OFFLOAD_FDB_ELSEWHERE,
++	PPE_OFFLOAD_FDB_UNCHECKED,
++};
++
++/* Whether the bridge @dev is a port of positively has @addr in @vid on
++ * another of its ports. A download into the switch names its port outright
++ * (the emulated head tag's port mask, or an S-R S-tag), so one offered on
++ * the route it was created with after its client moved would keep going to
++ * the old port: the flowtable re-offers a flow on that route about once a
++ * second while software forwards it, whatever the FDB says by then.
++ *
++ * Asked through pending 708's nf_br_utils_hook, which the flowtable's gc
++ * uses for the same question: under RCU, without RTNL (the offer path must
++ * not take it). An entry that is absent counts as here: offloaded packets do
++ * not refresh it, so it ages out under a healthy flow, and the switch
++ * delivers an S-R frame to a DA it does not know on the S-tag's port alone
++ * (sr/RESULT-ARCH D3). @vid 0 on a VLAN-filtering bridge is the port's PVID.
++ * Without the hook (no bridge, or a bridge without the flowtable helpers)
++ * nothing can be said, as before this check.
++ */
++static enum ppe_offload_fdb_where ppe_offload_fdb_elsewhere(const struct net_device *dev,
++							    const u8 *addr, u16 vid)
++{
++	enum ppe_offload_fdb_where where = PPE_OFFLOAD_FDB_UNCHECKED;
++#if IS_ENABLED(CONFIG_NETFILTER)
++	const struct nf_br_utils *br_utils;
++
++	rcu_read_lock();
++	br_utils = rcu_dereference(nf_br_utils_hook);
++	if (br_utils)
++		where = br_utils->fdb_valid_dst(dev, addr, vid) ? PPE_OFFLOAD_FDB_HERE :
++								  PPE_OFFLOAD_FDB_ELSEWHERE;
++	rcu_read_unlock();
++#endif
++
++	return where;
++}
++
++/* The VLAN a port-addressed download's client is looked up in: an S-R
++ * download's class's, profile E's VLAN 1 in a VLAN-aware bridge, none in a
++ * VLAN-unaware one.
++ */
++static u16 ppe_offload_fdb_vid(bool sr, u16 sr_vid, bool vlan_aware)
++{
++	if (sr)
++		return sr_vid;
++	return vlan_aware ? PPE_OFFLOAD_RTL8372N_CPU_VID : 0;
++}
+ #endif
+ 
+ /* Whether @dev is a DSA user port. */
+@@ -2677,6 +2739,7 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 	unsigned int smac_slot = 0;
+ 	bool smac_ref = false;
+ 	bool smac = false;
++	bool moved = false;
+ 	u32 flow_l3_if;
+ 	u16 pppoe_sid = 0;
+ 	bool pub_ip = false;
+@@ -3253,6 +3316,33 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		smac = true;
+ 	}
+ 
++#if IS_ENABLED(CONFIG_NET_DSA)
++	/* A download into the switch whose client the bridge has since learnt
++	 * on another port (a roam to the router's Wi-Fi, a port of the other
++	 * tagging form, a port out of S-R's scope, a recable with both links
++	 * up): the flowtable still offers it on the route it was created with,
++	 * towards the old port, which hardware would keep sending to. Declined,
++	 * so that a flow already in hardware is withdrawn, and software
++	 * forwards it until a gc pass (708) tears it down for the new route.
++	 * Checked again once the flow is where the FDB notifier finds it.
++	 */
++	if (egress.dsa_fixed && egress.bridge_ifindex) {
++		u16 fdb_vid = ppe_offload_fdb_vid(egress.sr, sr_offer.cls.vid, egress.vlan_aware);
++		enum ppe_offload_fdb_where where;
++
++		where = ppe_offload_fdb_elsewhere(odev, eth.bytes, fdb_vid);
++		if (where == PPE_OFFLOAD_FDB_UNCHECKED)
++			atomic_long_inc(&priv->counters.fdb_unchecked);
++		if (where == PPE_OFFLOAD_FDB_ELSEWHERE) {
++			atomic_long_inc(&priv->counters.moved);
++			if (egress.sr)
++				ppe_sr_count_decline(&priv->sr, PPE_SR_W_MOVED);
++			return ppe_offload_decline("odev=%s: %pM in vlan %u is on another port",
++						    netdev_name(odev), eth.bytes, fdb_vid);
++		}
++	}
++#endif
++
+ 	/* PPPoE upload: the session must be the kernel's for the address
+ 	 * the flow is translated to, on the device and VLAN it leaves
+ 	 * through, and the frames must be addressed to its concentrator.
+@@ -3616,9 +3706,36 @@ static int ppe_offload_flow_replace(struct net_device *netdev,
+ 		spin_lock_bh(&priv->dsa_fixed_lock);
+ 		hash_add(priv->dsa_fixed_ht, &entry->dsa_fixed_hnode,
+ 			 ether_addr_to_u64(entry->dmac));
++#if IS_ENABLED(CONFIG_NET_DSA)
++		/* The client may have been learnt on another port since the
++		 * check before the add. A learn whose notifier takes
++		 * dsa_fixed_lock after this point finds the entry and queues
++		 * its move; one whose notifier took it before had already
++		 * changed the FDB entry, which this sees now.
++		 */
++		if (egress.bridge_ifindex &&
++		    ppe_offload_fdb_elsewhere(odev, entry->dmac,
++					      ppe_offload_fdb_vid(egress.sr, sr_offer.cls.vid,
++								  egress.vlan_aware)) ==
++		    PPE_OFFLOAD_FDB_ELSEWHERE)
++			moved = true;
++#endif
+ 		spin_unlock_bh(&priv->dsa_fixed_lock);
+ 	}
+ 
++	/* Taken back at once, as if declined before the add. A drop that
++	 * fails latches degraded with the entry kept, as anywhere else.
++	 */
++	if (moved) {
++		atomic_long_inc(&priv->counters.moved);
++		if (egress.sr)
++			ppe_sr_count_decline(&priv->sr, PPE_SR_W_MOVED);
++		ppe_offload_flow_drop(priv, entry);
++		ret = -EOPNOTSUPP;
++		stage = "moved";
++		goto unlock;
++	}
++
+ 	if (ingress_sr || egress.sr)
+ 		ppe_sr_offer_accepted(priv, &sr_offer);
+ 
+@@ -3762,7 +3879,13 @@ static int ppe_offload_flow_destroy(struct ppe_offload_priv *priv, struct flow_c
+  * follow the move: the bridge learns the client's new port from the first
+  * frame that reaches the CPU and reports it as SWITCHDEV_FDB_ADD_TO_DEVICE
+  * on the new port device, and every fixed-port flow for that MAC is then
+- * re-pointed at the new port, in place. That first frame is the limit of
++ * re-pointed at the new port, in place, or dropped when hardware cannot
++ * reach the client there (a port off the switch, the router's Wi-Fi
++ * included, or one the flow's form or VLAN does not fit). A dropped flow
++ * is re-offered on the route it was created with, which the offer path
++ * declines while the bridge has the client elsewhere
++ * (ppe_offload_fdb_elsewhere()), so software keeps it until the gc pass
++ * re-creates it on the new route. That first frame is the limit of
+  * this: a moved client's own hardware-forwarded packets never reach the
+  * bridge, so the move is noticed when the client next ARPs, renews its
+  * lease or opens a connection (the switch driver reports no hardware
+@@ -3773,7 +3896,8 @@ static int ppe_offload_flow_destroy(struct ppe_offload_priv *priv, struct flow_c
+  * in a VLAN-unaware bridge or in VID 1 in a VLAN-aware one (where the
+  * emulated tag delivers, see ppe_offload_dsa_vlan_ok()): that is the one
+  * domain in which the bridge itself would send the client's traffic to the
+- * new port. Another bridge on the same
++ * new port; a learn there on a port that is not a DSA user port drops the
++ * flow. Another bridge on the same
+  * switch learning the address (a guest port claiming a trusted client's
+  * MAC) must not pull the flow across, which it otherwise would, since the
+  * emulated head tag addresses the port outright with no FDB or VLAN check
+@@ -3798,9 +3922,10 @@ static int ppe_offload_flow_destroy(struct ppe_offload_priv *priv, struct flow_c
+  * (ppe_offload_fdb_sweep_work()). A dropped download is not offered again
+  * against the bridge as it is then: the flowtable re-offers it with the
+  * route it was created with, towards the port its client was first
+- * resolved on, and it is accepted there again while that port's class
+- * allows it, until a gc pass of the flowtable (OpenWrt's 708) tears it
+- * down because the bridge has the client elsewhere. Its uploads are left
++ * resolved on, and the offer path declines it there while the bridge has
++ * the client on another port (ppe_offload_fdb_elsewhere()), until a gc
++ * pass of the flowtable (OpenWrt's 708) tears it down and offers it on
++ * the new route. Its uploads are left
+  * alone: the moved client's frames come with another identity and fail
+  * their source check.
+  *
+@@ -3942,102 +4067,173 @@ static bool ppe_offload_fdb_flapping(struct ppe_offload_flow_entry *entry)
+ 	return ++entry->move_count > PPE_OFFLOAD_FDB_FLAP_MAX;
+ }
+ 
+-/* Profile E's flows to @move->addr, after its learn on @move->dev. Under
+- * RTNL: DSA tears its ports down under it, and the device reference alone
+- * keeps only the netdevice, not its port, alive.
++/* The port the bridge @br_ifindex of @net has @addr on in @vid now, NULL if
++ * it has it on none (aged out, or flushed). Under RTNL.
++ */
++static struct net_device *ppe_offload_fdb_port(struct net *net, int br_ifindex,
++					       const u8 *addr, u16 vid)
++{
++	struct net_device *br;
++
++	ASSERT_RTNL();
++
++	br = __dev_get_by_index(net, br_ifindex);
++
++	return br ? br_fdb_find_port(br, addr, vid) : NULL;
++}
++
++/* Whether profile E can take a client's flows to @dev, the port its bridge
++ * @bridge has just learnt it on: what ppe_offload_dsa_egress() asks of a
++ * bridged port, and the same EDMA conduit, set up for the emulated head tag,
++ * as the flows it would re-point. Sets @dpp, @tagged and @port_privp when it
++ * can. Under RTNL: DSA tears its ports down under it, and the device
++ * reference alone keeps only the netdevice, not its port, alive.
+  */
+-static void ppe_offload_fdb_move_e(struct ppe_offload_priv *priv,
+-				   const struct ppe_offload_fdb_move *move)
++static bool ppe_offload_fdb_e_target(struct ppe_offload_priv *priv, struct net_device *dev,
++				     const struct net_device *bridge, bool vlan_aware,
++				     struct dsa_port **dpp, bool *tagged,
++				     struct edma_port_priv **port_privp)
+ {
+-	struct ppe_offload_flow_entry *entry;
+-	unsigned int moved = 0, failed = 0, dropped = 0;
+-	struct ppe_nexthop_entry nexthop;
+-	struct edma_port_priv *port_priv;
+ 	struct bridge_vlan_info vinfo;
+-	struct net_device *bridge;
+ 	struct net_device *conduit;
+-	bool vlan_aware, tagged = false;
+-	struct hlist_node *tmp;
+ 	struct dsa_port *dp;
+-	u32 nexthop_index;
+ 
+ 	ASSERT_RTNL();
+ 
+-	/* The port may have left DSA, or its bridge, while this was queued. */
+-	dp = dsa_port_from_netdev(move->dev);
++	/* Not a port of this driver's switch: the router's Wi-Fi, another
++	 * bridge port, or a port that left DSA while this was queued.
++	 */
++	dp = dsa_port_from_netdev(dev);
+ 	if (IS_ERR(dp) || dp->index >= PPE_OFFLOAD_RTL8_4_RX_BITS)
+-		return;
+-	bridge = dsa_port_bridge_dev_get(dp);
+-	if (!bridge)
+-		return;
++		return false;
++	if (dsa_port_bridge_dev_get(dp) != bridge ||
++	    dsa_port_is_vlan_filtering(dp) != vlan_aware)
++		return false;
+ 
+-	/* In a VLAN-aware bridge, only a learn in the VLAN the emulated tag
+-	 * delivers in, on a port that is a member there in the way the flow
+-	 * leaves (see ppe_offload_dsa_vlan_ok()).
++	/* In a VLAN-aware bridge, a port that is a member of the VLAN the
++	 * emulated tag delivers in, in a way the flow can leave by (see
++	 * ppe_offload_dsa_vlan_ok()).
+ 	 */
+-	vlan_aware = br_vlan_enabled(bridge);
+-	if (move->vid != (vlan_aware ? PPE_OFFLOAD_RTL8372N_CPU_VID : 0))
+-		return;
+-	/* What ppe_offload_dsa_egress() asks of a bridged port. */
+-	if (netdev_master_upper_dev_get(move->dev) != bridge ||
+-	    dsa_port_is_vlan_filtering(dp) != vlan_aware)
+-		return;
++	*tagged = false;
+ 	if (vlan_aware) {
+ 		bool only;
+ 
+ 		if (!dp->ds->dev ||
+ 		    !of_device_is_compatible(dp->ds->dev->of_node, "realtek,rtl8372n"))
+-			return;
+-		if (br_vlan_get_info(move->dev, PPE_OFFLOAD_RTL8372N_CPU_VID, &vinfo))
+-			return;
+-		tagged = !(vinfo.flags & BRIDGE_VLAN_INFO_UNTAGGED);
++			return false;
++		if (br_vlan_get_info(dev, PPE_OFFLOAD_RTL8372N_CPU_VID, &vinfo))
++			return false;
++		*tagged = !(vinfo.flags & BRIDGE_VLAN_INFO_UNTAGGED);
+ 		rcu_read_lock();
+-		only = ppe_offload_vlan1_untagged_only(priv, dp, move->dev);
++		only = ppe_offload_vlan1_untagged_only(priv, dp, dev);
+ 		rcu_read_unlock();
+-		if (!tagged && !only)
+-			return;
++		if (!*tagged && !only)
++			return false;
+ 	}
+ 
+ 	/* The bridge learns on a port before it forwards to it; a port it
+ 	 * would not deliver to is no destination for hardware either.
+ 	 */
+ 	if (dp->stp_state != BR_STATE_FORWARDING)
+-		return;
++		return false;
+ 
+-	/* What ppe_offload_dsa_egress() required of the original port: the
+-	 * new one must hang off the same EDMA conduit, set up for the
+-	 * emulated head tag, whose PPE port the kept nexthop names.
+-	 */
+ 	if (dp->cpu_port_in_lag)
+-		return;
++		return false;
+ 	conduit = dp->cpu_dp->conduit;
+ 	if (!conduit || !edma_port_is_edma_netdev(conduit))
+-		return;
++		return false;
+ 	if (!ppe_offload_rtl8_4_egress_ready(priv, conduit))
++		return false;
++
++	*dpp = dp;
++	*port_privp = netdev_priv(conduit);
++	return true;
++}
++
++/* Profile E's flows to @move->addr, after its learn on @move->dev, taken to
++ * the port their bridge has the client on when this runs, if not theirs.
++ * Each is re-pointed there if
++ * ppe_offload_fdb_e_target() says the port can take it, and dropped
++ * otherwise: its emulated head tag names the old port, where hardware
++ * would keep sending it (a client gone to the router's Wi-Fi, to a port
++ * of another VLAN form, to a port not forwarding). Software then forwards
++ * it, and the flowtable re-offers it on its original route, which
++ * ppe_offload_fdb_elsewhere() declines, until a gc pass (708) tears it
++ * down for the port the bridge has then. Under RTNL.
++ */
++static void ppe_offload_fdb_move_e(struct ppe_offload_priv *priv,
++				   const struct ppe_offload_fdb_move *move)
++{
++	struct ppe_offload_flow_entry *entry;
++	unsigned int moved = 0, failed = 0, dropped = 0, gone = 0;
++	struct edma_port_priv *port_priv = NULL;
++	struct ppe_nexthop_entry nexthop;
++	struct dsa_port *dp = NULL;
++	struct net_device *bridge, *to;
++	bool vlan_aware, tagged = false;
++	struct hlist_node *tmp;
++	u32 nexthop_index;
++	bool follow;
++
++	ASSERT_RTNL();
++
++	/* The port may have left its bridge while this was queued: that is
++	 * a bridge change, which drops the port's flows by itself.
++	 */
++	bridge = netdev_master_upper_dev_get(move->dev);
++	if (!bridge || !netif_is_bridge_master(bridge) ||
++	    bridge->ifindex != move->bridge_ifindex)
++		return;
++
++	/* A learn in another VLAN is not this client's move: in a
++	 * VLAN-aware bridge, profile E's flows are all in VLAN 1.
++	 */
++	vlan_aware = br_vlan_enabled(bridge);
++	if (move->vid != (vlan_aware ? PPE_OFFLOAD_RTL8372N_CPU_VID : 0))
++		return;
++
++	/* Where the bridge has the client now, not where the learn that
++	 * queued this said: a learn back on the flow's own port while this
++	 * waited queued nothing, and must not see the flow dropped. An
++	 * address the bridge no longer has (aged out, flushed) says nothing.
++	 */
++	to = ppe_offload_fdb_port(dev_net(move->dev), bridge->ifindex, move->addr, move->vid);
++	if (!to)
+ 		return;
+-	port_priv = netdev_priv(conduit);
++
++	follow = ppe_offload_fdb_e_target(priv, to, bridge, vlan_aware, &dp, &tagged, &port_priv);
+ 
+ 	mutex_lock(&priv->lock);
+ 
+ 	/* Disabled meanwhile: the flows and the egress profile are gone. */
+-	if (!priv->enabled || priv->egress_port != port_priv->ppe_port->port_id) {
++	if (!priv->enabled) {
+ 		mutex_unlock(&priv->lock);
+ 		return;
+ 	}
++	if (follow && priv->egress_port != port_priv->ppe_port->port_id)
++		follow = false;
+ 
+ 	/* @lock keeps the entries alive; a failed re-point drops its entry. */
+ 	hash_for_each_possible_safe(priv->dsa_fixed_ht, entry, tmp, dsa_fixed_hnode,
+ 				    ether_addr_to_u64(move->addr)) {
+-		if (entry->sr_mode != PPE_SR_FLOW_NONE ||
+-		    !entry->flow_valid || entry->dsa_ds != dp->ds ||
+-		    entry->nexthop.port != port_priv->ppe_port->port_id ||
++		if (entry->sr_mode != PPE_SR_FLOW_NONE || !entry->flow_valid ||
+ 		    entry->dsa_bridge_ifindex != bridge->ifindex ||
+ 		    entry->dsa_vlan_aware != vlan_aware ||
+-		    (vlan_aware && entry->dsa_vlan_tagged != tagged) ||
+-		    entry->dsa_ifindex == move->dev->ifindex ||
++		    entry->dsa_ifindex == to->ifindex ||
+ 		    !ether_addr_equal(entry->dmac, move->addr))
+ 			continue;
+ 
++		/* Nowhere hardware can take it: back to software. */
++		if (!follow || entry->dsa_ds != dp->ds ||
++		    entry->nexthop.port != port_priv->ppe_port->port_id ||
++		    (vlan_aware && entry->dsa_vlan_tagged != tagged)) {
++			if (ppe_offload_flow_drop(priv, entry))
++				failed++;
++			else
++				gone++;
++			continue;
++		}
++
+ 		/* Following the bridge is only as good as its learning. An
+ 		 * address that keeps moving (a loop, a station on two ports,
+ 		 * or any host on the bridge sending frames with that source)
+@@ -4061,7 +4257,7 @@ static void ppe_offload_fdb_move_e(struct ppe_offload_priv *priv,
+ 		if (ppe_nexthop_pool_get_and_ref(priv->ppe_dev, &priv->nexthop_pool, &nexthop,
+ 						 &nexthop_index) ||
+ 		    ppe_offload_flow_repoint(priv, entry, &nexthop, nexthop_index, dp->index,
+-					     move->dev, NULL))
++					     to, NULL))
+ 			failed++;
+ 		else
+ 			moved++;
+@@ -4072,9 +4268,10 @@ static void ppe_offload_fdb_move_e(struct ppe_offload_priv *priv,
+ 	/* A MAC flapping between two ports (a loop, a misbehaving client)
+ 	 * would otherwise turn this into a log storm.
+ 	 */
+-	if (moved || failed || dropped)
+-		pr_info_ratelimited("ppe_offload: %pM moved to %s: %u flow(s) re-pointed, %u not re-pointed, %u dropped for flapping\n",
+-				    move->addr, netdev_name(move->dev), moved, failed, dropped);
++	if (moved || failed || dropped || gone)
++		pr_info_ratelimited("ppe_offload: %pM moved to %s: %u flow(s) re-pointed, %u back to software, %u not re-pointed, %u dropped for flapping\n",
++				    move->addr, netdev_name(to), moved, gone, failed,
++				    dropped);
+ }
+ 
+ /* Let a learn of @addr queue a move again. Takes dsa_fixed_lock. */
+@@ -4100,21 +4297,6 @@ struct ppe_offload_fdb_tally {
+ 	u8 why;
+ };
+ 
+-/* The port the bridge @br_ifindex of @net has @addr on in @vid now, NULL if
+- * it has it on none (aged out, or flushed). Under RTNL.
+- */
+-static struct net_device *ppe_offload_fdb_port(struct net *net, int br_ifindex,
+-					       const u8 *addr, u16 vid)
+-{
+-	struct net_device *br;
+-
+-	ASSERT_RTNL();
+-
+-	br = __dev_get_by_index(net, br_ifindex);
+-
+-	return br ? br_fdb_find_port(br, addr, vid) : NULL;
+-}
+-
+ /* Take one S-R download to @dev, the port its bridge has its client on now
+  * (NULL for none), after a learn of the client elsewhere at S-R generation
+  * @gen (WP2-DESIGN D9, §5.3): it is re-pointed there, with the S-tag of
+@@ -4356,15 +4538,16 @@ static int ppe_offload_fdb_event(struct notifier_block *nb, unsigned long event,
+ 	if (!bridge || !netif_is_bridge_master(bridge))
+ 		return NOTIFY_DONE;
+ 
+-	/* Profile E: only a DSA user port can be the new home of a client this
+-	 * driver addresses by port, a VLAN-aware bridge's flows here are all
+-	 * in VLAN 1 (ppe_offload_dsa_vlan_ok()) and a VLAN-unaware one learns
+-	 * without a VID. An S-R download follows a learn in its own VLAN on
+-	 * any port of its bridge (ppe_offload_fdb_move_sr()), under the S-R
+-	 * generation of now; there is none while the S-R mode is off.
++	/* Profile E: a VLAN-aware bridge's flows here are all in VLAN 1
++	 * (ppe_offload_dsa_vlan_ok()) and a VLAN-unaware one learns without a
++	 * VID. A learn on any port of the bridge counts, the router's Wi-Fi
++	 * included: a flow re-pointed to a DSA user port, dropped for any
++	 * other (ppe_offload_fdb_move_e()). An S-R download follows a learn in
++	 * its own VLAN on any port of its bridge (ppe_offload_fdb_move_sr()),
++	 * under the S-R generation of now; there is none while the S-R mode is
++	 * off.
+ 	 */
+-	e_dev = (!fdb_info->vid || fdb_info->vid == PPE_OFFLOAD_RTL8372N_CPU_VID) &&
+-		dsa_user_dev_check(dev);
++	e_dev = !fdb_info->vid || fdb_info->vid == PPE_OFFLOAD_RTL8372N_CPU_VID;
+ 	sr_gen = ppe_sr_eng_gen(&priv->sr.eng);
+ 	sr_off = ppe_sr_eng_state(&priv->sr.eng) == PPE_SR_S_OFF;
+ 	if (!e_dev && sr_off)
+@@ -6367,6 +6550,9 @@ static int ppe_offload_flows_show(struct seq_file *m, void *v)
+ 		   atomic_long_read(&priv->counters.withdrawn),
+ 		   atomic_long_read(&priv->counters.unbound),
+ 		   atomic_long_read(&priv->counters.stuck));
++	seq_printf(m, "fdb_moved %ld fdb_unchecked %ld\n",
++		   atomic_long_read(&priv->counters.moved),
++		   atomic_long_read(&priv->counters.fdb_unchecked));
+ 
+ 	for (i = 0; i < PPE_OFFLOAD_PPPOE_MAX; i++) {
+ 		const struct ppe_offload_pppoe *p = &priv->pppoe[i];
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_sr.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr.h
+@@ -28,7 +28,9 @@
+  * none. The resolver's reasons come first (ppe_sr_class_up() and
+  * ppe_sr_class_dn()), then the offer path's, then the arm refusals: an arm
+  * inhibited by a control disarm or the guard (INHIBIT), and one without a
+- * deadline or with too short a one (DEADLINE), last.
++ * deadline or with too short a one (DEADLINE), last but one. MOVED, an
++ * offer path reason added later, comes last: a download whose client the
++ * bridge positively has on another port (ppe_offload_fdb_elsewhere()).
+  */
+ enum ppe_sr_why {
+ 	PPE_SR_W_OK,
+@@ -61,6 +63,7 @@ enum ppe_sr_why {
+ 	PPE_SR_W_PRECHECK,
+ 	PPE_SR_W_INHIBIT,
+ 	PPE_SR_W_DEADLINE,
++	PPE_SR_W_MOVED,
+ 	PPE_SR_W_NUM
+ };
+ 
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_sr_eng.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_eng.c
+@@ -424,7 +424,8 @@ int ppe_sr_dn_egress(const struct ppe_sr_offer *o, struct ppe_sr_dn *dn)
+  *
+  * Return: 0 to follow, -EOPNOTSUPP to drop the download. The flowtable
+  * offers it again with the route it was created with: towards the port its
+- * client was first resolved on, not where the bridge has it now.
++ * client was first resolved on, not where the bridge has it now, which the
++ * offer path declines while the bridge has the client elsewhere.
+  */
+ int ppe_sr_eng_move(const struct ppe_sr_eng *eng, const struct ppe_sr_topo *topo,
+ 		    const struct ppe_sr_scope *scope, struct ppe_sr_move *m)
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_sr_topo.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_sr_topo.c
+@@ -68,6 +68,7 @@ static const char * const ppe_sr_why_names[PPE_SR_W_NUM] = {
+ 	[PPE_SR_W_PRECHECK] = "precheck",
+ 	[PPE_SR_W_INHIBIT] = "inhibit",
+ 	[PPE_SR_W_DEADLINE] = "deadline",
++	[PPE_SR_W_MOVED] = "moved",
+ };
+ 
+ /**
