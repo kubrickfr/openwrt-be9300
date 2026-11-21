@@ -7,15 +7,18 @@ the live line (section 6). The owner runs every step that changes state; an
 assistant only reads. On any stop line (section 2): stop, recover (section
 1.3), capture (section 7).
 
-The owner skipped the rig and ran the live phases from 2026-10-22:
+It ran in the other order. The owner ran the live phases first, from
+2026-10-22:
 
 - L1 and L2 within the safety envelope of section 1;
 - the first night and the L4 runs on r37585 under a guard script;
 - the soak, the L4 runs on r37586 and the lifecycle tests (section 6.6)
   with no rollback armed.
 
-Section 0 records what ran; the checks
-that need the rig are still open.
+The rig was then built as a mock-ISP bench and ran from 2026-11-09 to
+2026-11-19, on a twin of the gateway's configuration. Section 0 records
+the live runs, section 0b the bench. Together they close every gate of
+DESIGN.md section 9 except the ones section 0b lists as open.
 
 Names: PPE port 1 is the conduit `lan` (to the RTL8372N), port 2 is `wan`;
 the session is `pppoe-wan` on `wan.<vid>`, `<vid>` being the ISP's WAN VLAN ID. br-lan is VLAN-aware.
@@ -41,11 +44,13 @@ the session is `pppoe-wan` on `wan.<vid>`, `<vid>` being the ISP's WAN VLAN ID. 
 - **Client:** a PC on a 2.5G USB adapter, behind the managed switch on
   lan1; for the port tests of 2026-10-27, plugged straight into lan2,
   then lan3.
-- **Rig:** not built.
+- **Rig:** not built at the time; the mock-ISP bench came later
+  (section 0b).
 - **How offload was switched on:** at runtime in every phase. Both
   parameters were written, and fw4's `flow_offloading_hw` set without a
   commit. Nothing was persisted.
-- **Boot with `0442`'s defaults:** not yet run (section 6.5).
+- **Boot with `0442`'s defaults:** not run in this record. It ran on the
+  bench (section 0b, K4.3) and on the gateway from 2026-11-07.
 
 | Date | Phase | What ran | Result |
 | --- | --- | --- | --- |
@@ -62,7 +67,7 @@ the session is `pppoe-wan` on `wan.<vid>`, `<vid>` being the ISP's WAN VLAN ID. 
 | 2026-10-27 | Reference: the router out of the path | The router powered off, the PC straight on the ONT with its own PPPoE session (MTU 1492), running the L4 tests: Ookla twice on the same server, one 20 s proof.ovh.net stream. Offload, not persisted, was switched on again at runtime after the reboot for the rows below | Ookla 2080 and 2107 Mbit/s down, 745 and 732 up, against 2110-2133 and 761-764 through the router with offload (the r37586 L4 row). One stream: 1436 Mbit/s, inside the router's 1302-1786. The PC's busiest core peaked at 69% busy, so the PC was not the limit: the router does not cap the line |
 | 2026-10-27 | HV1 untagged; HE2 on another port | A 30 s download to the PC on lan2, an untagged PVID-1 port (switch port 6) | Pass: in hardware towards port 6, untagged, at both reads (`dsa_port 6 vlan1-untagged`, conntrack `[HW_OFFLOAD]`). 1880 Mbit/s on average, about 1.95 Gbit/s once ramped up (2.0-2.1 at the PC's adapter, headers included); 0.13% of the download's packets reached the CPU. The PC's adapter received about 1.05 bytes per byte curl kept (1.048 over the client move's download; this run's sampler stopped 0.4 s before curl and reads 1.036), what Ethernet, IP, TCP and TLS headers add: the PC's stack kept the frames, as it would not with a wrong tag. No driver line, `stuck 0` |
 | 2026-10-27 | R5, client move | A download of up to 60 s to the PC on lan2; at a prompt 10 s in, its cable was moved by hand to lan3 (switch port 5), coming out about 15 s in | Pass (see note 4) |
-| - | Not run | R4/HP1 (what must not hit, including the VLAN residual); HE2b; HV1's second untagged VLAN and software-bridged cases; HB; HM with UDP; the HD procedure; R5 disable under load, bridge VLAN change, a move between two ports that both stay up (the FDB follower), a move to Wi-Fi, and the session-loss breaker (two losses within a minute); R6 profile A (H0, HP2); R7 | Open |
+| - | Not run live | R4/HP1; HE2b; HV1's second untagged VLAN and software-bridged cases; HB; HM with UDP; the HD procedure; R5 disable under load, bridge VLAN change, a move between two ports that both stay up, a move to Wi-Fi, and the session-loss breaker; R7 | All but the HD wrong-code frame and the move to Wi-Fi ran on the bench (section 0b). R6 is obsolete: profile A was dropped by 0461 |
 
 1. **HE2, frames.** PPE-forwarded frames carry the same TTL, source MAC
    and DSCP as the packets software routed in the same connection (the
@@ -111,6 +116,61 @@ the session is `pppoe-wan` on `wan.<vid>`, `<vid>` being the ISP's WAN VLAN ID. 
      709's carrier-loss teardown, 3.2 s before lan3 came up, so it cannot
      have undone the add of the flow towards lan3. After a teardown, judge
      by `offload_flows` and the CPU-path count, not by the flag.
+
+## 0b. Mock-ISP bench, 2026-11-09 to 2026-11-19
+
+**Setup:**
+- **Router:** the gateway's GL-BE9300, out of service, with a twin of its
+  configuration: VLAN-aware br-lan, PPPoE over `wan.<vid>`, fw4 hardware
+  offload. Wi-Fi, banIP and the other add-on services were off.
+- **Image:** r36754+1538, kernel 6.18.60, built from the branch with
+  0431-0442, 714, 651-02, the S-R series (tagger `rtl8_4s` in I0 and P1,
+  `rtl8_4` from P2 on; S-R armed only in I0) and the ath12k 953 fixes. Both `0442` options
+  unset, so each block started in software and switched offload on at
+  runtime, except the boot test K4.3.
+- **ISP side:** a PC running a PPPoE concentrator on `<vid>` over a 2.5G
+  link to the WAN jack. No real concentrator, no internet, no IPv6.
+- **Clients:** L, untagged on lan2 at 2.5G; G1, tagged VLAN 1 with PCP 4
+  on lan1 at 1G.
+
+The bench logs stay outside the tree; the results are below. "No router
+failure" holds for every block: no stuck flow, no degraded state, no
+kernel error, no reboot except the ones the test asked for. The FAILs in
+the logs are harness rules, kit bugs and mock-ISP artefacts. Most were
+fixed and re-run; the rest were classified by analysis (P3 B, and the two
+P5 C rule FAILs, whose kit fixes are pending). The two router findings are
+the generic TTL bug in DESIGN.md section 11 and the dead-session shortfall
+below.
+
+| Phase | What ran | Result (MEASURED) |
+| --- | --- | --- |
+| P1 | Driver state after boot: TDM table, Rx ring map, RPS knobs, IRQ spread | Port 2 in 6 of 31 TDM slots, ring map and `rps_bitmap_cores` as set, invalid writes refused |
+| P2 A | Profile E on, pinned session, redial, the two clients | Downloads 2199-2257 Mbit/s to L and 934-935 to G1 in hardware, 0.0007-0.0021% of packets on the CPU (0.0070% in the HP0 run) |
+| P2 B | HE2, HE2b (PCP and DEI), HB, HV1 with its second-VLAN and software-bridge declines, HM (12 MSS/MRU steps), a DHCP WAN untagged and on the VLAN | All PPE criteria pass. Over-MRU frames go to the CPU (code 83), 127385 of 127385, 0% loss. The residual measured: a flow's tuple in another encapsulation or VID is forwarded in hardware |
+| P2 C | TDM at line rate; throughput and CPU, E off and on; 5 `fw4 reload`s | WAN took 2370 Mbit/s, wire utilisation 0.996, `rx_fifo_overflow` +0. One stream: 2202 Mbit/s with the busiest core 24.7% (E on) against 2010 Mbit/s at 99.4% (E off). Reload stall 0-200 ms |
+| P3 A | Session loss from the ISP side: bare PADT, TermReq, server restart, two concentrators, same and new session ID, new concentrator MAC, LCP echo loss, silent concentrator, the breaker | Every case out of hardware with 0 stuck, redial, back in hardware at 2297-2305 Mbit/s. Echo loss detected in 11-21 s. Breaker latched and cleared |
+| P3 B | Cable pull, discovery under loss, disable under load, `conntrack -D/-F`, FIN, idle, RST, TTL 1, fragments, 15 reloads with captures, bridge VLAN change | No router failure. Judged FAILs were kit expectations or mock artefacts. The admin flaps were void, because the mock cannot drop the link; one owner cable pull passed. Reloads lossless (stall 0-100 ms, nothing lost between the concentrator and L). TTL 1 and fragments behave the same with E on and off. Bridge VLAN change re-offloads in about 0.6 s |
+| P3 C | Move between two ports that both stay up (MAC clone lan2 to lan1); cable move lan2 to lan3 (T9) | The moved flow went into hardware towards the new port, no black hole. T9: link out 3.1 s, data back 6 s after it stopped, 2184 Mbit/s in hardware on lan3 |
+| P4 | `sysrq-c` panic; two boots with offload on from `/etc/modules.conf` (K4.3) | Network back 45 s after the panic, one pstore record. Boot with offload on: `profile E not yet (no rtl8_4 conduit) (port 0)` at probe, head tag at the first flow, 2319 and 2326 Mbit/s in hardware |
+| P5 A | Hostile WAN frames (HP1: 15 cases), a header exception (HD), a spoofed tuple | 12 cases did not hit. X2 (PPPoE length field) hit, as software forwards it too; R1/R2 (the VLAN residual) hit, where software drops most of them. The header exception re-programmed the flow. The spoof behaves the same with E on and off |
+| P5 B | Flow table fill (4500 tuples), FDB flood (8192 and 16384 MACs), broadcast, unknown-unicast and multicast storms at 100M and 1G, all cores busy | One `flow table full` line, every flow kept working, 2036 flows out with 0 stuck. The software FDB learned 24578 addresses, past the switch's 4160, with no flood frame on lan1. PPPoE stayed up in every storm. 1G delivered at full rate with all cores at 100% |
+| P5 C | 10 h soak with 30 PPPoE faults | 30 faults, every new session in bound. 61 probes at 2282-2331 Mbit/s, CPU path at most 0.0029%. 0 stuck, 0 degraded, 0 kernel errors |
+
+Still open after the bench:
+
+- a client moving to the router's Wi-Fi with offload on (the bench ran
+  with Wi-Fi off);
+- storms at 2.5G (the sender topped out at 1G);
+- IPv6 on a real line (fw4 rejects WAN RAs in this configuration, and the
+  line has none);
+- HD's wrong-code PPPoE frame (the bench showed DE_ACCE set by a header
+  exception instead);
+- in two of five session restarts under load, 6-16% of the frames the PPE
+  punted for the dead session (up to about 130) were lost in router
+  software; the other three lost none. The drop site and an E-off
+  control are missing. No flow got stuck;
+- the 0.5-5 s reload stall of section 0 note 2: the bench does not
+  reproduce it.
 
 ## 1. Safety envelope
 
@@ -565,6 +625,9 @@ stop-line message is not read again.
 
 ### 5.6 R6, profile A (H0, HP2)
 
+Obsolete: 0461 dropped profile A. Kept as the record of what it would have
+checked.
+
 Dead-man armed, operator on Wi-Fi. `echo "A 120" >
 /sys/kernel/debug/ppe/offload_profile`: `profile A on for PPE port 1`.
 
@@ -692,12 +755,14 @@ What happened instead:
 - **Keeping it** is done by the build: from `0442`, both parameters
   default on for the ipq53xx subtarget, so `/etc/modules.conf` is not
   needed.
-- **fw4's hardware offload** is still to be committed, from LuCI: Network,
-  Firewall, Routing/NAT Offloading, "Hardware flow offloading".
+- **fw4's hardware offload** is committed in the configuration, from
+  LuCI: Network, Firewall, Routing/NAT Offloading, "Hardware flow
+  offloading".
 
-The first boot of an image with `0442` is a check of its own. Offload is
-then enabled at probe, before the switch driver attaches to the conduit;
-that path has not run on hardware yet. Expect:
+The first boot of an image with offload on is a check of its own. Offload
+is then enabled at probe, before the switch driver attaches to the
+conduit. It ran on the bench (section 0b, P4 K4.3, two boots) and on the
+gateway from 2026-11-07, and gave what is listed here:
 
 - `dmesg | grep ppe_offload`: `enabled: ... profile E not yet (no rtl8_4
   conduit) (port 0)` at probe, then `rtl8_4 head tag emulation on PPE port
@@ -756,17 +821,26 @@ the idle-time counter reads, and after a crash `/sys/fs/pstore/*`.
 
 ## 8. Known limitations
 
-- Downloads only: the parser cannot see past the head tag on uploads
-  without profile A, which breaks the tagged WAN.
+The README's "Known limitations" list is the consolidated one. The points
+specific to this bench:
+
+- Downloads only in profile E: the parser cannot see past the head tag on
+  uploads. Uploads are offloaded only in the experimental S-R mode
+  (package `ppe-sr`, off by default), whose gates have not run.
 - The PPPoE session match has no VLAN: a frame with the session ID and the
-  concentrator's MAC on another VLAN of the WAN port reaches the flow (5.4).
-  Nor has the flow key: a plain-IP flow from the WAN port would hit untagged
-  or on any VLAN of it (not this line's case; DESIGN.md section 10).
+  concentrator's MAC on another VLAN of the WAN port, or untagged, reaches
+  the flow (MEASURED on the bench, section 0b P5 A). Nor has the flow key:
+  a plain-IP flow from the WAN port hits untagged or on any VLAN of it
+  (MEASURED, P2 B). Software would drop most of these frames. Sending them
+  needs a host on the ISP's side of the ONT; DESIGN.md section 10.
+- Like the software flowtable, the PPE checks neither the PPPoE length
+  field nor TCP RST sequence numbers (P5 A, P3 B).
 - All LAN ports and VLANs share the conduit's L3 interface; VLAN-aware
   egress is VLAN 1 only.
 - IPv6, Wi-Fi clients and VLANs 10/20 stay in software.
 - A download running at line rate during `fw4 reload` stalls for 0.5-5 s
-  (section 0, DESIGN.md section 11).
+  on the gateway (section 0). The bench saw 0-200 ms and lost nothing
+  (section 0b); the cause is not known (DESIGN.md section 11).
 - After a flow is torn down and set up again (a client move), conntrack
   may show it as `[OFFLOAD]` while the PPE forwards it (section 0, note 4).
 - `declined` counts offers, not flows: each active flow's upload half is

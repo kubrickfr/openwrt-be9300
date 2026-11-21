@@ -3,13 +3,15 @@
 Branch `be9300-next-ppe-pppoe`, on top of `be9300-next-rtl8372n`, kernel
 6.18. On `be9300-next-sr`, 0461 drops profile A (section 8) and 0460-0468
 add the S-R mode, which offloads uploads through per-port S-tags; this
-document describes the ppe-pppoe series. Validated live on one GL-BE9300 between 2026-10-22 and 2026-10-27
-(TESTING.md section 0). The fake-ISP rig was never built, so the gates that
-need it are still open (section 9). Evidence labels: **[src]** read from
-a public source (PROVENANCE.md has path:line), **[meas-P]** measured by Kamil
-Bienkiewicz (perceival) on a GL-BE9300 and recorded in his patches,
-**[meas-U]** measured on this gateway, **(I)** inference, **(H)** hypothesis
-with a bench gate (section 9, TESTING.md).
+document describes the ppe-pppoe series. Validated live on one GL-BE9300
+between 2026-10-22 and 2026-10-27 (TESTING.md section 0), then on a
+mock-ISP bench from 2026-11-09 to 2026-11-19 (TESTING.md section 0b),
+which closed the gates that needed a fake ISP (section 9). Evidence
+labels: **[src]** read from a public source (PROVENANCE.md has path:line),
+**[meas-P]** measured by Kamil Bienkiewicz (perceival) on a GL-BE9300 and
+recorded in his patches, **[meas-U]** measured on this gateway,
+**[meas-B]** measured on the mock-ISP bench, **(I)** inference, **(H)**
+hypothesis with a bench gate (section 9, TESTING.md).
 
 ## 0. Goal and scope
 
@@ -40,6 +42,10 @@ BusyBox top, a four-core average, reads far lower.
   43% of one core for one stream at about 2.0 Gbit/s, and 56% (33% on a
   second core) for the multi-stream download at 2172 Mbit/s, over the
   acceptance bar of 50%.
+
+On the mock-ISP bench, with a 2.5G client, one stream ran at 2202 Mbit/s
+with the busiest core 24.7% busy, against 2010 Mbit/s at 99.4% with
+offload off [meas-B, TESTING.md section 0b, P2 C].
 
 With offload the router does not cap the line [meas-U, 2026-10-27]: a PC
 running its own PPPoE session straight on the ONT, its busiest core at
@@ -172,8 +178,10 @@ enabled:
   path as it was.
 - **At probe, by `0442`'s default:** the switch is not up yet, so profile E
   waits for the first flow towards the conduit. With fw4's hardware offload
-  off it is never applied. That boot state has not run on hardware
-  (TESTING.md section 6.5).
+  off it is never applied. That path ran on the bench on two boots with
+  the parameters set in `/etc/modules.conf` (2319 and 2326 Mbit/s in
+  hardware afterwards) [meas-B, TESTING.md section 0b, P4], and on the
+  gateway with `0442`'s default from 2026-11-07 to 2026-11-09.
 
 With the parameter off, the driver still binds the flowtable's block (a
 ruleset with `flags offload` always loads). It then declines every flow and
@@ -427,7 +435,9 @@ down itself at its next gc pass once the bridge FDB names another port for
 its destination (OpenWrt's pending 708, nftables flowtables only): after
 a move between two ports that stay up, the follower re-points the flow
 first and the gc pass then tears it down and the flowtable offers it
-afresh. That interplay has not run on hardware.
+afresh. On the bench, a client cloned from lan2 to lan1 with both ports
+up had its flow in hardware towards lan1 with no black hole [meas-B,
+TESTING.md section 0b, P3 C].
 
 ## 6. PPPoE (0438 download, 0439 upload)
 
@@ -531,7 +541,7 @@ in service:
   next offer would undo a no-carrier teardown.
 
 The plan was to write the first session entry on the fake-ISP rig, never
-first on the live line (TESTING.md). The rig was never built: the owner
+first on the live line (TESTING.md). The rig was not built then: the owner
 wrote it first on the live line on 2026-10-22 (L2 part 1, with the pin
 below). For that first write, `offload_pppoe_pin` (debugfs, 0600)
 programs the session of a named PPP device without any flow, for at most
@@ -613,23 +623,24 @@ without the rig on 2026-10-22:
 - the soak, the L4 runs on r37586 and the lifecycle tests ran with no
   rollback armed.
 
-The last column is what that bench showed (TESTING.md
-section 0); the gates marked "not run" are still open.
+The rig was built afterwards as the mock-ISP bench of 2026-11-09 to
+2026-11-19 (TESTING.md section 0b). The last column gives the live result
+and, after "Bench:", the bench's.
 
-| Id | Hypothesis | Where | If it fails | Live result |
+| Id | Hypothesis | Where | If it fails | Result |
 | --- | --- | --- | --- | --- |
 | HE1 | E (and the port MTU command) alone change nothing for the software path: ARP, DHCP, PPPoE discovery and session, full-size frames, Rx spread | rig, offload on with fw4 HW offload off | disable; DSA egress not used | held (L1, 2026-10-22) |
-| HE2 | The RTL8372N on this tree's driver delivers the emulated frame to the named port only | rig | decline DSA egress | delivered on lan1 (VLAN 1 tagged) at line rate, TTL, source MAC, DSCP and checksums matched software's (2026-10-26); also on lan2 and lan3, untagged, near line rate in one stream (2026-10-27). "Only" not checked: nothing captured on the other ports |
-| HE2b | Ingress PCP/DEI on the WAN's VLAN tag do not reach W1/W3 | rig, PCP 3/5 and DEI 1 from the fake ISP | decline DSA egress for tagged-WAN ingress | not exercised: the ISP sends PCP 0 |
-| HV1 | VLAN-aware: tagged VID 1 on lan1 and lan4; untagged on a port made an untagged PVID-1 member for the rig (lan2); declined on a software-bridged port (lan4 with `lan4.100` created while out of br-lan) | rig | decline VLAN-aware egress | tagged VID 1 held (lan1); untagged held (lan2 and lan3, untagged PVID-1 ports, 2026-10-27: `vlan1-untagged` flows near line rate, 1821-1880 Mbit/s in one stream, the PC's stack keeping the frames). The second untagged VLAN and software-bridged cases not run |
-| HB | An L3 interface bound to no port (no L3_VP_PORT, MAC_BITMAP 0, routing off), used only as a nexthop's POST_L3_IF, gives the frame its EG_L3_IF source MAC, and its IN_L3_IF MTU is the one checked | rig, R3 (br-lan's own MAC, then the conduit's) | enable routing on slots 24-27 as the vendor does; else decline flows whose source MAC is not the conduit's | not exercised: br-lan's MAC is the conduit's here |
+| HE2 | The RTL8372N on this tree's driver delivers the emulated frame to the named port only | rig | decline DSA egress | delivered on lan1 (VLAN 1 tagged) at line rate, TTL, source MAC, DSCP and checksums matched software's (2026-10-26); also on lan2 and lan3, untagged, near line rate in one stream (2026-10-27). "Only" not checked live. Bench: HE2 held on L and G1 (TTL decremented once everywhere) |
+| HE2b | Ingress PCP/DEI on the WAN's VLAN tag do not reach W1/W3 | rig, PCP 3/5 and DEI 1 from the fake ISP | decline DSA egress for tagged-WAN ingress | not exercised live: the ISP sends PCP 0. Bench: held for PCP and DEI, no marker reached the router's CPU |
+| HV1 | VLAN-aware: tagged VID 1 on lan1 and lan4; untagged on a port made an untagged PVID-1 member for the rig (lan2); declined on a software-bridged port (lan4 with `lan4.100` created while out of br-lan) | rig | decline VLAN-aware egress | tagged VID 1 held (lan1); untagged held (lan2 and lan3, untagged PVID-1 ports, 2026-10-27: `vlan1-untagged` flows near line rate, 1821-1880 Mbit/s in one stream, the PC's stack keeping the frames). Bench: held, and the second-VLAN and software-bridged flows were declined as designed |
+| HB | An L3 interface bound to no port (no L3_VP_PORT, MAC_BITMAP 0, routing off), used only as a nexthop's POST_L3_IF, gives the frame its EG_L3_IF source MAC, and its IN_L3_IF MTU is the one checked | rig, R3 (br-lan's own MAC, then the conduit's) | enable routing on slots 24-27 as the vendor does; else decline flows whose source MAC is not the conduit's | not exercised live: br-lan's MAC is the conduit's here. Bench: every PPE criterion held |
 | HS1 | A valid session entry leaves the session's other frames intact for the CPU | rig: pinned with no flow, then with one offloaded download, 5 min each, across a redial | keep PPPoE in software | held: pinned 300 s with no flow, then 4 days with flows. A redial with 78 flows in hardware was clean (2026-10-27) |
-| HD | Hardware sets DE_ACCE in the flow entry when a de-accelerating exception fires | rig: after a code-0 control that hits, one wrong-code PPPoE frame on an offloaded download idle for 6-20 s; `rearmed_deacce` +1 at once, `rearmed_invalid` flat (software forwards the frame and re-offers the flow); a flat count is judged only with `offload_flows_hw` and the CPU code | staleness falls back to VALID only; a flow so de-accelerated stays in software until destroyed | held: `rearmed_deacce` reached 52 in 4 days. It counts only DE_ACCE bits read from hardware entries. The wrong-code procedure was not run |
+| HD | Hardware sets DE_ACCE in the flow entry when a de-accelerating exception fires | rig: after a code-0 control that hits, one wrong-code PPPoE frame on an offloaded download idle for 6-20 s; `rearmed_deacce` +1 at once, `rearmed_invalid` flat (software forwards the frame and re-offers the flow); a flat count is judged only with `offload_flows_hw` and the CPU code | staleness falls back to VALID only; a flow so de-accelerated stays in software until destroyed | held: `rearmed_deacce` reached 52 in 4 days. It counts only DE_ACCE bits read from hardware entries. Bench: a hostile header exception set it (`rearmed_deacce` +1, CPU code 3 +1) and the flow was programmed again. That was a header exception, not the wrong-code PPPoE frame |
 | HP0 | Session frames are decapsulated, routed and hit (absent from the CPU path, not counters) | rig | flows stay in software (no churn) | held: 0.01-0.2% of download packets on the CPU in the L4 and redial runs, and 3% in L2's 6 × 50 MB run (about 205k packets, a much smaller download); every count includes household traffic |
-| HP1 | Plain IPv4, another session, another source MAC, another VLAN do not hit (the last is the residual) | rig | decline PPPoE | not run (needs the rig) |
-| HM | Full-size frames both ways pass; no MTU drop or redirect (no new CPU codes 79/80 L2 MRU/MTU, 82/91 L3 MTU (DF), 83 L3 MRU, 93/94 flow PMTU (DF) after the load; TESTING 5.3) | rig, then live | lower the flow's PMTU | Partly. TCP downloads passed at line rate with 1500-byte packets (RFC 4638 session, MSS 1460). Code 79 did rise: by 7, 96 and 17 in the three reload runs that read it, each with 2.6-3.3M download packets, so the downloads do not feed it. But the gate asks for no new counts, and its 11.78M since boot is unexplained. The UDP 1472 case was not run |
-| HP2 | The upload encapsulation is correct (<vid>, 0x8864, S, length) | rig, profile A | upload stays bench-only anyway | not run |
-| H0 | 802.1Q on the WAN still parsed with C-TPID 0 | rig, profile A | expected false | not run |
+| HP1 | Plain IPv4, another session, another source MAC, another VLAN do not hit (the last is the residual) | rig | decline PPPoE | Bench: 12 of 15 hostile cases did not hit. The VLAN residual hit (wrong VLAN and untagged, 10/10 each), and so did a frame with a wrong PPPoE length field (X2), which software forwards too (section 11) |
+| HM | Full-size frames both ways pass; no MTU drop or redirect (no new CPU codes 79/80 L2 MRU/MTU, 82/91 L3 MTU (DF), 83 L3 MRU, 93/94 flow PMTU (DF) after the load; TESTING 5.3) | rig, then live | lower the flow's PMTU | Partly. TCP downloads passed at line rate with 1500-byte packets (RFC 4638 session, MSS 1460). Code 79 did rise: by 7, 96 and 17 in the three reload runs that read it, each with 2.6-3.3M download packets, so the downloads do not feed it. But the gate asks for no new counts, and its 11.78M since boot was unexplained then. Bench: explained. Code 79 is the PPE port-1 MRU (1522) against full-size VLAN-1-tagged LAN uploads (1526 bytes); it costs nothing in profile E, which leaves uploads to software. 12 MSS/MRU steps passed, and over-MRU frames went to the CPU as code 83, 127385 of 127385 |
+| HP2 | The upload encapsulation is correct (<vid>, 0x8864, S, length) | rig, profile A | upload stays bench-only anyway | obsolete: profile A dropped by 0461 |
+| H0 | 802.1Q on the WAN still parsed with C-TPID 0 | rig, profile A | expected false | obsolete: profile A dropped by 0461 |
 
 Rig: the PC's `enp7s0u2.<vid>` as a PPPoE concentrator without authentication
 (the router never sends its real credentials), MTU/MRU 1500 with the VLAN at
@@ -641,8 +652,8 @@ household offline, the operator on Wi-Fi.
 1. **WAN VLAN residuals** (sections 6 and 11). The owner accepted them on
    2026-10-27, after the live bench, by turning both defaults on (`0442`, for the ipq53xx subtarget).
    Offload stays switchable at runtime (fw4, LuCI), per boot
-   (`/etc/modules.conf`) and per build (menuconfig). The residuals
-   themselves are unverified on hardware: HP1 needs the rig.
+   (`/etc/modules.conf`) and per build (menuconfig). The bench measured
+   both residuals (TESTING.md section 0b, P2 B and P5 A).
 
    Neither the flow key nor the PPPoE session match has a VLAN. A plain-IP flow from the WAN port also
    hits its 5-tuple untagged or on another VLAN of that port (perceival's
@@ -661,17 +672,21 @@ household offline, the operator on Wi-Fi.
    translation into per-VLAN L3 interfaces on the WAN port) would program
    tables this series does not touch and change how every other VLAN on
    that port is received; it is not proposed.
-2. **VLAN `used_keys` upstream fix**: a separate pending patch, outside this
-   series' scope (it changes upstream netfilter semantics beyond the PPPoE
-   match).
+2. **VLAN `used_keys` upstream fix**: settled. The tree carries OpenWrt's
+   generic pending 709 (netfilter: flowtable: advertise the vlan match in
+   used_keys).
 
 ## 11. Limitations
 
 - The flow key has the ingress L3 interface only: every LAN port and VLAN
   shares the conduit's, and the session match has no VLAN (perceival's
   SECURITY LIMITATION, unchanged; section 6).
-- Downloads only in service; uploads need a different CPU tag or the athtag
-  stripper.
+- Downloads only in service; uploads need a different CPU tag, the athtag
+  stripper, or the experimental S-R mode of be9300-next-sr.
+- Like the software flowtable, the PPE checks neither the PPPoE length
+  field nor TCP RST sequence numbers. A frame with a wrong length is
+  forwarded either way; an injected RST in the tuple moves the flow to
+  software for good (CPU cost only) [meas-B].
 - A client re-cabled to another LAN port has its flows torn down (the old
   port's carrier loss) and offered afresh; one moved between two ports that
   both stay up is followed only when the bridge learns it again (VID 1 in a
@@ -687,18 +702,22 @@ household offline, the operator on Wi-Fi.
   port's MTU capped by the PPP device's, the bridge's and its VLAN 1
   upper's.
 - `fw4 reload` takes every flow out of hardware. That covers any firewall
-  change, and the two reloads after every WAN redial. A download running at
-  line rate at that moment stalls for 0.5-5 s [meas-U, 5 runs of 5]; with
-  the software flowtable alone it did not [meas-U, 1 run].
+  change, and the two reloads after every WAN redial. On the gateway a
+  download running at line rate at that moment stalls for 0.5-5 s [meas-U,
+  5 runs of 5]; with the software flowtable alone it did not [meas-U, 1
+  run]. The bench does not reproduce it: 20 reloads under load stalled for
+  0-200 ms; the ones captured at both ends (P3 B) lost nothing [meas-B]. The
+  gateway carries more flows, a larger conntrack table and banIP's sets
+  (I).
   - The cause is reordering and real loss as the flow passes from the PPE
     to the CPU and back: about 3.6k late originals and 2.8k lost segments
     in one captured run.
   - About 39% of the lost segments (1090 of 2774) had already left the
     router's CPU.
     Neither the router's counters nor the client's show the drops.
-  - Where they are lost is not established. The router has no `tc`, and
-    the RTL8372N exposes no drop counters. The connection recovers by
-    itself.
+  - Where they are lost on the gateway is not established. The router
+    has no `tc`, and the RTL8372N exposes no drop counters. The
+    connection recovers by itself.
 - With `flow_offload` on and fw4's hardware offload off, the exceptions
   and the port L3 interfaces stay programmed while no flow is offered.
   - Profile E stays programmed too, if offload was enabled at runtime with
@@ -714,3 +733,11 @@ household offline, the operator on Wi-Fi.
   (WAN port and conduit). Each upload half is declined each time, so
   `declined` grows by tens a second on a busy line. That is bookkeeping;
   a decline touches no register.
+- CPU codes 88 and 89 rise in normal service: code 88 once per closed
+  offloaded connection, code 89 in a burst when a PPPoE session dies with
+  flows in hardware [meas-B]. Both are the designed hand-back to software.
+- In two of five session restarts under load on the bench, 6-16% of the
+  frames the PPE punted for the dead session (up to about 130) were lost
+  in router software, past the EDMA driver; the other three lost none
+  [meas-B]. The drop site is inferred and there is no E-off control. No
+  flow got stuck.

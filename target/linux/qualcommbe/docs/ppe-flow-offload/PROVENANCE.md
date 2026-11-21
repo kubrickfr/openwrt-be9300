@@ -13,8 +13,9 @@ Confidence labels:
 - **hyp**: a hypothesis this tree depends on; TESTING.md names its gate.
 
 The meas-U cells come from the live bench of 2026-10-22 to 2026-10-27
-(TESTING.md section 0). The fake-ISP rig was never built, so the rows that
-only the rig can settle still say hyp.
+(TESTING.md section 0). The fake-ISP rig was not built then; the mock-ISP
+bench of 2026-11-09 to 2026-11-19 (TESTING.md section 0b) ran those gates,
+and the Gate column gives its result.
 
 ## Who wrote what
 
@@ -113,14 +114,14 @@ SSDK paths are relative to `include/hsl/` unless they start with `src/`.
 | Id | Statement | Why believed | Gate |
 | --- | --- | --- | --- |
 | HE1 | Profile E (and the port MTU command) alone change nothing for software-path frames | CPU transmits bypass egress editing; the PPE bridges nothing between ports | TESTING R1, L1: held in L1 (2026-10-22) |
-| HE2 | The RTL8372N accepts the emulated head tag (W2 = 0x8100) on this tree's driver | meas-P on the SDK-based driver | R3 (rig); live: delivered on lan1 at line rate, with TTL, source MAC, DSCP and checksums matching software's; "only" not checked |
-| HV1 | An injected untagged frame is classified to VLAN 1 and leaves per VLAN 1's entry | this tree's rtl8372n driver: CPU port VLAN-unaware PVID 1, ORIGINAL egress | R3 (rig); live: tagged VID 1 held (lan1), untagged held (lan2 and lan3, 2026-10-27) |
-| HE2b | PCP and DEI of the WAN's VLAN tag do not reach the emulated tag's words | PCP/DEI propagation off at reset and cleared by E; the S-tag PCP comes from the port default (0) | R3 (rig); not exercised live (the ISP sends PCP 0) |
-| HB | An L3 interface bound to no port (no L3_VP_PORT, MAC_BITMAP 0, routing off), used only as a nexthop's POST_L3_IF, gives the frame its EG_L3_IF source MAC and its IN_L3_IF MTU is the one checked | routing enable and MAC_BITMAP are ingress checks; the vendor never builds this shape (`nss-ppe drv/ppe_drv/ppe_drv_l3_if.c:572-573` always sets routing) | R3 (rig); not exercised live (br-lan's MAC is the conduit's) |
+| HE2 | The RTL8372N accepts the emulated head tag (W2 = 0x8100) on this tree's driver | meas-P on the SDK-based driver | R3 (rig); live: delivered on lan1 at line rate, with TTL, source MAC, DSCP and checksums matching software's; bench (TESTING 0b): held on lan1 and lan2 |
+| HV1 | An injected untagged frame is classified to VLAN 1 and leaves per VLAN 1's entry | this tree's rtl8372n driver: CPU port VLAN-unaware PVID 1, ORIGINAL egress | R3 (rig); live: tagged VID 1 held (lan1), untagged held (lan2 and lan3, 2026-10-27); bench: held, second-VLAN and software-bridged flows declined |
+| HE2b | PCP and DEI of the WAN's VLAN tag do not reach the emulated tag's words | PCP/DEI propagation off at reset and cleared by E; the S-tag PCP comes from the port default (0) | R3 (rig); not exercised live (the ISP sends PCP 0); bench: held for PCP and DEI |
+| HB | An L3 interface bound to no port (no L3_VP_PORT, MAC_BITMAP 0, routing off), used only as a nexthop's POST_L3_IF, gives the frame its EG_L3_IF source MAC and its IN_L3_IF MTU is the one checked | routing enable and MAC_BITMAP are ingress checks; the vendor never builds this shape (`nss-ppe drv/ppe_drv/ppe_drv_l3_if.c:572-573` always sets routing) | R3 (rig); not exercised live (br-lan's MAC is the conduit's); bench: held |
 | HS1 | A valid session entry leaves the session's frames that miss the flow table intact for the CPU (PPPoE header kept) | not stated anywhere; the vendor keeps its session entry valid for the whole link, from PPP connect to disconnect (`nss-ppe clients/pppoe/nss_ppe_pppoe_mgr.c:203-270,350-353`, `drv/ppe_drv/ppe_drv_pppoe_session.c:103`) | R2 (rig), before any live session; held live instead (L2 pin, then four days, a redial) |
 | HP0 | A frame of the programmed session is decapsulated, routed and hits the flow keyed on the session's L3 interface | vendor recipe (nss-ppe) | R3 (rig); held live (L2, L4) |
-| HP1 | Plain IPv4, another session or another source MAC with the same 5-tuple does not hit | session match fields; SRC_L3_IF on the flow | R4 (rig); not run |
-| HD | Hardware sets a flow entry's DE_ACCE when a de-accelerating exception fires on it | `nss-ppe drv/ppe_drv/tun/ppe_drv_tun_decap.c:345` ("deacce_en bit got set ... by HW") for the vendor's tunnel tables; the field in the flow entry | R2 (a wrong-code PPPoE frame on an idle flow: `rearmed_deacce` rises by 1, `rearmed_invalid` flat); held live: `rearmed_deacce` 52 in four days, `rearmed_invalid` 0 |
-| HM | Full-size frames pass the port and L3 MTU checks at zero margin; the emulated tag's 8 bytes are counted as the vendor says ("PPE ignore vlan headers at L2") | `nss-ppe drv/ppe_drv/ppe_drv_port.c:1635` | R3 (rig), CPU codes 79/80/82/83/91/93/94. Partly held live (TCP at 1500 bytes; code 79 unexplained); UDP not run |
-| HP2 | Upload encap from EG_L3_IF builds a correct PPPoE header | vendor recipe | R6 (rig, profile A); not run |
-| H0 | WAN 802.1Q still parsed with C-TPID 0x0000 | expected false (meas-P) | R6 (rig, profile A); not run |
+| HP1 | Plain IPv4, another session or another source MAC with the same 5-tuple does not hit | session match fields; SRC_L3_IF on the flow | R4 (rig); bench: held for 12 hostile cases; the VLAN residual and a wrong PPPoE length field hit, as DESIGN.md section 11 says |
+| HD | Hardware sets a flow entry's DE_ACCE when a de-accelerating exception fires on it | `nss-ppe drv/ppe_drv/tun/ppe_drv_tun_decap.c:345` ("deacce_en bit got set ... by HW") for the vendor's tunnel tables; the field in the flow entry | R2 (a wrong-code PPPoE frame on an idle flow: `rearmed_deacce` rises by 1, `rearmed_invalid` flat); held live: `rearmed_deacce` 52 in four days, `rearmed_invalid` 0; bench: a header exception set it and the flow was programmed again (the wrong-code frame itself not sent) |
+| HM | Full-size frames pass the port and L3 MTU checks at zero margin; the emulated tag's 8 bytes are counted as the vendor says ("PPE ignore vlan headers at L2") | `nss-ppe drv/ppe_drv/ppe_drv_port.c:1635` | R3 (rig), CPU codes 79/80/82/83/91/93/94. Partly held live (TCP at 1500 bytes); bench: held over 12 MSS/MRU steps; code 79 is the port-1 MRU against tagged LAN uploads, which E leaves to software |
+| HP2 | Upload encap from EG_L3_IF builds a correct PPPoE header | vendor recipe | R6 (rig, profile A); obsolete, profile A dropped by 0461 |
+| H0 | WAN 802.1Q still parsed with C-TPID 0x0000 | expected false (meas-P) | R6 (rig, profile A); obsolete, profile A dropped by 0461 |
