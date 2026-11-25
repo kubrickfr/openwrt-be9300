@@ -954,7 +954,11 @@ cmd_enable() {
 		;;
 	*) die "state $C: not enabling (ppe-sr status)" ;;
 	esac
-	enable_run explicit "$L" "$o" || exit 1
+	# As the daemon does before its first arm: with ppe_params 1, the
+	# preconditions read flow_offload after it is set, not before. A failed
+	# enable that unwound to OFF leaves the parameters as it found them.
+	ppe_params_set
+	enable_run explicit "$L" "$o" || { ppe_params_undo; exit 1; }
 	echo "enabled $C"
 }
 
@@ -1300,15 +1304,41 @@ health_line() {
 }
 
 # ppe_params_set: with ppe_params 1, flow_offload and pppoe_offload to 1 if N.
+# PP_SET lists the ones it set, for ppe_params_undo.
 ppe_params_set() {
 	local p
 
+	PP_SET=
 	[ "$C_PPEPARAMS" = 1 ] || return 0
 	for p in flow_offload pppoe_offload; do
 		[ "$(cat "$PPEPAR/$p" 2>/dev/null)" = N ] || continue
-		ctl_write "$PPEPAR/$p" 1 10 && log notice "qcom_ppe.$p set to 1 (ppe_params)" ||
+		if ctl_write "$PPEPAR/$p" 1 10; then
+			PP_SET="${PP_SET:+$PP_SET }$p"
+			log notice "qcom_ppe.$p set to 1 (ppe_params)"
+		else
 			log warning "qcom_ppe.$p: $W_RET"
+		fi
 	done
+}
+
+# ppe_params_undo: back to 0 what ppe_params_set set (an enable that failed),
+# only once the failure unwound to OFF; otherwise S-R may still hold state
+# that needs the PPE, and the parameters stay at 1.
+ppe_params_undo() {
+	local p
+
+	[ -n "$PP_SET" ] || return 0
+	state_read
+	if [ "$C" != OFF ]; then
+		log warning "qcom_ppe $PP_SET kept at 1 (enable failed, state $C)"
+		PP_SET=
+		return 0
+	fi
+	for p in $PP_SET; do
+		ctl_write "$PPEPAR/$p" 0 10 && log notice "qcom_ppe.$p back to 0 (enable failed)" ||
+			log warning "qcom_ppe.$p back to 0: $W_RET"
+	done
+	PP_SET=
 }
 
 # daemon (procd): every TICK s, or at once on SIGHUP: reconcile, renew,

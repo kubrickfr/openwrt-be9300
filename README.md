@@ -131,6 +131,10 @@ configuration. To override:
   keep PPPoE in software) in `/etc/modules.conf`. The module name there is
   `qcom-ppe`, with a hyphen;
 - at runtime: `/sys/module/qcom_ppe/parameters/`;
+- with S-R: `ppe-sr`, with `option ppe_params 1` (its default), sets both
+  back to 1 when it arms (`ppe-sr enable`, or the daemon's first arm),
+  and puts them back if `ppe-sr enable` fails. To keep either one at 0,
+  set `ppe_sr.main.ppe_params` to 0;
 - state: `/sys/kernel/debug/ppe/offload_flows`. `declined` counts offers,
   not flows: the kernel re-offers each active flow about once a second.
 
@@ -272,11 +276,6 @@ Open issues:
   `offload_flows` counts the declines as `fdb_moved`, and
   `offload_sr_status` as `decline_moved`. Keeping ports that lead to
   access points out of S-R's scope avoids the case for S-R.
-- A manual `ppe-sr enable` is refused with `flow_offload N` when the PPE's
-  `flow_offload` is off: `option ppe_params 1` is applied only by the
-  automatic arm. With the default-on images this does not arise;
-  otherwise write 1 to `/sys/module/qcom_ppe/parameters/flow_offload`
-  (and `pppoe_offload`) first.
 - In two of five PPPoE session restarts under load on the bench, 6-16% of
   the frames the PPE punted for the dead session (up to about 130) were
   lost in router software; the other three lost none. No flow got stuck.
