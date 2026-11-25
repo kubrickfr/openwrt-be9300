@@ -1,9 +1,9 @@
 # PPE flow offload for PPPoE on the GL-BE9300: design
 
-Branch `be9300-next-ppe-pppoe`, on top of `be9300-next-rtl8372n`, kernel
-6.18. On `be9300-next-sr`, 0461 drops profile A (section 8) and 0460-0468
-add the S-R mode, which offloads uploads through per-port S-tags; this
-document describes the ppe-pppoe series. Validated live on one GL-BE9300
+Patches 0433-0442 of branch `be9300`, kernel 6.18, on top of the RTL8372N
+DSA driver. Later in the same series, 0461 drops profile A (section 8) and
+0460-0468 add the S-R mode, which offloads uploads through per-port
+S-tags; this document describes the download series (profile E). Validated live on one GL-BE9300
 between 2026-10-22 and 2026-10-27 (TESTING.md section 0), then on a
 mock-ISP bench from 2026-11-09 to 2026-11-19 (TESTING.md section 0b),
 which closed the gates that needed a fake ISP (section 9). Evidence
@@ -59,10 +59,10 @@ the RTL8372N (rtl8_4 tag), including a VLAN-aware br-lan.
 
 Declined, staying in software: IPv6 (perceival's IPv6 path is not ported),
 Wi-Fi (not a PPE port), hairpin NAT and plain routing, multicast, a second
-DSA conduit, tag_8021q, and every upload (section 1). Changing the
-RTL8372N's CPU tag EtherType or using the IPQ5332 athtag stripper would make
-uploads possible, but changes the tagging scheme and needs the owner's
-go-ahead first.
+DSA conduit, tag_8021q, and, in profile E, every upload (section 1).
+Uploads are offloaded by the S-R mode (0460-0468, package `ppe-sr`), which
+has the switch put a per-port S-tag on them; it neither changes the
+RTL8372N's CPU tag EtherType nor uses the IPQ5332 athtag stripper.
 
 ## 1. What each direction needs
 
@@ -442,7 +442,7 @@ TESTING.md section 0b, P3 C].
 A move the follower cannot take the flow to (the router's Wi-Fi, a port of
 the other VLAN form, a port that does not forward) used to leave the flow
 in hardware towards the old port, and the follower looked only at learns
-on switch ports. Since `0469` on be9300-next-sr, a learn in the flow's
+on switch ports. Since `0469`, a learn in the flow's
 VLAN on any port of its bridge reaches the follower, which drops a flow it
 cannot re-point. The offer path also asks the bridge, through 708's
 `nf_br_utils_hook` (under RCU, no RTNL), and declines a download into the
@@ -453,7 +453,8 @@ forwards the flow, would put it straight back towards the old port. An
 absent FDB entry is not a move: offloaded traffic does not refresh it.
 The check runs again once the flow is in the hash the FDB notifier scans,
 which closes the race with a learn. The same applies to S-R downloads in
-their class's VLAN. (I: desk harness only, not run on hardware.)
+their class's VLAN. (I: decline path desk harness only; 0469 is in the gateway's image since
+2026-11-21 but has not triggered there, `fdb_moved` 0.)
 
 ## 6. PPPoE (0438 download, 0439 upload)
 
@@ -596,7 +597,7 @@ That such an interface (bound to no port, MAC_BITMAP 0, routing off; the
 vendor always sets routing) gives a nexthop its source MAC, with its MTU
 the one checked, is hypothesis HB.
 
-## 8. Profile A (bench only, 0439; dropped by 0461 on be9300-next-sr)
+## 8. Profile A (bench only, 0439; dropped by 0461)
 
 perceival's full ingress alias, on top of E: IPR and TPR VLAN_TPID =
 0x88990000 (S 0x8899, C 0x0000); PORT_EG_VLAN[0] (CPU port) VLAN_TYPE,
@@ -697,8 +698,13 @@ household offline, the operator on Wi-Fi.
 - The flow key has the ingress L3 interface only: every LAN port and VLAN
   shares the conduit's, and the session match has no VLAN (perceival's
   SECURITY LIMITATION, unchanged; section 6).
-- Downloads only in service; uploads need a different CPU tag, the athtag
-  stripper, or the experimental S-R mode of be9300-next-sr.
+- Profile E offloads downloads only. Uploads, and VLANs other than 1, are
+  offloaded in the S-R mode (0460-0468, package `ppe-sr`), on the
+  maintainer's gateway since 2026-11-21.
+- CPU-forwarded TCP can leave with its TTL not decremented while GRO is
+  on for the WAN (81-94% of such frames, measured on the bench, P2 B).
+  The bug is in the generic kernel's fraglist GRO, not the PPE; the fix
+  is not yet in this tree. Workaround: `ethtool -K wan gro off`.
 - Like the software flowtable, the PPE checks neither the PPPoE length
   field nor TCP RST sequence numbers. A frame with a wrong length is
   forwarded either way; an injected RST in the tuple moves the flow to

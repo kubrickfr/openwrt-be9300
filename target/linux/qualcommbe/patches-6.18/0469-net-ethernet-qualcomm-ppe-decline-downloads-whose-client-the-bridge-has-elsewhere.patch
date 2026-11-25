@@ -39,7 +39,7 @@ is dropped, as S-R's follower already did: software then forwards it, the
 offer path declines its re-offers on the old route, and the gc pass
 re-creates it on the new one.
 
-offload_stats gains a line "fdb_moved N fdb_unchecked N"; the S-R status
+offload_flows gains a line "fdb_moved N fdb_unchecked N"; the S-R status
 a "decline_moved" line.
 
 Signed-off-by: François Guerraz <kubrick@fgv6.net>

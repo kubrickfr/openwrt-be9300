@@ -5,7 +5,8 @@ Mainline **OpenWrt** support for the **GL.iNet Flint 3 (GL-BE9300)**: Qualcomm
 switch and a **RTL8221B** 2.5G WAN PHY.
 
 This is a complete, buildable OpenWrt tree: upstream OpenWrt `main` with a
-curated GL-BE9300 series on top. Build from `be9300-next`. Target
+curated GL-BE9300 series on top. Build from `be9300`, the tested branch;
+`be9300-next` is where new work lands first. Target
 **`qualcommbe/ipq53xx`**, kernel **6.18**.
 
 > [!WARNING]
@@ -28,7 +29,8 @@ The rebase is not a plain replay. On top of the port it adds:
 
 - an SDK-free RTL8372N DSA driver that offloads a VLAN-aware bridge to the
   switch;
-- PPE hardware flow offload of IPv4 downloads, PPPoE included;
+- PPE hardware flow offload of IPv4 downloads on VLAN 1, PPPoE included;
+  with the opt-in S-R mode, uploads too, and other VLANs of the bridge;
 - EDMA and PPE driver fixes (WAN ingress at line rate, RPS, ring mapping);
 - newer ath12k and hostapd fixes, Wi-Fi MAC addresses, the regulatory
   country and fan control.
@@ -59,7 +61,7 @@ from it. The kernel's AES and GCM use the ARMv8 Crypto Extensions.
 | Boot, sysupgrade, return to stock | working |
 | LAN switch | working; one VLAN-aware bridge switched in hardware, access, trunk and tagged-only ports |
 | WAN | working at 2.5 Gbit/s, line rate into the SoC |
-| Flow offloading | working; IPv4 downloads in hardware, PPPoE included. The PPE driver is on by default; fw4's hardware flow offloading, off in a fresh configuration, turns it on |
+| Flow offloading | working; IPv4 downloads in hardware, PPPoE included. The PPE driver is on by default; fw4's hardware flow offloading, off in a fresh configuration, turns it on. Uploads and VLANs other than 1 too with the opt-in S-R mode (package `ppe-sr`) |
 | Wi-Fi 7, all three bands; MLO across 5 and 6 GHz | working |
 | DFS | working: CAC, and the secondary AP after CAC |
 | 802.11k / 802.11v | working |
@@ -73,9 +75,14 @@ Measured on this board, over PPPoE on a VLAN WAN:
 
 - With hardware flow offload on, one TCP download at 2202 Mbit/s with
   the busiest core 24.7% busy. In software the same stream ran at
-  2010 Mbit/s with a core at 99.4%. 0.002-0.004% of the download's
-  packets reach the CPU; what is left on the CPU is the client's ACKs.
-  (Mock-ISP bench, 2.5G client, 2026-11-12.)
+  2010 Mbit/s with a core at 99.4% (mock-ISP bench, 2.5G client,
+  2026-11-12). On the same bench 0.0007-0.0021% of the downloads' packets
+  reached the CPU, and at most 0.0029% over a 10-hour soak; what is left
+  on the CPU is the client's ACKs.
+- In S-R mode, one TCP upload at 939 Mbit/s (the 1G client's limit) with
+  the router's cores 0.1% busy; in software the same upload kept one core
+  at 100%. Downloads in S-R mode: 939 Mbit/s at 0.0% (bench, 2026-11-21).
+  S-R also holds at 2.5G.
 - On a 2.2/0.8 Gbit/s FTTH line, 2110-2133 Mbit/s down with Ookla's CLI. A
   PC on the ONT without the router got 2080-2107 Mbit/s from the same
   server, so the router does not limit the line (2026-10-27).
@@ -153,20 +160,56 @@ The record, with the gates and what each showed, is in
 `target/linux/qualcommbe/docs/ppe-flow-offload/` (TESTING.md sections 0
 and 0b, DESIGN.md sections 9-11).
 
+Since 2026-11-21 the same unit has been the main gateway again, on an
+image built from this tree with both `0442` defaults on and S-R
+auto-armed across three VLANs. By 2026-11-25 it had run 3 days 18 hours
+with no reboot, no fault and no stuck flow; about 770,000 flows went into
+hardware, roughly half of them uploads, and a WAN redial was followed in
+hardware.
+
 **Uploads.** In the default mode the PPE offloads downloads only: its
 parser cannot read past the switch's `rtl8_4` tag. The S-R mode (patches
 0460-0468, package `ppe-sr`) has the switch put a per-port S-tag on uploads
-so that the PPE can offload them. It is experimental and off by default,
-and enables nothing on its own. It has been tested far less than the
-default mode:
+so that the PPE can offload them, on every VLAN of its scope. It is
+opt-in: the package is not in the default image, its configuration ships
+disabled, and it enables nothing on its own. How it was tested:
 
 - one night ACTIVE on the live gateway, about 14 hours (2026-11-05/06),
   with household uploads in hardware and no fault; a speed test at the
   start reached the line's rate;
-- a bench bring-up on 2026-11-10, in which its arm and disarm paths passed.
+- a bench bring-up on 2026-11-10, in which its arm and disarm paths passed;
+- a bench run on 2026-11-21: uploads and downloads in hardware at the 1G
+  client's rate (figures under [Performance](#performance)); it also
+  holds at 2.5G;
+- the main gateway since 2026-11-21, auto-armed, with a scope of VLAN 1
+  on an access port and VLANs 1, 10 and 20 on a trunk: no fault, every
+  VLAN with flows in hardware.
 
-The bench torture of 2026-11-11 to 2026-11-17 ran with S-R off, and S-R's
-own bench phases, roaming included, have not run.
+S-R has had less fault testing than the default mode: the bench torture
+of 2026-11-11 to 2026-11-17 (PPPoE faults, storms, floods, a full flow
+table) ran with S-R off.
+
+To use it, add `ppe-sr` (Network) in `make menuconfig`, then:
+
+```sh
+uci set ppe_sr.main.enabled='1'      # S-tag switch mode, from the next boot
+uci set ppe_sr.main.auto_arm='1'     # arm after the boot holdoff
+uci delete ppe_sr.main.class
+uci add_list ppe_sr.main.class='lan2 U 1'    # <lanN> <U|T> <vid>
+uci add_list ppe_sr.main.class='lan1 T 1'
+uci add_list ppe_sr.main.class='lan1 T 10'
+uci add_list ppe_sr.main.class='lan1 T 20'
+uci set ppe_sr.main.ack_multi_cvid='1'       # needed for more than one VLAN
+uci commit ppe_sr && ppe-sr modconf && reboot
+```
+
+S-R needs the VLAN-aware `br-lan` (`vlan_filtering 1`). Every VLAN in
+the scope needs its L3 device (`br-lan.<vid>`), and every port in a class
+must be in `br-lan` and listed in `list ack_port` (lan1 and lan2 by
+default). VLANs 3900-3919 are reserved for the switch's steering. Keep ports
+that lead to Wi-Fi access points out of the scope (see the roaming entry
+under Known limitations). `ppe-sr status` shows the state; `ACTIVE`
+means it offloads.
 
 Notes on the software flowtable and the switch ports are in
 `target/linux/qualcommbe/docs/flowtable-notes.md`.
@@ -175,13 +218,20 @@ Notes on the software flowtable and the switch ports are in
 
 Offload scope, by design:
 
-- Only IPv4 downloads into the switch are offloaded. Uploads and VLANs
-  other than 1 (outside S-R), IPv6, Wi-Fi clients, hairpin NAT and
-  multicast stay in the software flowtable. S-R covers any VLAN of the
-  bridge that has an L3 device (`br-lan.<v>`); a scope with more than one
-  VLAN needs `option ack_multi_cvid 1`, and only VLAN 1 has run in
-  hardware so far. At most 4 PPPoE sessions and 4 bridge MACs are in
-  hardware.
+- In the default mode only IPv4 downloads into the switch on VLAN 1 are
+  offloaded; uploads and other VLANs need S-R. In either mode IPv6, Wi-Fi
+  clients, hairpin NAT and multicast stay in the software flowtable. S-R
+  covers any VLAN of the bridge that has an L3 device (`br-lan.<v>`); a
+  scope with more than one VLAN needs `option ack_multi_cvid 1`, and VLANs
+  3900-3919 are reserved for the switch. VLANs 1, 10 and 20 have run in
+  hardware on the gateway.
+- At most 4 PPPoE sessions and 4 bridge MACs are in hardware. Three
+  sessions at once ran in hardware on the bench (2026-11-21), and losing
+  one moved only its own flows to software. The PPPoE flap breaker is
+  shared by all sessions and has no time window: two sessions in a row
+  that die within 60 s of going into hardware, however far apart in time,
+  keep every session in software until offload is disabled and enabled
+  again.
 - Neither the PPPoE session match nor the flow key has a VLAN. Frames with
   the session ID from the concentrator's MAC on another VLAN of the WAN
   port, or untagged, and a plain-IP flow's tuple in another encapsulation,
@@ -214,11 +264,19 @@ Open issues:
   carrier: its hardware downloads go back to software as soon as the
   bridge learns it there, and stay in software until the flowtable's gc
   pass offers them on the new route (`0469`; before it, both modes could
-  send them to the old port until the connections ended). Desk-tested
-  only; not yet run on hardware. Wired moves between two switch ports of
-  the same form are re-pointed in place, as before (measured on the bench
-  in the default mode with both ports up). `offload_stats` counts the
-  declines as `fdb_moved`, and the S-R status as `decline_moved`.
+  send them to the old port until the connections ended). It has run in
+  the gateway's image since 2026-11-21 but has not triggered there, so its
+  decline path is desk-tested only. Wired moves between two switch ports
+  of the same form are re-pointed in place, as before (measured on the
+  bench in the default mode: cable and MAC-clone moves, 2026-11-13).
+  `offload_flows` counts the declines as `fdb_moved`, and
+  `offload_sr_status` as `decline_moved`. Keeping ports that lead to
+  access points out of S-R's scope avoids the case for S-R.
+- A manual `ppe-sr enable` is refused with `flow_offload N` when the PPE's
+  `flow_offload` is off: `option ppe_params 1` is applied only by the
+  automatic arm. With the default-on images this does not arise;
+  otherwise write 1 to `/sys/module/qcom_ppe/parameters/flow_offload`
+  (and `pppoe_offload`) first.
 - In two of five PPPoE session restarts under load on the bench, 6-16% of
   the frames the PPE punted for the dead session (up to about 130) were
   lost in router software; the other three lost none. No flow got stuck.
@@ -228,7 +286,10 @@ Open issues:
   6 GHz restart cycles on the bench (20 restarts) caused no crash, but
   the exact production sequence (the radio torn down with a client
   attached) has not been reproduced, so that path of the fix is unproven.
-  The firmware crash itself is not explained.
+  The firmware crash itself is not explained. Wi-Fi has otherwise run on
+  the household gateway since September 2026, all three bands and MLO,
+  with this the only crash; with the fixes, on the bench from 2026-11-09
+  and on the gateway since 2026-11-21 (channel on auto), no crash.
 - After hours of sustained load with many clients, the QCN9274 firmware
   can take a fatal error (reported upstream). The firmware dump is
   released automatically (`/etc/hotplug.d/devcoredump/10-release-coredump`).
@@ -258,8 +319,9 @@ Open issues:
   by hand: `uci set wireless.radioN.country=XX; uci commit wireless; wifi`.
 
 Untested: a VLAN-unaware `br-lan` (OpenWrt's default layout) with
-offload, the WAN at 1G or 100M, a DFS radar event, storms at 2.5G, IPv6 on
-a real line, other boards and ISPs, and IPQ9574.
+offload, the WAN at 1G or 100M, a DFS radar event, storms at 2.5G, S-R
+under the bench's fault and storm torture, 0469's decline path on
+hardware, IPv6 on a real line, other boards and ISPs, and IPQ9574.
 
 ## Firmware
 
@@ -272,7 +334,7 @@ a real line, other boards and ISPs, and IPQ9574.
 ## Building
 
 ```sh
-git clone -b be9300-next https://github.com/kubrickfr/openwrt-be9300.git
+git clone -b be9300 https://github.com/kubrickfr/openwrt-be9300.git
 cd openwrt-be9300
 ./scripts/feeds update -a
 ./scripts/feeds install -a

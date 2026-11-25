@@ -139,7 +139,7 @@ kernel error, no reboot except the ones the test asked for. The FAILs in
 the logs are harness rules, kit bugs and mock-ISP artefacts. Most were
 fixed and re-run; the rest were classified by analysis (P3 B, and the two
 P5 C rule FAILs, whose kit fixes are pending). The two router findings are
-the generic TTL bug in DESIGN.md section 11 and the dead-session shortfall
+the generic fraglist GRO TTL bug (DESIGN.md section 11) and the dead-session shortfall
 below.
 
 | Phase | What ran | Result (MEASURED) |
@@ -825,8 +825,10 @@ The README's "Known limitations" list is the consolidated one. The points
 specific to this bench:
 
 - Downloads only in profile E: the parser cannot see past the head tag on
-  uploads. Uploads are offloaded only in the experimental S-R mode
-  (package `ppe-sr`, off by default), whose gates have not run.
+  uploads. Uploads are offloaded in the S-R mode (package `ppe-sr`,
+  opt-in). Apart from its arm and disarm bring-up in I0, this bench ran
+  with S-R off; its own record is in the README (Flow offloading,
+  Uploads).
 - The PPPoE session match has no VLAN: a frame with the session ID and the
   concentrator's MAC on another VLAN of the WAN port, or untagged, reaches
   the flow (MEASURED on the bench, section 0b P5 A). Nor has the flow key:
@@ -835,9 +837,10 @@ specific to this bench:
   needs a host on the ISP's side of the ONT; DESIGN.md section 10.
 - Like the software flowtable, the PPE checks neither the PPPoE length
   field nor TCP RST sequence numbers (P5 A, P3 B).
-- All LAN ports and VLANs share the conduit's L3 interface; VLAN-aware
-  egress is VLAN 1 only.
-- IPv6, Wi-Fi clients and VLANs 10/20 stay in software.
+- All LAN ports and VLANs share the conduit's L3 interface;
+  outside S-R, VLAN-aware egress is VLAN 1 only and VLANs 10/20 stay in
+  software.
+- IPv6 and Wi-Fi clients stay in software.
 - A download running at line rate during `fw4 reload` stalls for 0.5-5 s
   on the gateway (section 0). The bench saw 0-200 ms and lost nothing
   (section 0b); the cause is not known (DESIGN.md section 11).
