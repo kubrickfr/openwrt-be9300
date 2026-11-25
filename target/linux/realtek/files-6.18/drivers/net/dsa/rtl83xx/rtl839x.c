@@ -11,7 +11,7 @@
 #include "qos.h"
 #include "mirror.h"
 #include "mac.h"
-#include "rtl-otto.h"
+#include "otto_dsa.h"
 #include "stats.h"
 #include "vlan.h"
 #include "stp.h"
@@ -44,7 +44,7 @@ static u64 rtl839x_read_debug_matrix(struct otto_dsa_priv *priv, int port)
 	return ((u64)v[0] << 32) | v[1];
 }
 
-void rtldsa_839x_print_matrix(struct otto_dsa_priv *priv)
+static void rtldsa_839x_print_matrix(struct otto_dsa_priv *priv)
 {
 	for (int i = 0; i < 52; i += 4)
 		pr_debug("> %16llx %16llx %16llx %16llx\n",
@@ -128,12 +128,6 @@ const struct rtldsa_config rtldsa_839x_cfg = {
 	.fib_entries = 16384,
 	.l2_uc_tbl = RTL8390_TBL_L2_UC,
 	.l2_cam_tbl = RTL8390_TBL_L2_CAM_UC,
-	.mask_port_reg_be = rtl839x_mask_port_reg_be,
-	.set_port_reg_be = rtl839x_set_port_reg_be,
-	.get_port_reg_be = rtl839x_get_port_reg_be,
-	.mask_port_reg_le = rtl839x_mask_port_reg_le,
-	.set_port_reg_le = rtl839x_set_port_reg_le,
-	.get_port_reg_le = rtl839x_get_port_reg_le,
 	.stat_port_rst = RTL839X_STAT_PORT_RST,
 	.stat_rst = RTL839X_STAT_RST,
 	.stat_port_std_mib = RTL839X_STAT_PORT_STD_MIB,
@@ -226,6 +220,6 @@ const struct rtldsa_config rtldsa_839x_cfg = {
 	.set_egress_rate = otto_qos_839x_set_egress_rate,
 	.qos_init = otto_qos_839x_init,
 	.lag_set_distribution_algorithm = otto_lag_839x_set_distribution_algorithm,
-	.lag_set_port_members = otto_lag_839x_set_port_members,
+	.lag_set_port_members = otto_lag_83xx_set_port_members,
 	.lag_setup_algomask = otto_lag_83xx_setup_algomask,
 };

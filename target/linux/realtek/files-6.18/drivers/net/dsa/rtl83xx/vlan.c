@@ -5,7 +5,7 @@
 #include <linux/regmap.h>
 #include <net/dsa.h>
 
-#include "rtl-otto.h"
+#include "otto_dsa.h"
 #include "vlan.h"
 #include "stp.h"
 
@@ -55,11 +55,9 @@
 #define RTL839X_VLAN_PORT_FWD			(0x27AC)
 #define RTL930X_VLAN_PORT_FWD			(0x834C)
 #define RTL931X_VLAN_PORT_FWD			(0x95CC)
-#define RTL838X_VLAN_FID_CTRL			(0x3aa8)
 
 #define RTL838X_VLAN_PORT_TAG_STS_UNTAG				0x0
 #define RTL838X_VLAN_PORT_TAG_STS_TAGGED			0x1
-#define RTL838X_VLAN_PORT_TAG_STS_PRIORITY_TAGGED		0x2
 #define RTL838X_VLAN_PORT_TAG_KEEP_FORMAT			0x1
 
 #define RTL838X_VLAN_PORT_TAG_STS_CTRL_BASE			0xA530
@@ -67,9 +65,7 @@
 #define RTL838X_VLAN_PORT_TAG_STS_CTRL(port) \
 	(RTL838X_VLAN_PORT_TAG_STS_CTRL_BASE + (port << 2))
 
-#define RTL838X_VLAN_PORT_TAG_STS_CTRL_EGR_P_OTAG_KEEP_MASK	GENMASK(11, 10)
 #define RTL838X_VLAN_PORT_TAG_STS_CTRL_EGR_P_ITAG_KEEP_MASK	GENMASK(9, 8)
-#define RTL838X_VLAN_PORT_TAG_STS_CTRL_IGR_P_OTAG_KEEP_MASK	GENMASK(7, 6)
 #define RTL838X_VLAN_PORT_TAG_STS_CTRL_IGR_P_ITAG_KEEP_MASK	GENMASK(5, 4)
 #define RTL838X_VLAN_PORT_TAG_STS_CTRL_OTAG_STS_MASK		GENMASK(3, 2)
 #define RTL838X_VLAN_PORT_TAG_STS_CTRL_ITAG_STS_MASK		GENMASK(1, 0)
@@ -78,7 +74,6 @@
 
 #define RTL839X_VLAN_PORT_TAG_STS_UNTAG				0x0
 #define RTL839X_VLAN_PORT_TAG_STS_TAGGED			0x1
-#define RTL839X_VLAN_PORT_TAG_STS_PRIORITY_TAGGED		0x2
 
 #define RTL839X_VLAN_PORT_TAG_STS_CTRL_BASE			0x6828
 /* port 0-52 */
@@ -86,9 +81,7 @@
 	(RTL839X_VLAN_PORT_TAG_STS_CTRL_BASE + (port << 2))
 #define RTL839X_VLAN_PORT_TAG_STS_CTRL_OTAG_STS_MASK		GENMASK(7, 6)
 #define RTL839X_VLAN_PORT_TAG_STS_CTRL_ITAG_STS_MASK		GENMASK(5, 4)
-#define RTL839X_VLAN_PORT_TAG_STS_CTRL_EGR_P_OTAG_KEEP_MASK	GENMASK(3, 3)
 #define RTL839X_VLAN_PORT_TAG_STS_CTRL_EGR_P_ITAG_KEEP_MASK	GENMASK(2, 2)
-#define RTL839X_VLAN_PORT_TAG_STS_CTRL_IGR_P_OTAG_KEEP_MASK	GENMASK(1, 1)
 #define RTL839X_VLAN_PORT_TAG_STS_CTRL_IGR_P_ITAG_KEEP_MASK	GENMASK(0, 0)
 
 #define RTL839X_VLAN_PORT_OTAG_TPID_CMP_MSK(port)		(0x8048 + ((port) << 7))
@@ -96,7 +89,6 @@
 #define RTL930X_VLAN_PORT_TAG_STS_INTERNAL			0x0
 #define RTL930X_VLAN_PORT_TAG_STS_UNTAG				0x1
 #define RTL930X_VLAN_PORT_TAG_STS_TAGGED			0x2
-#define RTL930X_VLAN_PORT_TAG_STS_PRIORITY_TAGGED		0x3
 
 #define RTL930X_VLAN_PORT_TAG_STS_CTRL_BASE			0xCE24
 /* port 0-28 */
@@ -104,9 +96,7 @@
 	(RTL930X_VLAN_PORT_TAG_STS_CTRL_BASE + (port << 2))
 #define RTL930X_VLAN_PORT_TAG_STS_CTRL_EGR_OTAG_STS_MASK	GENMASK(7, 6)
 #define RTL930X_VLAN_PORT_TAG_STS_CTRL_EGR_ITAG_STS_MASK	GENMASK(5, 4)
-#define RTL930X_VLAN_PORT_TAG_STS_CTRL_EGR_P_OTAG_KEEP_MASK	GENMASK(3, 3)
 #define RTL930X_VLAN_PORT_TAG_STS_CTRL_EGR_P_ITAG_KEEP_MASK	GENMASK(2, 2)
-#define RTL930X_VLAN_PORT_TAG_STS_CTRL_IGR_P_OTAG_KEEP_MASK	GENMASK(1, 1)
 #define RTL930X_VLAN_PORT_TAG_STS_CTRL_IGR_P_ITAG_KEEP_MASK	GENMASK(0, 0)
 
 #define RTL930X_VLAN_TAG_TPID_CTRL(idx)				(0xC7AC + ((idx) << 2))
@@ -116,10 +106,8 @@
 #define RTL930X_VLAN_PORT_EGR_TPID_OTPID_IDX			GENMASK(5, 4)
 #define RTL930X_VLAN_PORT_EGR_TPID_OTPID_KEEP			BIT(3)
 
-#define RTL931X_VLAN_PORT_TAG_STS_INTERNAL			0x0
 #define RTL931X_VLAN_PORT_TAG_STS_UNTAG				0x1
 #define RTL931X_VLAN_PORT_TAG_STS_TAGGED			0x2
-#define RTL931X_VLAN_PORT_TAG_STS_PRIORITY_TAGGED		0x3
 
 #define RTL931X_VLAN_PORT_TAG_CTRL_BASE				0x4860
 /* port 0-56 */
@@ -127,14 +115,6 @@
 	(RTL931X_VLAN_PORT_TAG_CTRL_BASE + (port << 2))
 #define RTL931X_VLAN_PORT_TAG_EGR_OTAG_STS_MASK			GENMASK(13, 12)
 #define RTL931X_VLAN_PORT_TAG_EGR_ITAG_STS_MASK			GENMASK(11, 10)
-#define RTL931X_VLAN_PORT_TAG_EGR_OTAG_KEEP_MASK		GENMASK(9, 9)
-#define RTL931X_VLAN_PORT_TAG_EGR_ITAG_KEEP_MASK		GENMASK(8, 8)
-#define RTL931X_VLAN_PORT_TAG_IGR_OTAG_KEEP_MASK		GENMASK(7, 7)
-#define RTL931X_VLAN_PORT_TAG_IGR_ITAG_KEEP_MASK		GENMASK(6, 6)
-#define RTL931X_VLAN_PORT_TAG_OTPID_IDX_MASK			GENMASK(5, 4)
-#define RTL931X_VLAN_PORT_TAG_OTPID_KEEP_MASK			GENMASK(3, 3)
-#define RTL931X_VLAN_PORT_TAG_ITPID_IDX_MASK			GENMASK(2, 1)
-#define RTL931X_VLAN_PORT_TAG_ITPID_KEEP_MASK			GENMASK(0, 0)
 
 #define RTLDSA_VLAN_PORT_AFT_ITAG_UNTAG		BIT(1)
 #define RTLDSA_VLAN_PORT_AFT_OTAG_UNTAG		BIT(3)
@@ -276,10 +256,8 @@ void otto_vlan_838x_set_untagged(u32 vlan, u64 portmask)
  */
 void otto_vlan_838x_port_forward_on_inner(struct otto_dsa_priv *priv, int port, bool is_set)
 {
-	if (is_set)
-		regmap_write_bits(priv->map, RTL838X_VLAN_PORT_FWD, BIT(port), 0);
-	else
-		regmap_write_bits(priv->map, RTL838X_VLAN_PORT_FWD, BIT(port), BIT(port));
+	regmap_assign_bits(priv->map, RTL838X_VLAN_PORT_FWD,
+			   BIT(port), !is_set);
 }
 
 int
@@ -459,10 +437,8 @@ void otto_vlan_839x_set_untagged(u32 vlan, u64 portmask)
 /* Sets the L2 forwarding to be based on either the inner VLAN tag or the outer */
 void otto_vlan_839x_port_forward_on_inner(struct otto_dsa_priv *priv, int port, bool is_set)
 {
-	if (is_set)
-		rtl839x_mask_port_reg_le(BIT_ULL(port), 0ULL, RTL839X_VLAN_PORT_FWD);
-	else
-		rtl839x_mask_port_reg_le(0ULL, BIT_ULL(port), RTL839X_VLAN_PORT_FWD);
+	regmap_assign_bits(priv->map, RTL839X_VLAN_PORT_FWD + (port / 32) * 4,
+			   BIT(port % 32), !is_set);
 }
 
 int
@@ -698,10 +674,8 @@ void otto_vlan_930x_set_untagged(u32 vlan, u64 portmask)
 void otto_vlan_930x_port_forward_on_inner(struct otto_dsa_priv *priv, int port, bool is_set)
 {
 	/* Always set all tag modes to fwd based on either inner or outer tag */
-	if (is_set)
-		regmap_write_bits(priv->map, RTL930X_VLAN_PORT_FWD + (port << 2), 0xf, 0);
-	else
-		regmap_write_bits(priv->map, RTL930X_VLAN_PORT_FWD + (port << 2), 0xf, 0xf);
+	regmap_assign_bits(priv->map, RTL930X_VLAN_PORT_FWD + (port << 2),
+			   0xf, !is_set);
 }
 
 void otto_vlan_930x_profile_setup(struct otto_dsa_priv *priv, int profile)
@@ -926,10 +900,8 @@ void otto_vlan_931x_set_untagged(u32 vlan, u64 portmask)
 void otto_vlan_931x_port_forward_on_inner(struct otto_dsa_priv *priv, int port, bool is_set)
 {
 	/* Always set all tag modes to fwd based on either inner or outer tag */
-	if (is_set)
-		regmap_write_bits(priv->map, RTL931X_VLAN_PORT_FWD + (port << 2), 0xf, 0);
-	else
-		regmap_write_bits(priv->map, RTL931X_VLAN_PORT_FWD + (port << 2), 0xf, 0xf);
+	regmap_assign_bits(priv->map, RTL931X_VLAN_PORT_FWD + (port << 2),
+			   0xf, !is_set);
 }
 
 void otto_vlan_931x_profile_setup(struct otto_dsa_priv *priv, int profile)

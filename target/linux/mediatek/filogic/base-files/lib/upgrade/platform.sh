@@ -196,6 +196,7 @@ platform_do_upgrade() {
 	konka,komi-a31|\
 	mediatek,mt7981-rfb|\
 	mediatek,mt7988a-rfb|\
+	mercusys,h90x-v1-ubi|\
 	mercusys,mr85x-ubi|\
 	mercusys,mr90x-v1-ubi|\
 	netis,eap930-v1|\
@@ -233,6 +234,7 @@ platform_do_upgrade() {
 	acer,vero-w6m|\
 	airpi,ap3000m|\
 	arcadyan,mozart|\
+	benton,sn-r1|\
 	glinet,gl-be14000|\
 	glinet,gl-mt2500|\
 	glinet,gl-mt2500-airoha|\
@@ -345,12 +347,14 @@ platform_do_upgrade() {
 		esac
 		nand_do_upgrade "$1"
 		;;
+	mercusys,h90x-v1|\
 	mercusys,mr80x-v3|\
 	mercusys,mr85x|\
 	mercusys,mr90x-v1|\
 	tplink,archer-ax80-v1|\
 	tplink,archer-ax80-v1-eu|\
 	tplink,be450|\
+	tplink,ex820v|\
 	tplink,re6000xd)
 		CI_UBIPART="ubi0"
 		nand_do_upgrade "$1"
@@ -455,6 +459,7 @@ platform_check_image() {
 	konka,komi-a31|\
 	mediatek,mt7981-rfb|\
 	mediatek,mt7988a-rfb|\
+	mercusys,h90x-v1-ubi|\
 	mercusys,mr85x-ubi|\
 	mercusys,mr90x-v1-ubi|\
 	nokia,ea0326gmp|\
@@ -482,6 +487,7 @@ platform_check_image() {
 		fit_check_image "$1"
 		return $?
 		;;
+	benton,sn-r1|\
 	creatlentem,clt-r30b1|\
 	creatlentem,clt-r30b1-112m|\
 	hiveton,h5000m|\
@@ -527,6 +533,7 @@ platform_copy_config() {
 	acer,vero-w6m|\
 	airpi,ap3000m|\
 	arcadyan,mozart|\
+	benton,sn-r1|\
 	glinet,gl-be14000|\
 	glinet,gl-mt2500|\
 	glinet,gl-mt2500-airoha|\

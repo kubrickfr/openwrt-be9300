@@ -291,7 +291,7 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
  		     struct ieee80211_sub_if_data *sdata,
 --- a/net/mac80211/ieee80211_i.h
 +++ b/net/mac80211/ieee80211_i.h
-@@ -1121,6 +1121,8 @@ static inline u32 ieee80211_crit_update_
+@@ -1132,6 +1132,8 @@ static inline u32 ieee80211_crit_update_
  	return (u64)val >> 32;
  }
  
@@ -300,7 +300,7 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
  struct ieee80211_link_data_ap {
  	struct beacon_data __rcu *beacon;
  	struct probe_resp __rcu *probe_resp;
-@@ -1135,6 +1137,9 @@ struct ieee80211_link_data_ap {
+@@ -1146,6 +1148,9 @@ struct ieee80211_link_data_ap {
  
  	/* IEEE80211_CRIT_UPDATE() */
  	atomic64_t crit_update;
@@ -312,7 +312,7 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
  struct ieee80211_link_data {
 --- a/net/mac80211/tx.c
 +++ b/net/mac80211/tx.c
-@@ -5708,6 +5708,40 @@ static void ieee80211_beacon_crit_update
+@@ -5714,6 +5714,40 @@ static void ieee80211_beacon_crit_update
  	}
  }
  
@@ -353,7 +353,7 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
  static struct sk_buff *
  __ieee80211_beacon_get_ap(struct ieee80211_hw *hw,
  			  struct ieee80211_vif *vif,
-@@ -5769,6 +5803,8 @@ __ieee80211_beacon_get_ap(struct ieee802
+@@ -5775,6 +5809,8 @@ __ieee80211_beacon_get_ap(struct ieee802
  	if (beacon->tail)
  		skb_put_data(skb, beacon->tail, beacon->tail_len);
  

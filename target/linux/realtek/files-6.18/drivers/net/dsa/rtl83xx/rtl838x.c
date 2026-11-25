@@ -13,7 +13,7 @@
 #include "qos.h"
 #include "mirror.h"
 #include "mac.h"
-#include "rtl-otto.h"
+#include "otto_dsa.h"
 #include "stats.h"
 #include "vlan.h"
 #include "stp.h"
@@ -46,7 +46,7 @@ static u32 rtl838x_read_debug_reg(struct otto_dsa_priv *priv, u32 reg)
 	return val;
 }
 
-void rtldsa_838x_print_matrix(struct otto_dsa_priv *priv)
+static void rtldsa_838x_print_matrix(struct otto_dsa_priv *priv)
 {
 	for (int i = 0; i < 28; i += 8)
 		pr_debug("> %8x %8x %8x %8x %8x %8x %8x %8x\n",
@@ -117,12 +117,6 @@ const struct rtldsa_config rtldsa_838x_cfg = {
 	.fib_entries = 8192,
 	.l2_uc_tbl = RTL8380_TBL_L2_UC,
 	.l2_cam_tbl = RTL8380_TBL_L2_CAM_UC,
-	.mask_port_reg_be = rtl838x_mask_port_reg,
-	.set_port_reg_be = rtl838x_set_port_reg,
-	.get_port_reg_be = rtl838x_get_port_reg,
-	.mask_port_reg_le = rtl838x_mask_port_reg,
-	.set_port_reg_le = rtl838x_set_port_reg,
-	.get_port_reg_le = rtl838x_get_port_reg,
 	.stat_port_rst = RTL838X_STAT_PORT_RST,
 	.stat_rst = RTL838X_STAT_RST,
 	.stat_init = otto_stats_838x_init,
@@ -217,6 +211,6 @@ const struct rtldsa_config rtldsa_838x_cfg = {
 	.set_egress_rate = otto_qos_838x_set_egress_rate,
 	.qos_init = otto_qos_838x_init,
 	.lag_set_distribution_algorithm = otto_lag_838x_set_distribution_algorithm,
-	.lag_set_port_members = otto_lag_838x_set_port_members,
+	.lag_set_port_members = otto_lag_83xx_set_port_members,
 	.lag_setup_algomask = otto_lag_83xx_setup_algomask,
 };

@@ -27,7 +27,7 @@ Assisted-by: LLM
 
 --- a/src/ap/ieee802_11.c
 +++ b/src/ap/ieee802_11.c
-@@ -7825,7 +7825,11 @@ static void handle_assoc(struct hostapd_
+@@ -7879,7 +7879,11 @@ static void handle_assoc(struct hostapd_
  	 * and FILS keep keys of the authentication in the state machine, so
  	 * only Open System and SAE authentication are covered.
  	 */

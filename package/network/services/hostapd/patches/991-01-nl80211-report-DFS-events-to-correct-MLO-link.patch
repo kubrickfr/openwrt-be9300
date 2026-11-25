@@ -24,7 +24,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
 
 --- a/src/drivers/driver_nl80211_event.c
 +++ b/src/drivers/driver_nl80211_event.c
-@@ -2719,6 +2719,16 @@ static void nl80211_process_radar_event(
+@@ -2771,6 +2771,16 @@ static void nl80211_process_radar_event(
  					union wpa_event_data *data,
  					enum nl80211_radar_event event_type)
  {
@@ -41,7 +41,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	wpa_printf(MSG_DEBUG,
  		   "nl80211: DFS event on freq %d MHz, ht: %d, offset: %d, width: %d, cf1: %dMHz, cf2: %dMHz, link_id=%d",
  		   data->dfs_event.freq, data->dfs_event.ht_enabled,
-@@ -2728,19 +2738,19 @@ static void nl80211_process_radar_event(
+@@ -2780,19 +2790,19 @@ static void nl80211_process_radar_event(
  
  	switch (event_type) {
  	case NL80211_RADAR_DETECTED:

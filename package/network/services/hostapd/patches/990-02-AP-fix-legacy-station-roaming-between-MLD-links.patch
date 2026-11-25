@@ -42,7 +42,7 @@ Signed-off-by: Ramasamy Kaliappan <rkaliapp@qti.qualcomm.com>
 
 --- a/src/ap/ieee802_11.c
 +++ b/src/ap/ieee802_11.c
-@@ -4789,7 +4789,7 @@ static void handle_auth(struct hostapd_d
+@@ -4834,7 +4834,7 @@ static void handle_auth(struct hostapd_d
  	    !(hapd->conf->mesh & MESH_ENABLED) &&
  	    (!sta->added_unassoc || link_addr_changed) &&
  	    auth_alg != WLAN_AUTH_PASN) {
@@ -51,7 +51,7 @@ Signed-off-by: Ramasamy Kaliappan <rkaliapp@qti.qualcomm.com>
  			resp = WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA;
  			goto fail;
  		}
-@@ -6899,6 +6899,7 @@ static int add_associated_sta(struct hos
+@@ -6949,6 +6949,7 @@ static int add_associated_sta(struct hos
  		hostapd_drv_sta_remove(hapd, sta->addr);
  		wpa_auth_sm_event(sta->wpa_sm, WPA_DRV_STA_REMOVED);
  		set = 0;
@@ -122,7 +122,7 @@ Signed-off-by: Ramasamy Kaliappan <rkaliapp@qti.qualcomm.com>
  	sta->wpa_sm = sm;
  	if (res < 0)
  		return -1;
-@@ -2386,10 +2427,14 @@ void ap_sta_link_event(struct hostapd_da
+@@ -2405,10 +2446,14 @@ void ap_sta_link_event(struct hostapd_da
  
  
  static void ap_sta_remove_link_sta(struct hostapd_data *hapd,
@@ -138,7 +138,7 @@ Signed-off-by: Ramasamy Kaliappan <rkaliapp@qti.qualcomm.com>
  	for_each_mld_link(tmp_hapd, hapd) {
  		struct sta_info *tmp_sta;
  
-@@ -2402,8 +2447,13 @@ static void ap_sta_remove_link_sta(struc
+@@ -2421,8 +2466,13 @@ static void ap_sta_remove_link_sta(struc
  			    !ether_addr_equal(tmp_sta->addr, sta->addr))
  				continue;
  
@@ -154,7 +154,7 @@ Signed-off-by: Ramasamy Kaliappan <rkaliapp@qti.qualcomm.com>
  		}
  	}
  }
-@@ -2420,7 +2470,7 @@ void hostapd_free_mld_partner_stas(struc
+@@ -2439,7 +2489,7 @@ void hostapd_free_mld_partner_stas(struc
  		    sta->mld_assoc_link_id != hapd->mld_link_id)
  			continue;
  
@@ -163,7 +163,7 @@ Signed-off-by: Ramasamy Kaliappan <rkaliapp@qti.qualcomm.com>
  	}
  }
  
-@@ -2458,7 +2508,7 @@ void ap_free_sta_all_links(struct hostap
+@@ -2477,7 +2527,7 @@ void ap_free_sta_all_links(struct hostap
  
  	assoc_sta = hostapd_ml_get_assoc_sta(hapd, sta, &assoc_hapd);
  	if (assoc_sta) {
@@ -172,7 +172,7 @@ Signed-off-by: Ramasamy Kaliappan <rkaliapp@qti.qualcomm.com>
  		hapd = assoc_hapd;
  		sta = assoc_sta;
  	}
-@@ -2467,7 +2517,8 @@ void ap_free_sta_all_links(struct hostap
+@@ -2486,7 +2536,8 @@ void ap_free_sta_all_links(struct hostap
  }
  
  
@@ -182,7 +182,7 @@ Signed-off-by: Ramasamy Kaliappan <rkaliapp@qti.qualcomm.com>
  {
  	const u8 *mld_link_addr = NULL;
  	bool mld_link_sta = false, epp_sta = false;
-@@ -2485,18 +2536,15 @@ int ap_sta_re_add(struct hostapd_data *h
+@@ -2504,18 +2555,15 @@ int ap_sta_re_add(struct hostapd_data *h
  	 */
  
  #ifdef CONFIG_IEEE80211BE
@@ -204,7 +204,7 @@ Signed-off-by: Ramasamy Kaliappan <rkaliapp@qti.qualcomm.com>
  	}
  #endif /* CONFIG_IEEE80211BE */
  
-@@ -2518,6 +2566,7 @@ int ap_sta_re_add(struct hostapd_data *h
+@@ -2537,6 +2585,7 @@ int ap_sta_re_add(struct hostapd_data *h
  	}
  
  	sta->added_unassoc = 1;
@@ -214,15 +214,15 @@ Signed-off-by: Ramasamy Kaliappan <rkaliapp@qti.qualcomm.com>
  
 --- a/src/ap/sta_info.h
 +++ b/src/ap/sta_info.h
-@@ -377,6 +377,7 @@ struct sta_info {
- 	bool neg_ttlm_assoc;
- 	bool neg_ttlm_assoc_reject;
+@@ -385,6 +385,7 @@ struct sta_info {
+ 	bool neg_ttlm_pref_dflt;
+ 	struct eht_neg_ttlm neg_ttlm_pref;
  #endif /* CONFIG_IEEE80211BE */
 +	u8 skip_kernel_delete;
  
  	u16 max_idle_period; /* if nonzero, the granted BSS max idle period in
  			      * units of 1000 TUs */
-@@ -515,7 +516,8 @@ void ap_sta_delayed_1x_auth_fail_disconn
+@@ -524,7 +525,8 @@ void ap_sta_delayed_1x_auth_fail_disconn
  					    unsigned timeout);
  int ap_sta_pending_delayed_1x_auth_fail_disconnect(struct hostapd_data *hapd,
  						   struct sta_info *sta);
@@ -232,7 +232,7 @@ Signed-off-by: Ramasamy Kaliappan <rkaliapp@qti.qualcomm.com>
  
  void ap_free_sta_pasn(struct hostapd_data *hapd, struct sta_info *sta);
  
-@@ -536,6 +538,8 @@ void clear_wpa_sm_for_each_partner_link(
+@@ -545,6 +547,8 @@ void clear_wpa_sm_for_each_partner_link(
  void clear_wpa_sm_for_all_sta(struct hostapd_data *hapd,
  			      struct wpa_state_machine *wpa_sm);
  void ap_sta_free_wpa_sm(struct hostapd_data *hapd, struct sta_info *sta);
@@ -261,7 +261,7 @@ Signed-off-by: Ramasamy Kaliappan <rkaliapp@qti.qualcomm.com>
  		wpa_printf(MSG_INFO, "%s: Prune association for " MACSTR,
 --- a/src/ap/wpa_auth_glue.c
 +++ b/src/ap/wpa_auth_glue.c
-@@ -1335,7 +1335,7 @@ static int hostapd_wpa_auth_add_sta_ft(v
+@@ -1426,7 +1426,7 @@ static int hostapd_wpa_auth_add_sta_ft(v
  		 * previous association. */
  		wpa_printf(MSG_DEBUG,
  			   "FT: Remove and re-add driver STA entry after successful FT authentication");

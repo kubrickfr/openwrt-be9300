@@ -113,7 +113,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  			     int ht_enabled, int chan_offset, int chan_width,
 --- a/src/ap/hostapd.h
 +++ b/src/ap/hostapd.h
-@@ -794,6 +794,7 @@ struct hostapd_iface {
+@@ -819,6 +819,7 @@ struct hostapd_iface {
  
  	void (*scan_cb)(struct hostapd_iface *iface);
  	int num_ht40_scan_tries;
@@ -141,7 +141,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  	if (iface->scan_cb == ieee80211n_check_scan)
 --- a/src/drivers/driver_nl80211.c
 +++ b/src/drivers/driver_nl80211.c
-@@ -11681,14 +11681,22 @@ static int nl80211_start_radar_detection
+@@ -11720,14 +11720,22 @@ static int nl80211_start_radar_detection
  		return -1;
  	}
  
@@ -166,7 +166,7 @@ Signed-off-by: JiaY-shi <shi05275@163.com>
  		}
  	}
  
-@@ -11698,9 +11706,9 @@ static int nl80211_start_radar_detection
+@@ -11737,9 +11745,9 @@ static int nl80211_start_radar_detection
  		return 0;
  	}
  

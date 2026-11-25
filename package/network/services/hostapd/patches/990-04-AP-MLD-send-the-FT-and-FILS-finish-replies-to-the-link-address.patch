@@ -19,10 +19,10 @@ Assisted-by: LLM
 
 --- a/src/ap/ieee802_11.c
 +++ b/src/ap/ieee802_11.c
-@@ -555,11 +555,13 @@ static void handle_auth_ft_finish(void *
- 	struct sta_info *sta;
- 	int reply_res;
+@@ -591,11 +591,13 @@ static void handle_auth_ft_finish(void *
  
+ 	connect_refused_notify(hapd, dst, status, HOSTAPD_UBUS_RSN_ERROR_AUTH,
+ 			       NULL, 0);
 -	reply_res = send_auth_reply(hapd, NULL, dst, WLAN_AUTH_FT,
 -				    auth_transaction, status, ies, ies_len,
 -				    "auth-ft-finish");
@@ -37,10 +37,10 @@ Assisted-by: LLM
  	if (sta == NULL)
  		return;
  
-@@ -3367,8 +3369,8 @@ static void handle_auth_fils_finish(stru
- 	auth_alg = (pub ||
- 		    resp == WLAN_STATUS_FINITE_CYCLIC_GROUP_NOT_SUPPORTED) ?
+@@ -3411,8 +3413,8 @@ static void handle_auth_fils_finish(stru
  		WLAN_AUTH_FILS_SK_PFS : WLAN_AUTH_FILS_SK;
+ 	connect_refused_notify(hapd, sta->addr, resp,
+ 			       HOSTAPD_UBUS_RSN_ERROR_FILS, NULL, 0);
 -	send_auth_reply(hapd, sta, sta->addr, auth_alg, 2, resp,
 -			data ? wpabuf_head(data) : (u8 *) "",
 +	send_auth_reply(hapd, sta, ap_sta_link_addr(hapd, sta), auth_alg, 2,

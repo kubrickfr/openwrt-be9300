@@ -11,7 +11,7 @@
 #include "qos.h"
 #include "mirror.h"
 #include "mac.h"
-#include "rtl-otto.h"
+#include "otto_dsa.h"
 #include "stats.h"
 #include "tc.h"
 #include "vlan.h"
@@ -28,8 +28,6 @@
 #define RTL931X_IMR_PORT_LINK_STS_CHG		(0x126C)
 #define RTL931X_ISR_GLB_SRC			(0x12B4)
 #define RTL931X_ISR_PORT_LINK_STS_CHG		(0x12B8)
-
-#define RTL931X_LED_GLB_CTRL			(0x0600)
 
 #define RTL931X_RMA_BPDU_CTRL			(0x881C)
 
@@ -65,7 +63,7 @@
 #define RTL931X_LED_CLK_SEL_200NS				2
 #define RTL931X_LED_CLK_SEL_100NS				3
 
-void rtldsa_931x_print_matrix(struct otto_dsa_priv *priv)
+static void rtldsa_931x_print_matrix(struct otto_dsa_priv *priv)
 {
 	int tbl = otto_table_acquire(RTL9310_TBL_PORT_ISO_CTRL);
 	u32 v[2];
@@ -379,12 +377,6 @@ const struct rtldsa_config rtldsa_931x_cfg = {
 	.fib_entries = 16384, /* TODO: has 32K but code cannot handle that */
 	.l2_uc_tbl = RTL9310_TBL_L2_UC,
 	.l2_cam_tbl = RTL9310_TBL_L2_CAM_UC,
-	.mask_port_reg_be = rtl839x_mask_port_reg_be,
-	.set_port_reg_be = rtl839x_set_port_reg_be,
-	.get_port_reg_be = rtl839x_get_port_reg_be,
-	.mask_port_reg_le = rtl839x_mask_port_reg_le,
-	.set_port_reg_le = rtl839x_set_port_reg_le,
-	.get_port_reg_le = rtl839x_get_port_reg_le,
 	.stat_port_rst = RTL931X_STAT_PORT_RST,
 	.stat_rst = RTL931X_STAT_RST,
 	.stat_port_std_mib = 0,  /* Not defined */

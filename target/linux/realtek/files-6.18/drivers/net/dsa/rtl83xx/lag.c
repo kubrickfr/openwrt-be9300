@@ -9,7 +9,7 @@
 #include <net/dsa.h>
 
 #include "lag.h"
-#include "rtl-otto.h"
+#include "otto_dsa.h"
 
 /* Link aggregation (Trunking) */
 #define TRUNK_DISTRIBUTION_ALGO_SPA_BIT         BIT(0)
@@ -160,7 +160,7 @@ int otto_lag_find_group_from_port(struct otto_dsa_priv *priv, int port)
  * @e: L2 entry data
  * @lag_group: lag id of the trunk group
  */
-void otto_lag_93xx_prepare_fdb(struct rtl838x_l2_entry *e, int lag_group)
+void otto_lag_93xx_prepare_fdb(struct otto_l2_entry *e, int lag_group)
 {
 	if (e && lag_group >= 0) {
 		e->is_trunk = true;
@@ -211,6 +211,74 @@ int otto_lag_port_change(struct dsa_switch *ds, int port)
 		if (ret)
 			return ret;
 	}
+
+	return 0;
+}
+
+/* Caller must hold priv->reg_mutex */
+static int otto_lag_add(struct dsa_switch *ds, int group, int port,
+			struct netdev_lag_upper_info *info)
+{
+	struct otto_dsa_priv *priv = ds->priv;
+	int ret;
+	int i;
+
+	for (i = 0; i < priv->ds->num_lag_ids; i++) {
+		if (priv->lags_port_members[i] & BIT_ULL(port))
+			break;
+	}
+	if (i != priv->ds->num_lag_ids) {
+		pr_err("%s: Port %d already member of LAG %d.\n", __func__, port, i);
+		return -ENOSPC;
+	}
+
+	if (priv->r->lag_setup_algomask) {
+		ret = priv->r->lag_setup_algomask(priv, group, info);
+		if (ret)
+			return ret;
+	}
+
+	ret = priv->r->lag_set_port_members(priv, group,
+					    priv->lags_port_members[group] | BIT_ULL(port), info);
+	if (ret)
+		return ret;
+
+	pr_info("%s: Added port %d to LAG %d. Members now %016llx.\n",
+		__func__, port, group, priv->lags_port_members[group]);
+
+	return 0;
+}
+
+/* Caller must hold priv->reg_mutex */
+static int otto_lag_del(struct dsa_switch *ds, int group, int port)
+{
+	struct otto_dsa_priv *priv = ds->priv;
+	int ret;
+
+	if (group >= priv->ds->num_lag_ids) {
+		pr_err("%s: LAG %d invalid.\n", __func__, group);
+		return -EINVAL;
+	}
+
+	if (!(priv->lags_port_members[group] & BIT_ULL(port))) {
+		pr_err("%s: Port %d not member of LAG %d.\n", __func__, port, group);
+		return -ENOSPC;
+	}
+
+	/* Don't touch hash mask bits, as only the port might be removed from
+	 * the LAG group. This means the lag group stays valid with existing
+	 * mask algo bits. If there are no lag members left, then
+	 * otto_lag_add will reconfigure hash mask when new LAG group is
+	 * created.
+	 */
+	ret = priv->r->lag_set_port_members(priv, group,
+					    priv->lags_port_members[group] & ~BIT_ULL(port),
+					    NULL);
+	if (ret)
+		return ret;
+
+	pr_info("%s: Removed port %d from LAG %d. Members now %016llx.\n",
+		__func__, port, group, priv->lags_port_members[group]);
 
 	return 0;
 }
@@ -295,73 +363,6 @@ int otto_lag_port_leave(struct dsa_switch *ds, int port, struct dsa_lag lag)
 out:
 	mutex_unlock(&priv->reg_mutex);
 	return err;
-}
-
-/* Caller must hold priv->reg_mutex */
-int otto_lag_add(struct dsa_switch *ds, int group, int port, struct netdev_lag_upper_info *info)
-{
-	struct otto_dsa_priv *priv = ds->priv;
-	int ret;
-	int i;
-
-	for (i = 0; i < priv->ds->num_lag_ids; i++) {
-		if (priv->lags_port_members[i] & BIT_ULL(port))
-			break;
-	}
-	if (i != priv->ds->num_lag_ids) {
-		pr_err("%s: Port %d already member of LAG %d.\n", __func__, port, i);
-		return -ENOSPC;
-	}
-
-	if (priv->r->lag_setup_algomask) {
-		ret = priv->r->lag_setup_algomask(priv, group, info);
-		if (ret)
-			return ret;
-	}
-
-	ret = priv->r->lag_set_port_members(priv, group,
-					    priv->lags_port_members[group] | BIT_ULL(port), info);
-	if (ret)
-		return ret;
-
-	pr_info("%s: Added port %d to LAG %d. Members now %016llx.\n",
-		__func__, port, group, priv->lags_port_members[group]);
-
-	return 0;
-}
-
-/* Caller must hold priv->reg_mutex */
-int otto_lag_del(struct dsa_switch *ds, int group, int port)
-{
-	struct otto_dsa_priv *priv = ds->priv;
-	int ret;
-
-	if (group >= priv->ds->num_lag_ids) {
-		pr_err("%s: LAG %d invalid.\n", __func__, group);
-		return -EINVAL;
-	}
-
-	if (!(priv->lags_port_members[group] & BIT_ULL(port))) {
-		pr_err("%s: Port %d not member of LAG %d.\n", __func__, port, group);
-		return -ENOSPC;
-	}
-
-	/* Don't touch hash mask bits, as only the port might be removed from
-	 * the LAG group. This means the lag group stays valid with existing
-	 * mask algo bits. If there are no lag members left, then
-	 * otto_lag_add will reconfigure hash mask when new LAG group is
-	 * created.
-	 */
-	ret = priv->r->lag_set_port_members(priv, group,
-					    priv->lags_port_members[group] & ~BIT_ULL(port),
-					    NULL);
-	if (ret)
-		return ret;
-
-	pr_info("%s: Removed port %d from LAG %d. Members now %016llx.\n",
-		__func__, port, group, priv->lags_port_members[group]);
-
-	return 0;
 }
 
 int otto_lag_93xx_set_distribution_algorithm(struct otto_dsa_priv *priv,
@@ -536,7 +537,13 @@ static int otto_lag_93xx_set_group2ports(struct otto_dsa_priv *priv, int group,
 static inline void otto_lag_93xx_set_local_group2ports(struct otto_dsa_priv *priv, int group,
 						       u64 ports)
 {
-	priv->r->set_port_reg_be(ports, priv->r->trk_mbr_ctr(group));
+	int reg = priv->r->trk_mbr_ctr(group);
+
+	if (priv->r->cpu_port >= 32) {
+		regmap_write(priv->map, reg, upper_32_bits(ports));
+		reg += 4;
+	}
+	regmap_write(priv->map, reg, lower_32_bits(ports));
 }
 
 int otto_lag_93xx_set_port_members(struct otto_dsa_priv *priv, int group,
@@ -626,13 +633,18 @@ int otto_lag_838x_set_distribution_algorithm(struct otto_dsa_priv *priv,
 	return 0;
 }
 
-int otto_lag_838x_set_port_members(struct otto_dsa_priv *priv, int group,
-				   u64 members, struct netdev_lag_upper_info *info)
+int otto_lag_83xx_set_port_members(struct otto_dsa_priv *priv, int group,
+				 u64 members, struct netdev_lag_upper_info *info)
 {
+	int reg = priv->r->trk_mbr_ctr(group);
+
 	priv->lags_port_members[group] = members;
 
-	priv->r->set_port_reg_be(priv->lags_port_members[group],
-				 priv->r->trk_mbr_ctr(group));
+	if (priv->r->cpu_port >= 32) {
+		regmap_write(priv->map, reg, upper_32_bits(members));
+		reg += 4;
+	}
+	regmap_write(priv->map, reg, lower_32_bits(members));
 
 	return 0;
 }
@@ -648,17 +660,6 @@ int otto_lag_839x_set_distribution_algorithm(struct otto_dsa_priv *priv,
 	regmap_write_bits(priv->map, RTL839X_TRK_HASH_IDX_CTRL + ((group >> 4) << 2),
 			  3U << ((group & 0xf) << 1), (u32)algoidx << ((group & 0xf) << 1));
 	regmap_write(priv->map, RTL839X_TRK_HASH_CTRL + (algoidx << 2), algomsk);
-
-	return 0;
-}
-
-int otto_lag_839x_set_port_members(struct otto_dsa_priv *priv, int group,
-				   u64 members, struct netdev_lag_upper_info *info)
-{
-	priv->lags_port_members[group] = members;
-
-	priv->r->set_port_reg_be(priv->lags_port_members[group],
-				 priv->r->trk_mbr_ctr(group));
 
 	return 0;
 }
